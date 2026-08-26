@@ -1,0 +1,18 @@
+# Rust
+/target
+**/target
+
+# Build artifacts and temp files
+**/dist
+*.tmp
+corpus/
+.DS_Store
+
+# Secrets
+.env
+
+# Local working materials — kept on disk, never published
+/docs/
+/archive/
+/ref/
+/research/
