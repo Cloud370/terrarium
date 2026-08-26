@@ -62,7 +62,13 @@ pub fn resolve_mount(mounts: &[Mount], js_path: &str) -> Result<PathBuf, String>
     let canon_parent = parent
         .canonicalize()
         .map_err(|e| format!("stat failed {js_path}: {e}"))?;
-    if !canon_parent.starts_with(&m.root) {
+    // canonicalize the root too: a symlink component in the mount path (/tmp → /private/tmp, Windows 8.3 short
+    // names) would otherwise mismatch the canonical parent and reject every legitimate read (write_file does same)
+    let root = m
+        .root
+        .canonicalize()
+        .map_err(|e| format!("stat failed {js_path}: {e}"))?;
+    if !canon_parent.starts_with(&root) {
         return Err(format!("path escapes mount root, rejected: {js_path}"));
     }
     Ok(canon_parent.join(tail))
