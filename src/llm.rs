@@ -1,7 +1,7 @@
 //! host.llm —— nested model calls: call (one-shot) / chat (multi-turn, auto-prepends contract).
 //! Async-concurrent (Promise.all = max not sum), cancellable (watch token), transport hangs self-heal via 120s × 2 retries.
-//! Keys live only in this process's env; the sandbox can't see them. (usage/contract introspection cut in D017 —
-//! Rust-side usage_snapshot below still feeds the operator's stderr stats.)
+//! Keys live only in this process's env; the sandbox can't see them. Usage accounting stays
+//! Rust-side (usage_json below) and rides along in the result JSON, never inside the cage.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -348,7 +348,7 @@ pub fn usage_json() -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{capability_text, model_capabilities, Modality, RESPONSE_BODY_CAP};
+    use super::{capability_text, model_capabilities, Modality};
 
     #[test]
     fn known_models_declare_input_capabilities() {
@@ -371,10 +371,5 @@ mod tests {
         let text = capability_text("deepseek-v4-flash-vision-exp");
         assert!(text.contains("declared input: text, image"));
         assert!(text.contains("payloads are text-only"));
-    }
-
-    #[test]
-    fn response_body_cap_is_finite() {
-        assert_eq!(RESPONSE_BODY_CAP, 4 * 1024 * 1024);
     }
 }

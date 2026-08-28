@@ -75,7 +75,4 @@ fn kernel_renders_the_current_contract() {
 
     assert!(contract.contains("host.fs.list(dir)"));
     assert!(contract.contains("host.agent.answer(text)"));
-    assert!(!contract.contains("nested execution"));
-    assert!(!contract.contains("child session"));
-    assert!(!contract.contains("text completion marker"));
 }

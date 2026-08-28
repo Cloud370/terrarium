@@ -2,12 +2,6 @@
 // Static asset: embedded via include_str!; editing this file edits every runtime foundation
 'use strict';
 
-globalThis.__fmt = (v) => {
-  if (typeof v === 'undefined') return undefined;
-  if (typeof v === 'function') throw new TypeError('functions are not JSON serializable');
-  return v;
-};
-
 const __rawlog = globalThis.__log;
 globalThis.__log = (s) => { __rawlog(s); };
 globalThis.print = (...a) => __log(a.map((v) => {

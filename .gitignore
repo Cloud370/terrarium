@@ -1,20 +1,16 @@
 # Rust build output
-/target
-**/target/
+target/
 
 # Generated artifacts and temp files
-**/dist/
+dist/
 *.tmp
 corpus/
 .DS_Store
 
 # Secrets
 .env
-**/.env
 .env.*
-**/.env.*
 !.env.example
-!**/.env.example
 
 # Machine-local references, history, clones, and scratch data
 /.local/

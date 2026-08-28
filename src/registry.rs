@@ -1,5 +1,5 @@
 //! Host API registry: the single source of truth where docs and implementation live together.
-//! Both host.help() and the contract ({{HOST_API}} in CONTRACT.md) are generated from it — they can never drift.
+//! Both host.help() and the contract ({{HOST_API}} in prompts/agent.md) are generated from it — they can never drift.
 
 use rquickjs::{Ctx, Function, Object};
 

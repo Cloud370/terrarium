@@ -1,7 +1,7 @@
 //! host.fs —— surface over real mounted directories: list / windowed read / streaming scan / atomic write.
 //! Mounting: --mount /proj=real-dir (read-only, the default) or --mount /proj=real-dir:rw (writable).
 //! Boundary = lexical `..` guard + parent canonicalize + prefix check; writes additionally require the
-//! mount to be declared :rw at launch — the kernel executes that operator decision, it never makes one (D017).
+//! mount to be declared :rw at launch — the kernel executes that operator decision, it never makes one.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -280,7 +280,7 @@ fn read_window(mounts: &[Mount], path: &str, a: usize, b: usize) -> Result<Strin
 }
 
 /// Whole-file text channel for PROGRAM consumption: LF-normalized, BOM-stripped (the in-program
-/// canonical form, D019/D022 — write restores the target's own EOL and BOM), no line numbers or
+/// canonical form — write restores the target's own EOL and BOM), no line numbers or
 /// line caps. Bounded by the cage heap: a file bigger than 64MB is refused, not buffered.
 fn read_text(mounts: &[Mount], path: &str) -> Result<String, String> {
     let p = resolve_mount(mounts, path)?;
@@ -304,7 +304,7 @@ fn read_text(mounts: &[Mount], path: &str) -> Result<String, String> {
         .map_err(|e| format!("{path}: {e}"))
 }
 
-// ===== scan: chunked async line stream — the predicate lives in the cage (D024) =====
+// ===== scan: chunked async line stream — the predicate lives in the cage =====
 // The host side is deliberately dumb: walk a scoped tree, filter by skip-lists + glob, hand out ~1000-line
 // chunks per await. Matching/casing/dedup/max are JS combinators, so the API surface stays flat while the
 // expressiveness is "whatever JS can write". Chunked handoff is also what keeps the deadline honest: the
@@ -315,7 +315,7 @@ const SCAN_CHUNK_BYTES: usize = 1024 * 1024; // chunk completes at 1000 lines OR
                                              // Per-line read bound ≈ what the 64MB cage heap could meaningfully hold anyway; a no-newline giant
                                              // (2GB base64 blob) stops here instead of allocating unboundedly. Lines are delivered WHOLE —
                                              // match completeness belongs to the predicate (grep matches the full line, truncates only the display),
-                                             // context economy is already guarded downstream by the feedback cap. D022: heap is the only bound.
+                                             // context economy is already guarded downstream by the feedback cap. Heap is the only bound.
 const SCAN_LINE_HARD: u64 = 8 * 1024 * 1024;
 
 /// Tiny glob: `*` = any run within one segment, `**` = anything incl. `/`, `?` = one non-`/` char.
@@ -377,7 +377,7 @@ fn file_matches_glob(pat: &str, rel: &str) -> bool {
 }
 
 // ---- gitignore respect (rg semantics, as a parameter the model decides per call) ----
-// Scope pruning like glob, not judgment D017: ignored trees are simply never opened. Hand-rolled
+// Scope pruning like glob, not judgment: ignored trees are simply never opened. Hand-rolled
 // on the common subset — anchoring, `**`, basename-anywhere, dir-only, negation, nested scopes.
 // Punted: `[..]` char classes and `\!` escapes (rare); .gitignore applies only at/below the scan
 // root (no upward repo search — walk_one_dir never sees parents).
@@ -649,10 +649,10 @@ fn scan_next_chunk(st: &mut ScanState) -> Result<Vec<ScanLine>, String> {
             let f =
                 std::fs::File::open(&p).map_err(|e| format!("scan {v}: cannot open file: {e}"))?;
             let mut r = BufReader::new(f);
-            // binary = NUL in the first buffer (grep/rg's physical definition, not judgment D017);
+            // binary = NUL in the first buffer (grep/rg's physical definition, not judgment);
             // the buffer isn't consumed — the reads below reuse it, so the sniff costs nothing.
             // scan is a text channel: binary bytes were never expressible as lines, only wastefully
-            // opened — real byte inspection needs its own windowed channel (deferred, D018-style)
+            // opened — real byte inspection needs its own windowed channel (deferred)
             let is_binary = r
                 .fill_buf()
                 .map_err(|e| format!("scan {v}: cannot inspect file: {e}"))?
@@ -943,7 +943,7 @@ pub fn install<'js>(ctx: &Ctx<'js>, host: &Object<'js>, mounts: &[Mount]) -> rqu
             let next_fn = Function::new(
                 ctx.clone(),
                 rquickjs::function::Async(move || {
-                    let rc = rc.clone(); // clone per call: the closure must stay Fn (D013)
+                    let rc = rc.clone(); // clone per call: the closure must stay Fn
                     async move { scan_next_chunk(&mut rc.borrow_mut()).map_err(js_err) }
                 }),
             )?;

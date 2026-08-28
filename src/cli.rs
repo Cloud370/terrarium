@@ -18,7 +18,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     while i < args.len() {
         let arg = args[i].as_str();
         match arg {
-            "--timeout-ms" | "--timeout" if i + 1 < args.len() => {
+            "--timeout-ms" if i + 1 < args.len() => {
                 match args[i + 1].parse::<u64>() {
                     Ok(n) if n >= 1 => parsed.timeout_ms = Some(n),
                     _ => return Err(format!("{arg} expects an integer >= 1 (milliseconds)")),
@@ -122,9 +122,12 @@ mod tests {
 
     #[test]
     fn run_mode_flags_are_guarded_and_order_insensitive() {
-        assert!(parse_run_args(&["--timeout".into()])
+        assert!(parse_run_args(&["--timeout-ms".into()])
             .unwrap_err()
             .contains("incomplete flag"));
+        assert!(parse_run_args(&["--timeout".into(), "50".into()])
+            .unwrap_err()
+            .contains("unknown or incomplete flag: --timeout"));
         assert!(parse_run_args(&["--timeout-ms".into(), "abc".into()])
             .unwrap_err()
             .contains("milliseconds"));
