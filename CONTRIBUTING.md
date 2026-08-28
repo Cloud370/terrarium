@@ -20,6 +20,8 @@ cargo clippy --all-targets -- -D warnings   # lint (CI enforces this too)
 
 - Keep PRs focused; one logical change per PR.
 - CI must be green: `fmt --check`, `clippy -D warnings`, `test`, `build`.
-- The agent contract (`src/CONTRACT.md`) and role template (`src/MAIN.md`) are compiled into the binary via `include_str!` — treat them as code: changing them changes runtime behavior.
-- `src/registry.rs` is the single source of the host API surface: `host.help()` and the contract are generated from it, so they cannot drift. Add new host capabilities there.
+- Runtime prompts (`src/prompts/`) and the JavaScript prelude (`src/runtime/prelude.js`) are compiled into the binary via `include_str!` — treat them as code: changing them changes runtime behavior.
+- Maintained specifications live in `docs/` and should describe the current implementation or clearly label future behavior.
+- `src/registry.rs` is the single source of the host API surface: `host.help()` and the prompt contract are generated from it. Add new host capabilities there.
+- Keep presentation adapters thin: reusable behavior belongs in the library; `src/main.rs` and `src/cli.rs` handle process and terminal concerns.
 - By submitting a PR you agree your contributions are licensed under the [MIT license](LICENSE).

@@ -1,39 +1,118 @@
-//! host.fs —— surface over real mounted directories: list / windowed read / streaming search / atomic write.
+//! host.fs —— surface over real mounted directories: list / windowed read / streaming scan / atomic write.
 //! Mounting: --mount /proj=real-dir (read-only, the default) or --mount /proj=real-dir:rw (writable).
 //! Boundary = lexical `..` guard + parent canonicalize + prefix check; writes additionally require the
 //! mount to be declared :rw at launch — the kernel executes that operator decision, it never makes one (D017).
 
-use std::io::{BufRead, BufReader, Read};
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rquickjs::function::Opt;
 use rquickjs::{Ctx, Function, Object};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Mount {
-    pub virt: String,
-    pub root: PathBuf,
-    pub rw: bool,
+    pub(crate) virt: String,
+    pub(crate) root: PathBuf,
+    pub(crate) rw: bool,
 }
 
-const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", "dist", "ref"];
-const SKIP_EXTS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "zip", "gz", "exe", "o", "a", "so", "dll", "lock", "bin",
-];
-const LINE_SCAN_CAP: usize = 4096; // search: skip pathological lines
+impl Mount {
+    pub fn new(virt: impl Into<String>, root: impl AsRef<Path>, rw: bool) -> Result<Self, String> {
+        let root = root
+            .as_ref()
+            .canonicalize()
+            .map_err(|e| format!("invalid mount root: {e}"))?;
+        Self::from_canonical(&virt.into(), root, rw)
+    }
+
+    pub(crate) fn from_canonical(virt: &str, root: PathBuf, rw: bool) -> Result<Self, String> {
+        if virt.len() < 2 || !virt.starts_with('/') || virt.contains("//") {
+            return Err(format!(
+                "invalid mount virtual prefix {virt:?} (expected /name=…)"
+            ));
+        }
+        if virt.split('/').any(|part| part == "." || part == "..") {
+            return Err(format!(
+                "invalid mount virtual prefix {virt:?} (dot segments are not allowed)"
+            ));
+        }
+        Ok(Self {
+            virt: format!("{virt}/"),
+            root,
+            rw,
+        })
+    }
+
+    pub fn virtual_path(&self) -> &str {
+        &self.virt
+    }
+
+    pub fn is_writable(&self) -> bool {
+        self.rw
+    }
+
+    pub(crate) fn overlaps(&self, other: &Self) -> bool {
+        let a = self.virt.trim_end_matches('/');
+        let b = other.virt.trim_end_matches('/');
+        a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+    }
+}
+
+/// scan options — defaults follow ripgrep, the convention the model already knows:
+/// gitignore respected, hidden (dot) entries skipped, binaries detected by content (NUL).
+/// skip_dirs/skip_exts are EXTRA prunes the program opts into, never implicit magic.
+#[derive(Debug, Clone)]
+struct ScanOpts {
+    skip_dirs: Vec<String>,
+    skip_exts: Vec<String>,
+    glob: Option<String>,
+    gitignore: bool,
+    skip_hidden: bool,
+}
+
+impl Default for ScanOpts {
+    fn default() -> Self {
+        ScanOpts {
+            skip_dirs: Vec::new(),
+            skip_exts: Vec::new(),
+            glob: None,
+            gitignore: true,
+            skip_hidden: true,
+        }
+    }
+}
+
 const LINE_READ_CAP: usize = 2000; // read: per-line character cap — a minified file must not blow context
 static TMP_CTR: AtomicU64 = AtomicU64::new(0);
 
 /// Virtual path → (mount, relative remainder). Shared by every fs operation.
+/// Component-wise: mount /t owns "/t" and "/t/…" but never "/tmp2" — a textual prefix would
+/// silently misfile neighboring paths (and make /a vs /ab registration-order dependent).
 fn strip_mount<'a>(mounts: &'a [Mount], js_path: &str) -> Result<(&'a Mount, String), String> {
     for m in mounts {
-        if let Some(rel) = js_path
-            .strip_prefix(&m.virt)
-            .or_else(|| js_path.strip_prefix(m.virt.trim_end_matches('/')))
-        {
-            return Ok((m, rel.trim_start_matches('/').to_string()));
+        let virt = m.virt.trim_end_matches('/');
+        if js_path == virt || js_path == format!("{virt}/") {
+            return Ok((m, String::new()));
+        }
+        if let Some(rel) = js_path.strip_prefix(&format!("{virt}/")) {
+            if rel.is_empty() {
+                return Ok((m, String::new()));
+            }
+            if rel.split('/').any(|part| part == "..") {
+                return Err(format!("path escapes mount root, rejected: {js_path}"));
+            }
+            if rel.starts_with('/') || rel.contains("//") || rel.contains('\\') {
+                return Err(format!("invalid virtual path: {js_path}"));
+            }
+            if rel.split('/').any(|part| part.is_empty() || part == ".") {
+                return Err(format!("invalid virtual path: {js_path}"));
+            }
+            return Ok((m, rel.to_string()));
         }
     }
     let avail: Vec<String> = mounts.iter().map(|m| m.virt.clone()).collect();
@@ -71,7 +150,16 @@ pub fn resolve_mount(mounts: &[Mount], js_path: &str) -> Result<PathBuf, String>
     if !canon_parent.starts_with(&root) {
         return Err(format!("path escapes mount root, rejected: {js_path}"));
     }
-    Ok(canon_parent.join(tail))
+    // the tail itself may be a symlink: resolve it and re-verify containment, so the boundary
+    // decision is complete (parent + tail) instead of leaving the last hop to File::open.
+    // Internal symlinks (target still under the root) stay legal; nonexistent targets pass —
+    // an open() of them can't follow anything.
+    let target = canon_parent.join(tail);
+    match target.canonicalize() {
+        Ok(full) if full.starts_with(&root) => Ok(full),
+        Ok(_) => Err(format!("path escapes mount root, rejected: {js_path}")),
+        Err(_) => Ok(target),
+    }
 }
 
 fn list_dir(mounts: &[Mount], dir: &str) -> Result<Vec<String>, String> {
@@ -80,38 +168,104 @@ fn list_dir(mounts: &[Mount], dir: &str) -> Result<Vec<String>, String> {
     for ent in std::fs::read_dir(&p).map_err(|e| format!("{dir}: {e}"))? {
         let ent = ent.map_err(|e| format!("{dir}: {e}"))?;
         let name = ent.file_name().to_string_lossy().into_owned();
-        let meta = ent.metadata().map_err(|e| format!("{dir}: {e}"))?;
-        out.push(if meta.is_dir() {
-            format!("{name}/\tdir")
+        let meta = std::fs::symlink_metadata(ent.path()).map_err(|e| format!("{dir}: {e}"))?;
+        if meta.file_type().is_symlink() {
+            out.push(format!("{name}\tsymlink"));
         } else {
-            format!("{name}\t{}", meta.len())
-        });
+            out.push(if meta.is_dir() {
+                format!("{name}/\tdir")
+            } else {
+                format!("{name}\t{}", meta.len())
+            });
+        }
     }
     out.sort();
     Ok(out)
 }
 
-/// Windowed read: "N: text" lines from..to (1-based inclusive), a continue-footer iff more lines follow.
+fn read_line_limited(
+    reader: &mut BufReader<std::fs::File>,
+    cap: usize,
+) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return if bytes.is_empty() {
+                Ok(None)
+            } else {
+                String::from_utf8(bytes)
+                    .map(Some)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            };
+        }
+        let take = buf
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map(|index| index + 1)
+            .unwrap_or(buf.len());
+        if bytes.len() + take > cap {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("line exceeds the {cap}-byte read limit"),
+            ));
+        }
+        let has_newline = buf[..take].contains(&b'\n');
+        bytes.extend_from_slice(&buf[..take]);
+        reader.consume(take);
+        if has_newline {
+            return String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+        }
+    }
+}
+
+/// Windowed read: "N: text" lines from..to (1-based, inclusive), a continue-footer iff more lines follow.
 fn read_window(mounts: &[Mount], path: &str, a: usize, b: usize) -> Result<String, String> {
+    if a == 0 || b < a {
+        return Err(format!(
+            "read window must satisfy 1 <= from <= to (got {a}..{b})"
+        ));
+    }
     let p = resolve_mount(mounts, path)?;
+    let meta = std::fs::metadata(&p).map_err(|e| format!("{path}: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("{path} is not a regular file"));
+    }
+    let mut budget: isize = crate::MEM_LIMIT as isize;
     let f = std::fs::File::open(&p).map_err(|e| format!("{path}: {e}"))?;
+    let mut reader = BufReader::new(f);
     let mut out = Vec::new();
     let mut more = false;
-    for (i, line) in BufReader::new(f).lines().enumerate() {
-        let ln = i + 1;
-        if ln > b {
-            more = true; // line b+1 exists
+    let mut line_no = 0usize;
+    while let Some(raw) =
+        read_line_limited(&mut reader, 8 * 1024 * 1024).map_err(|e| format!("{path}: {e}"))?
+    {
+        line_no += 1;
+        if line_no > b {
+            more = true;
             break;
         }
-        let line = line.map_err(|e| format!("{path}: {e}"))?;
-        if ln >= a {
+        if line_no >= a {
+            let line = raw
+                .strip_suffix('\n')
+                .unwrap_or(&raw)
+                .strip_suffix('\r')
+                .unwrap_or_else(|| raw.strip_suffix('\n').unwrap_or(&raw));
+            budget -= line.len() as isize + 8;
+            if budget < 0 {
+                return Err(format!(
+                    "read window on {path} exceeded the 64MB budget — narrow the range"
+                ));
+            }
             if line.chars().count() > LINE_READ_CAP {
                 out.push(format!(
-                    "{ln}: {}…",
+                    "{line_no}: {}…",
                     line.chars().take(LINE_READ_CAP).collect::<String>()
                 ));
             } else {
-                out.push(format!("{ln}: {line}"));
+                out.push(format!("{line_no}: {line}"));
             }
         }
     }
@@ -125,97 +279,459 @@ fn read_window(mounts: &[Mount], path: &str, a: usize, b: usize) -> Result<Strin
     Ok(s)
 }
 
-/// Whole-file text channel for PROGRAM consumption: LF-normalized (the in-program canonical form, D019),
-/// no line numbers or line caps — pair with write, which restores the target's own EOL. Heap is the only bound.
+/// Whole-file text channel for PROGRAM consumption: LF-normalized, BOM-stripped (the in-program
+/// canonical form, D019/D022 — write restores the target's own EOL and BOM), no line numbers or
+/// line caps. Bounded by the cage heap: a file bigger than 64MB is refused, not buffered.
 fn read_text(mounts: &[Mount], path: &str) -> Result<String, String> {
     let p = resolve_mount(mounts, path)?;
+    let meta = std::fs::metadata(&p).map_err(|e| format!("{path}: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("{path} is not a regular file"));
+    }
+    if meta.len() > crate::MEM_LIMIT as u64 {
+        return Err(format!(
+            "{path} is {} bytes — larger than the 64MB cage heap; use windowed host.fs.read \
+             or host.fs.scan",
+            meta.len()
+        ));
+    }
     std::fs::read_to_string(p)
-        .map(|s| s.replace("\r\n", "\n"))
+        .map(|s| {
+            s.strip_prefix('\u{feff}')
+                .unwrap_or(&s)
+                .replace("\r\n", "\n")
+        })
         .map_err(|e| format!("{path}: {e}"))
 }
 
-fn walk_text_files(
-    root: &Path,
-    dir: &Path,
-    out: &mut Vec<(PathBuf, String)>,
-    depth: usize,
-    skip_dirs: &[String],
-    skip_exts: &[String],
-) {
-    if depth > 10 {
-        return;
+// ===== scan: chunked async line stream — the predicate lives in the cage (D024) =====
+// The host side is deliberately dumb: walk a scoped tree, filter by skip-lists + glob, hand out ~1000-line
+// chunks per await. Matching/casing/dedup/max are JS combinators, so the API surface stays flat while the
+// expressiveness is "whatever JS can write". Chunked handoff is also what keeps the deadline honest: the
+// runtime yields between chunks, so a huge tree streams instead of freezing the process inside one poll.
+
+const SCAN_CHUNK: usize = 1000; // lines per await — small enough that no single chunk blocks the loop for long
+const SCAN_CHUNK_BYTES: usize = 1024 * 1024; // chunk completes at 1000 lines OR this many bytes, whichever first
+                                             // Per-line read bound ≈ what the 64MB cage heap could meaningfully hold anyway; a no-newline giant
+                                             // (2GB base64 blob) stops here instead of allocating unboundedly. Lines are delivered WHOLE —
+                                             // match completeness belongs to the predicate (grep matches the full line, truncates only the display),
+                                             // context economy is already guarded downstream by the feedback cap. D022: heap is the only bound.
+const SCAN_LINE_HARD: u64 = 8 * 1024 * 1024;
+
+/// Tiny glob: `*` = any run within one segment, `**` = anything incl. `/`, `?` = one non-`/` char.
+/// A pattern containing `/` matches the path relative to the scan root; otherwise the basename
+/// (so "*.rs" behaves like grep --include, "src/**/*.rs" like rg --glob).
+/// Iterative DP over three rolling rows — O(P×T), same answers as the classic backtracking
+/// recursion but with no exponential cliff (`*a*a*a*b` against long names froze a whole poll:
+/// the interrupt handler only fires at JS bytecode boundaries, never inside native code) and
+/// no native-stack recursion (a multi-MB pattern once segfaulted the process before any limit).
+fn glob_match(pat: &[char], text: &[char]) -> bool {
+    let nt = text.len();
+    // rows[i % 3][j] = "pat[i..] matches text[j..]"; row i is built from rows i+1 and i+2.
+    let mut rows = [
+        vec![false; nt + 1],
+        vec![false; nt + 1],
+        vec![false; nt + 1],
+    ];
+    rows[pat.len() % 3][nt] = true; // empty pattern matches only empty text
+    for i in (0..pat.len()).rev() {
+        let cur = i % 3;
+        for j in (0..=nt).rev() {
+            rows[cur][j] = match pat[i] {
+                // `**/` may match zero directory segments.
+                '*' if pat.get(i + 1) == Some(&'*') && pat.get(i + 2) == Some(&'/') => {
+                    rows[(i + 3) % 3][j] || (j < nt && rows[cur][j + 1])
+                }
+                // `**` matches any run, including `/`.
+                '*' if pat.get(i + 1) == Some(&'*') => {
+                    rows[(i + 2) % 3][j] || (j < nt && rows[cur][j + 1])
+                }
+                // `*`: match nothing, or consume one non-'/' char and stay put
+                '*' => rows[(i + 1) % 3][j] || (j < nt && text[j] != '/' && rows[cur][j + 1]),
+                '?' => j < nt && text[j] != '/' && rows[(i + 1) % 3][j + 1],
+                c => j < nt && text[j] == c && rows[(i + 1) % 3][j + 1],
+            };
+        }
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+    rows[0][0]
+}
+
+/// Patterns come from two untrusted sources (program args, mounted .gitignore files); the DP is
+/// linear in pattern length, so cap it where patterns enter. No real-world glob or gitignore
+/// line is anywhere near this long.
+const GLOB_PAT_MAX: usize = 1024;
+
+fn file_matches_glob(pat: &str, rel: &str) -> bool {
+    if pat.chars().count() > GLOB_PAT_MAX || rel.chars().count() > GLOB_PAT_MAX * 8 {
+        return false;
+    }
+    let (p, t): (Vec<char>, Vec<char>) = if pat.contains('/') {
+        (pat.chars().collect(), rel.chars().collect())
+    } else {
+        (
+            pat.chars().collect(),
+            rel.rsplit('/').next().unwrap_or(rel).chars().collect(),
+        )
     };
-    for ent in entries.flatten() {
-        let p = ent.path();
-        let name = ent.file_name().to_string_lossy().into_owned();
-        if p.is_dir() {
-            if !skip_dirs.iter().any(|d| d.eq_ignore_ascii_case(&name)) {
-                walk_text_files(root, &p, out, depth + 1, skip_dirs, skip_exts);
+    glob_match(&p, &t)
+}
+
+// ---- gitignore respect (rg semantics, as a parameter the model decides per call) ----
+// Scope pruning like glob, not judgment D017: ignored trees are simply never opened. Hand-rolled
+// on the common subset — anchoring, `**`, basename-anywhere, dir-only, negation, nested scopes.
+// Punted: `[..]` char classes and `\!` escapes (rare); .gitignore applies only at/below the scan
+// root (no upward repo search — walk_one_dir never sees parents).
+
+#[derive(Debug, Clone)]
+struct IgnorePat {
+    neg: bool,
+    dir_only: bool,
+    anchored: bool, // contains '/' (besides a trailing one) → match the rel path from the .gitignore's dir
+    pat: Vec<char>,
+}
+
+/// One .gitignore file's patterns, anchored at the directory holding it (rel to the scan root).
+#[derive(Debug, Clone)]
+struct IgnoreScope {
+    base: String, // "" = scan root
+    pats: Vec<IgnorePat>,
+}
+
+fn parse_gitignore(text: &str) -> Vec<IgnorePat> {
+    text.lines()
+        .filter_map(|raw| {
+            let l = raw.trim_end(); // git drops unescaped trailing spaces; close enough
+            if l.is_empty() || l.starts_with('#') || l.chars().count() > GLOB_PAT_MAX {
+                return None; // over-long lines are hostile input, not ignore rules (glob DP is linear in P)
             }
+            let (neg, l) = match l.strip_prefix('!') {
+                Some(r) => (true, r),
+                None => (false, l),
+            };
+            let (dir_only, l) = match l.strip_suffix('/') {
+                Some(r) => (true, r),
+                None => (false, l),
+            };
+            if l.is_empty() {
+                return None;
+            }
+            let anchored = l.contains('/');
+            let l = l.strip_prefix('/').unwrap_or(l);
+            Some(IgnorePat {
+                neg,
+                dir_only,
+                anchored,
+                pat: l.chars().collect(),
+            })
+        })
+        .collect()
+}
+
+/// gitignore's precedence — deepest scope wins, and within a file the LAST matching line decides
+/// (so `!un_ignore` after an ignore re-includes): walk both reversed, first decisive hit answers.
+fn entry_ignored(scopes: &[IgnoreScope], rel_from_root: &str, name: &str, is_dir: bool) -> bool {
+    let name_c: Vec<char> = name.chars().collect();
+    for sc in scopes.iter().rev() {
+        let rel = if sc.base.is_empty() {
+            rel_from_root
         } else {
+            match rel_from_root.strip_prefix(&format!("{}/", sc.base)) {
+                Some(r) => r,
+                None => continue, // entry isn't under this scope's dir
+            }
+        };
+        let rel_c: Vec<char> = rel.chars().collect();
+        for p in sc.pats.iter().rev() {
+            if p.dir_only && !is_dir {
+                continue;
+            }
+            let m = if p.anchored {
+                glob_match(&p.pat, &rel_c)
+            } else {
+                glob_match(&p.pat, &name_c)
+            };
+            if m {
+                return !p.neg;
+            }
+        }
+    }
+    false
+}
+
+/// Load dir/.gitignore as a scope (base = dir rel to scan root); empty when absent.
+/// A symlinked rule file is not read — following it could pull ignore rules from outside the mount.
+fn load_scope(dir: &Path, root: &Path) -> Result<IgnoreScope, String> {
+    let base = dir
+        .strip_prefix(root)
+        .unwrap_or(dir)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let gi = dir.join(".gitignore");
+    let text = match std::fs::symlink_metadata(&gi) {
+        Ok(md) if md.file_type().is_symlink() => String::new(),
+        Ok(_) => std::fs::read_to_string(&gi)
+            .map_err(|e| format!("scan {base}/.gitignore: cannot read ignore file: {e}"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(format!(
+                "scan {base}/.gitignore: cannot inspect ignore file: {e}"
+            ))
+        }
+    };
+    Ok(IgnoreScope {
+        base,
+        pats: parse_gitignore(&text),
+    })
+}
+
+#[derive(Debug)]
+struct ScanLine {
+    file: String,
+    no: usize,
+    text: String,
+}
+
+impl<'js> rquickjs::IntoJs<'js> for ScanLine {
+    fn into_js(self, ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Value<'js>> {
+        let obj = Object::new(ctx.clone())?;
+        obj.set("file", self.file)?;
+        obj.set("no", self.no as u32)?;
+        obj.set("text", self.text)?;
+        Ok(obj.into_value())
+    }
+}
+
+/// Walk state for one scan: directories still to enumerate, candidate files queued, current reader.
+/// Nothing is cached across calls — state lives exactly as long as the iterator the program holds.
+#[derive(Debug)]
+struct ScanState {
+    dir_queue: Vec<(PathBuf, Vec<IgnoreScope>)>,
+    root: PathBuf,
+    virt_base: String,
+    files: VecDeque<(PathBuf, String)>,
+    cur: Option<(BufReader<std::fs::File>, String)>,
+    lineno: usize,
+    opts: ScanOpts,
+    done: bool,
+}
+
+fn scan_open(mounts: &[Mount], js_path: &str, opts: ScanOpts) -> Result<ScanState, String> {
+    let real = resolve_mount(mounts, js_path)?;
+    let meta = std::fs::metadata(&real).map_err(|e| format!("{js_path}: {e}"))?;
+    if !meta.is_dir() {
+        return Err(format!(
+            "{js_path} is not a directory — scan walks a tree (single files go through host.fs.read)"
+        ));
+    }
+    Ok(ScanState {
+        dir_queue: vec![(real.clone(), Vec::new())],
+        root: real,
+        virt_base: js_path.trim_end_matches('/').to_string(),
+        files: VecDeque::new(),
+        cur: None,
+        lineno: 0,
+        opts,
+        done: false,
+    })
+}
+
+fn scan_virtual_path(st: &ScanState, path: &Path) -> String {
+    let rel = path
+        .strip_prefix(&st.root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    if rel.is_empty() {
+        st.virt_base.clone()
+    } else {
+        format!("{}/{}", st.virt_base, rel)
+    }
+}
+
+/// Enumerate exactly one directory per call — bounded work per chunk, so the walk can't wedge a poll either.
+fn walk_one_dir(st: &mut ScanState) -> Result<(), String> {
+    let Some((dir, scopes)) = st.dir_queue.pop() else {
+        st.done = true;
+        return Ok(());
+    };
+    let display = scan_virtual_path(st, &dir);
+    let entries = std::fs::read_dir(&dir)
+        .map_err(|e| format!("scan {display}: cannot read directory: {e}"))?;
+    // this dir's own .gitignore joins the inherited scopes for its entries and all descendants
+    let mut child_scopes = scopes;
+    if st.opts.gitignore {
+        let sc = load_scope(&dir, &st.root)?;
+        if !sc.pats.is_empty() {
+            child_scopes.push(sc);
+        }
+    }
+    let mut subdirs = Vec::new();
+    let mut found = Vec::new();
+    for ent in entries {
+        let ent =
+            ent.map_err(|e| format!("scan {display}: cannot inspect directory entry: {e}"))?;
+        let name = ent.file_name().to_string_lossy().into_owned();
+        // hidden first (cheapest, rg's default), then explicit extras, then gitignore
+        if st.opts.skip_hidden && name.starts_with('.') {
+            continue;
+        }
+        // classify by the directory entry itself, never by following it: a symlinked dir/file
+        // would walk or read outside the mount (rg's own default — no --follow), and a FIFO
+        // would block the open with no deadline to rescue it. Only real dirs and regular files
+        // are scan material.
+        let ft = ent.file_type().map_err(|e| {
+            format!(
+                "scan {}: cannot inspect entry: {e}",
+                scan_virtual_path(st, &ent.path())
+            )
+        })?;
+        if ft.is_symlink() {
+            continue;
+        }
+        let p = ent.path();
+        let rel = p
+            .strip_prefix(&st.root)
+            .unwrap_or(&p)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if ft.is_dir() {
+            if st
+                .opts
+                .skip_dirs
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(&name))
+            {
+                continue;
+            }
+            if st.opts.gitignore && entry_ignored(&child_scopes, &rel, &name, true) {
+                continue;
+            }
+            subdirs.push((p, child_scopes.clone()));
+        } else if ft.is_file() {
             let ext = p
                 .extension()
                 .map(|e| e.to_string_lossy().to_lowercase())
                 .unwrap_or_default();
-            if !skip_exts.contains(&ext) {
-                out.push((
-                    p.clone(),
-                    p.strip_prefix(root)
-                        .unwrap_or(&p)
-                        .to_string_lossy()
-                        .into_owned(),
-                ));
-            }
-        }
-    }
-}
-
-/// Streaming substring scan over all mounted text files; skip lists are caller-replaceable policy (defaults are context economy)
-fn search_files(
-    mounts: &[Mount],
-    needle: &str,
-    max: usize,
-    skip_dirs: Vec<String>,
-    skip_exts: Vec<String>,
-) -> Result<Vec<String>, String> {
-    let mut files = Vec::new();
-    for mount in mounts {
-        let Ok(canon) = mount.root.canonicalize() else {
-            continue;
-        };
-        let mut tmp = Vec::new();
-        walk_text_files(&canon, &canon, &mut tmp, 0, &skip_dirs, &skip_exts);
-        let virt = mount.virt.trim_end_matches('/');
-        for (p, rel) in tmp {
-            files.push((p, format!("{virt}/{rel}")));
-        }
-    }
-    let mut out = Vec::new();
-    'outer: for (p, vpath) in files {
-        let Ok(f) = std::fs::File::open(&p) else {
-            continue;
-        };
-        for (i, line) in BufReader::new(f).lines().enumerate() {
-            let Ok(line) = line else { break };
-            if line.len() > LINE_SCAN_CAP {
+            if st.opts.skip_exts.contains(&ext) {
                 continue;
             }
-            if line.contains(needle) {
-                out.push(format!(
-                    "{vpath}:{}:{}",
-                    i + 1,
-                    line.chars().take(72).collect::<String>()
-                ));
-                if out.len() >= max {
-                    break 'outer;
+            if st.opts.gitignore && entry_ignored(&child_scopes, &rel, &name, false) {
+                continue;
+            }
+            if let Some(g) = &st.opts.glob {
+                if !file_matches_glob(g, &rel) {
+                    continue;
+                }
+            }
+            found.push((p, format!("{}/{}", st.virt_base, rel)));
+        }
+    }
+    subdirs.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic walk order: by path, scopes just ride along
+    found.sort();
+    st.dir_queue.extend(subdirs);
+    st.files.extend(found);
+    Ok(())
+}
+
+/// Next chunk of lines; an EMPTY chunk is the exhaustion signal (a non-final chunk always carries lines).
+fn scan_next_chunk(st: &mut ScanState) -> Result<Vec<ScanLine>, String> {
+    let mut lines = Vec::new();
+    let mut bytes = 0usize;
+    while lines.len() < SCAN_CHUNK && bytes < SCAN_CHUNK_BYTES {
+        if st.cur.is_none() {
+            while st.files.is_empty() && !st.done {
+                walk_one_dir(st)?;
+            }
+            if st.files.is_empty() {
+                break;
+            }
+            let (p, v) = st.files.pop_front().expect("files non-empty");
+            let f =
+                std::fs::File::open(&p).map_err(|e| format!("scan {v}: cannot open file: {e}"))?;
+            let mut r = BufReader::new(f);
+            // binary = NUL in the first buffer (grep/rg's physical definition, not judgment D017);
+            // the buffer isn't consumed — the reads below reuse it, so the sniff costs nothing.
+            // scan is a text channel: binary bytes were never expressible as lines, only wastefully
+            // opened — real byte inspection needs its own windowed channel (deferred, D018-style)
+            let is_binary = r
+                .fill_buf()
+                .map_err(|e| format!("scan {v}: cannot inspect file: {e}"))?
+                .contains(&0);
+            if is_binary {
+                continue;
+            }
+            st.lineno = 0;
+            st.cur = Some((r, v));
+        }
+        let mut rotate = false;
+        if let Some((r, vpath)) = st.cur.as_mut() {
+            let vpath = vpath.clone();
+            for _ in 0..(SCAN_CHUNK - lines.len()) {
+                let mut raw = String::new();
+                // bounded read: a pathological no-newline line stops at the hard cap instead of
+                // allocating the whole file (a 2GB embedded base64 blob is read as 8MB + drained)
+                let read = r.by_ref().take(SCAN_LINE_HARD + 1).read_line(&mut raw);
+                match read {
+                    Ok(0) => {
+                        rotate = true;
+                        break;
+                    }
+                    Ok(_) => {
+                        st.lineno += 1;
+                        // "hit the cap" = limit bytes with no newline: the physical line continues past
+                        // the bound (a line of exactly SCAN_LINE_HARD+1 bytes ending in \n is complete)
+                        if !raw.ends_with('\n') && raw.len() as u64 > SCAN_LINE_HARD {
+                            // deliver the capped prefix, marked as cut — the remainder is drained in
+                            // buffer-sized steps until the line's end or EOF (it can't be matched)
+                            raw.push('…');
+                            while let Ok(buf) = r.fill_buf() {
+                                if buf.is_empty() {
+                                    break;
+                                }
+                                match buf.iter().position(|&c| c == b'\n') {
+                                    Some(i) => {
+                                        r.consume(i + 1);
+                                        break;
+                                    }
+                                    None => {
+                                        let l = buf.len();
+                                        r.consume(l);
+                                    }
+                                }
+                            }
+                        }
+                        // deliver the line whole — a minified one-liner arrives as one long line and
+                        // the predicate sees all of it (grep matches the full line, truncates only
+                        // the display); context economy is guarded downstream by the feedback cap
+                        if raw.ends_with('\n') {
+                            raw.pop();
+                            if raw.ends_with('\r') {
+                                raw.pop();
+                            }
+                        }
+                        bytes += raw.len();
+                        lines.push(ScanLine {
+                            file: vpath.clone(),
+                            no: st.lineno,
+                            text: raw,
+                        });
+                        // the byte budget must bind where the allocations happen: this inner loop
+                        // could otherwise stack 1000 × 8MB monster lines before the outer check
+                        if bytes >= SCAN_CHUNK_BYTES {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        return Err(format!("scan {vpath}: invalid UTF-8 or read failure: {e}"));
+                    }
                 }
             }
         }
+        if rotate {
+            st.cur = None;
+        }
     }
-    Ok(out)
+    Ok(lines)
 }
 
 /// Existing target's shape, from a 4KB sample (dsh detectLineEndings semantics): leading BOM + majority EOL.
@@ -257,19 +773,37 @@ fn write_file(mounts: &[Mount], js_path: &str, content: &str) -> Result<usize, S
     }
     let joined = m.root.join(&rel);
     let parent = joined.parent().unwrap_or(&m.root).to_path_buf();
-    std::fs::create_dir_all(&parent).map_err(|e| format!("{js_path}: {e}"))?;
-    let canon_parent = parent
-        .canonicalize()
-        .map_err(|e| format!("{js_path}: {e}"))?;
     let root = m
         .root
+        .canonicalize()
+        .map_err(|e| format!("{js_path}: {e}"))?;
+    let mut existing = parent.clone();
+    while !existing.exists() {
+        let Some(next) = existing.parent() else {
+            return Err(format!("cannot resolve parent for {js_path}"));
+        };
+        existing = next.to_path_buf();
+    }
+    let canon_existing = existing
+        .canonicalize()
+        .map_err(|e| format!("{js_path}: {e}"))?;
+    if !canon_existing.starts_with(&root) {
+        return Err(format!("path escapes mount root, rejected: {js_path}"));
+    }
+    std::fs::create_dir_all(&parent).map_err(|e| format!("{js_path}: {e}"))?;
+    let canon_parent = parent
         .canonicalize()
         .map_err(|e| format!("{js_path}: {e}"))?;
     if !canon_parent.starts_with(&root) {
         return Err(format!("path escapes mount root, rejected: {js_path}"));
     }
     let target = canon_parent.join(joined.file_name().unwrap_or_default());
-    let (bom, crlf) = detect_shape(&target);
+    // rename replaces a symlink rather than following it; the link itself carries no shape, and
+    // sniffing through it would read an out-of-mount file. New/regular targets keep their shape.
+    let (bom, crlf) = match std::fs::symlink_metadata(&target) {
+        Ok(md) if md.file_type().is_symlink() => (false, false),
+        _ => detect_shape(&target),
+    };
     let mut body = content.replace("\r\n", "\n"); // canonicalize; lone \r is left untouched
     if crlf {
         body = body.replace('\n', "\r\n");
@@ -284,7 +818,14 @@ fn write_file(mounts: &[Mount], js_path: &str, content: &str) -> Result<usize, S
         std::process::id(),
         TMP_CTR.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&tmp, &out).map_err(|e| format!("{js_path}: {e}"))?;
+    let mut tmp_file = std::fs::OpenOptions::new();
+    tmp_file.write(true).create_new(true);
+    let mut tmp_file = tmp_file.open(&tmp).map_err(|e| format!("{js_path}: {e}"))?;
+    tmp_file
+        .write_all(out.as_bytes())
+        .map_err(|e| format!("{js_path}: {e}"))?;
+    tmp_file.sync_all().map_err(|e| format!("{js_path}: {e}"))?;
+    drop(tmp_file);
     // brief backoff retries: transient holders (AV scanners, indexers, editors — the classic Windows
     // sharing violation, same mitigation git/cargo use); persistent holders still surface as an error
     let mut err = None;
@@ -347,24 +888,71 @@ pub fn install<'js>(ctx: &Ctx<'js>, host: &Object<'js>, mounts: &[Mount]) -> rqu
     fsobj.set("read", read_fn)?;
 
     let m = mounts.clone();
-    let search_fn = Function::new(
+    // scan: chunked line stream — next() resolves to a lines array; empty array = exhausted.
+    // The async-iterator blessing (Symbol.asyncIterator, chunk flattening) lives in prelude.js.
+    let scan_fn = Function::new(
         ctx.clone(),
-        move |needle: String, max: Opt<f64>, skips: Opt<Object>| {
-            let max = max.0.map(|x| x.max(1.0) as usize).unwrap_or(20);
-            let mut skip_dirs: Vec<String> = SKIP_DIRS.iter().map(|s| s.to_string()).collect();
-            let mut skip_exts: Vec<String> = SKIP_EXTS.iter().map(|s| s.to_string()).collect();
-            if let Some(o) = skips.0 {
-                if let Some(v) = o.get::<_, Option<Vec<String>>>("skipDirs").ok().flatten() {
-                    skip_dirs = v;
+        move |ctx: Ctx<'js>, path: String, opts: Opt<Object>| -> rquickjs::Result<Object> {
+            let mut so = ScanOpts::default(); // ripgrep defaults: gitignore respected, dot-entries skipped
+            if let Some(o) = opts.0 {
+                so.skip_dirs = o
+                    .get::<_, Option<Vec<String>>>("skipDirs")
+                    .map_err(|e| {
+                        js_err(format!(
+                            "scan option skipDirs must be an array of strings: {e}"
+                        ))
+                    })?
+                    .unwrap_or_default();
+                so.skip_exts = o
+                    .get::<_, Option<Vec<String>>>("skipExts")
+                    .map_err(|e| {
+                        js_err(format!(
+                            "scan option skipExts must be an array of strings: {e}"
+                        ))
+                    })?
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|s| s.to_lowercase())
+                    .collect();
+                if let Some(v) = o
+                    .get::<_, Option<String>>("glob")
+                    .map_err(|e| js_err(format!("scan option glob must be a string: {e}")))?
+                {
+                    if v.chars().count() > GLOB_PAT_MAX {
+                        return Err(js_err(format!(
+                            "glob pattern longer than {GLOB_PAT_MAX} chars — not a real-world glob"
+                        )));
+                    }
+                    so.glob = Some(v);
                 }
-                if let Some(v) = o.get::<_, Option<Vec<String>>>("skipExts").ok().flatten() {
-                    skip_exts = v.into_iter().map(|s| s.to_lowercase()).collect();
+                if let Some(v) = o
+                    .get::<_, Option<bool>>("gitignore")
+                    .map_err(|e| js_err(format!("scan option gitignore must be a boolean: {e}")))?
+                {
+                    so.gitignore = v;
+                }
+                if let Some(v) = o
+                    .get::<_, Option<bool>>("hidden")
+                    .map_err(|e| js_err(format!("scan option hidden must be a boolean: {e}")))?
+                {
+                    so.skip_hidden = !v; // {hidden: true} includes dot-entries, rg's --hidden polarity
                 }
             }
-            search_files(&m, &needle, max, skip_dirs, skip_exts).map_err(js_err)
+            let st = scan_open(&m, &path, so).map_err(js_err)?;
+            let rc: Rc<RefCell<ScanState>> = Rc::new(RefCell::new(st));
+            let next_fn = Function::new(
+                ctx.clone(),
+                rquickjs::function::Async(move || {
+                    let rc = rc.clone(); // clone per call: the closure must stay Fn (D013)
+                    async move { scan_next_chunk(&mut rc.borrow_mut()).map_err(js_err) }
+                }),
+            )?;
+            let it = Object::new(ctx.clone())?;
+            it.set("next", next_fn)?;
+            Ok(it)
         },
     )?;
-    fsobj.set("search", search_fn)?;
+    fsobj.set("scan", scan_fn)?;
 
     let m = mounts.clone();
     let text_fn = Function::new(ctx.clone(), move |path: String| {
@@ -394,11 +982,292 @@ mod tests {
     }
 
     fn mounts_at(root: &Path, rw: bool) -> Vec<Mount> {
-        vec![Mount {
-            virt: "/t/".into(),
-            root: root.to_path_buf(),
-            rw,
-        }]
+        vec![Mount::from_canonical("/t", root.to_path_buf(), rw).unwrap()]
+    }
+
+    #[test]
+    fn glob_basics() {
+        assert!(file_matches_glob("*.rs", "src/main.rs"));
+        assert!(!file_matches_glob("*.rs", "src/main.ts"));
+        assert!(!file_matches_glob("*.rs", "src/mod.rs.bak"));
+        assert!(file_matches_glob("**/*.rs", "a/b/c.rs"));
+        assert!(file_matches_glob("src/**/*.rs", "src/a/b/c.rs"));
+        assert!(file_matches_glob("src/*.rs", "src/main.rs"));
+        assert!(!file_matches_glob("src/*.rs", "src/a/main.rs")); // single * stays in-segment
+        assert!(file_matches_glob("a?c.rs", "abc.rs"));
+        assert!(!file_matches_glob("a?c.rs", "ac.rs"));
+        assert!(!file_matches_glob("a?c.rs", "a/c.rs"));
+        assert!(file_matches_glob("foo.spec.ts", "x/y/foo.spec.ts")); // no slash → basename
+        assert!(file_matches_glob("**/*.rs", "main.rs"));
+        assert!(file_matches_glob("src/**/*.rs", "src/main.rs"));
+    }
+
+    #[test]
+    fn mount_paths_reject_ambiguous_components() {
+        let root = tmp_root("mount-path");
+        assert!(Mount::from_canonical("/t//x", root.clone(), false).is_err());
+        assert!(Mount::from_canonical("/t/../x", root.clone(), false).is_err());
+        assert!(Mount::from_canonical("/t/./x", root, false).is_err());
+    }
+
+    #[test]
+    fn nested_mounts_are_order_independent() {
+        let root = tmp_root("mount-overlap");
+        let outer = Mount::from_canonical("/a", root.clone(), false).unwrap();
+        let inner = Mount::from_canonical("/a/b", root, true).unwrap();
+        assert!(outer.overlaps(&inner));
+        assert!(inner.overlaps(&outer));
+    }
+
+    #[tokio::test]
+    async fn scan_rejects_invalid_option_types() {
+        let root = tmp_root("scan-options");
+        let mounts = mounts_at(&root, false);
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let out =
+            crate::kernel::eval_js("host.fs.scan('/t', {hidden: 'yes'})", 5_000, &mounts, tx).await;
+        assert!(!out.ok);
+        let message = out.error.expect("scan option error").message;
+        assert!(message.contains("hidden"), "{message}");
+    }
+
+    #[test]
+    fn scan_reports_invalid_utf8_instead_of_skipping_the_file() {
+        let root = tmp_root("scan-utf8");
+        std::fs::write(root.join("bad.txt"), b"ok\n\xff\n").unwrap();
+        let mounts = mounts_at(&root, false);
+        let mut state = scan_open(&mounts, "/t", ScanOpts::default()).unwrap();
+        let error = scan_next_chunk(&mut state).unwrap_err();
+        assert!(error.contains("bad.txt"), "{error}");
+        assert!(
+            error.contains("UTF-8") || error.contains("utf-8"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn scan_streams_in_chunks_and_honors_glob_and_skips() {
+        let root = tmp_root("scan");
+        std::fs::create_dir_all(root.join("x/y")).unwrap();
+        std::fs::create_dir_all(root.join("x/.git")).unwrap();
+        std::fs::write(root.join("x/a.rs"), "one\ntwo\n").unwrap();
+        std::fs::write(root.join("x/c.txt"), "four\n").unwrap();
+        std::fs::write(root.join("x/y/b.rs"), "three\n").unwrap();
+        std::fs::write(root.join("x/.git/config"), "needle\n").unwrap();
+        let ms = mounts_at(&root, false);
+
+        let drains = |mut st: ScanState| {
+            let mut all = Vec::new();
+            loop {
+                let c = scan_next_chunk(&mut st).unwrap();
+                if c.is_empty() {
+                    break;
+                }
+                all.extend(c);
+            }
+            all
+        };
+        // defaults (rg semantics): dot-entries skipped, .git never entered
+        let all = drains(scan_open(&ms, "/t/x", ScanOpts::default()).unwrap());
+        let texts: Vec<&str> = all.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, ["one", "two", "four", "three"]);
+        assert_eq!(all[0].file, "/t/x/a.rs");
+        assert_eq!(all[0].no, 1);
+        assert_eq!(all[2].file, "/t/x/c.txt");
+        // glob filters candidates host-side (non-matching files are never opened)
+        let rs = drains(
+            scan_open(
+                &ms,
+                "/t/x",
+                ScanOpts {
+                    glob: Some("*.rs".into()),
+                    ..ScanOpts::default()
+                },
+            )
+            .unwrap(),
+        );
+        let texts: Vec<&str> = rs.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, ["one", "two", "three"]);
+        // {hidden: true} surfaces dot-entries (rg --hidden polarity)
+        let all = drains(
+            scan_open(
+                &ms,
+                "/t/x",
+                ScanOpts {
+                    skip_hidden: false,
+                    ..ScanOpts::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert!(all.iter().any(|l| l.file.ends_with(".git/config")));
+        // skipDirs is an opt-in extra prune, not baked-in magic
+        std::fs::create_dir_all(root.join("x/vendor")).unwrap();
+        std::fs::write(root.join("x/vendor/v.rs"), "vend\n").unwrap();
+        let all = drains(
+            scan_open(
+                &ms,
+                "/t/x",
+                ScanOpts {
+                    skip_dirs: vec!["vendor".into()],
+                    ..ScanOpts::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert!(!all.iter().any(|l| l.file.contains("vendor")));
+        // not-a-directory is a caller error
+        let err = scan_open(&ms, "/t/x/a.rs", ScanOpts::default()).unwrap_err();
+        assert!(err.contains("not a directory"), "{err}");
+    }
+
+    #[test]
+    fn gitignore_rules_prune_the_walk_and_can_be_overridden() {
+        let root = tmp_root("gi");
+        // covers the whole subset: anchored dir-only, basename anywhere, **, negation, nested scope
+        std::fs::write(
+            root.join(".gitignore"),
+            "/out/\n*.log\n!important.log\nbuild/\n**/*.gen.rs\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("keep.rs"), "k\n").unwrap();
+        std::fs::write(root.join("a.log"), "x\n").unwrap();
+        std::fs::write(root.join("important.log"), "i\n").unwrap(); // ! negation re-includes
+        std::fs::create_dir_all(root.join("out/deep")).unwrap();
+        std::fs::write(root.join("out/skipme.rs"), "x\n").unwrap(); // anchored dir-only
+        std::fs::create_dir_all(root.join("src/build")).unwrap();
+        std::fs::write(root.join("src/build/s.rs"), "x\n").unwrap(); // unanchored dir pattern
+        std::fs::write(root.join("src/w.gen.rs"), "x\n").unwrap(); // ** anywhere
+        std::fs::write(root.join("src/ok.rs"), "o\n").unwrap();
+        // nested scope: only ignores vend/ below sub/
+        std::fs::create_dir_all(root.join("sub/vend")).unwrap();
+        std::fs::write(root.join("sub/.gitignore"), "vend/\n").unwrap();
+        std::fs::write(root.join("sub/vend/v.rs"), "x\n").unwrap(); // ignored by nested scope
+        std::fs::create_dir_all(root.join("vend")).unwrap();
+        std::fs::write(root.join("vend/root.rs"), "r\n").unwrap(); // NOT covered by sub/.gitignore
+        let ms = mounts_at(&root, false);
+        let drain = |opts: ScanOpts| {
+            let mut st = scan_open(&ms, "/t", opts).unwrap();
+            let mut v = Vec::new();
+            loop {
+                let c = scan_next_chunk(&mut st).unwrap();
+                if c.is_empty() {
+                    break;
+                }
+                v.extend(c.into_iter().map(|l| l.file));
+            }
+            v
+        };
+        let on = drain(ScanOpts::default());
+        let mut uniq = on.clone();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 4, "{uniq:?}"); // the 4 non-hidden survivors
+        assert!(uniq.contains(&"/t/keep.rs".to_string()));
+        assert!(uniq.contains(&"/t/important.log".to_string())); // negation won
+        assert!(uniq.contains(&"/t/src/ok.rs".to_string()));
+        assert!(uniq.contains(&"/t/vend/root.rs".to_string())); // nested scope stays nested
+        assert!(!on.iter().any(|f| f.contains("a.log")));
+        assert!(!on.iter().any(|f| f.contains("/out/")));
+        assert!(!on.iter().any(|f| f.contains("build/")));
+        assert!(!on.iter().any(|f| f.ends_with("w.gen.rs")));
+        assert!(!on.iter().any(|f| f.contains("sub/vend/")));
+        // rule files are dot-entries — skipped by default like rg, present under {hidden: true}
+        assert!(!on.iter().any(|f| f.ends_with(".gitignore")));
+        let seen = drain(ScanOpts {
+            skip_hidden: false,
+            ..ScanOpts::default()
+        });
+        assert!(seen.iter().any(|f| f == "/t/.gitignore"));
+        assert!(seen.iter().any(|f| f == "/t/sub/.gitignore"));
+        // the model's escape hatch: everything non-hidden comes back
+        let off = drain(ScanOpts {
+            gitignore: false,
+            ..ScanOpts::default()
+        });
+        assert!(off.iter().any(|f| f.ends_with("a.log")));
+        assert!(off.iter().any(|f| f.contains("/out/skipme.rs")));
+        assert!(off.iter().any(|f| f.contains("src/build/")));
+        assert!(off.iter().any(|f| f.contains("sub/vend/")));
+    }
+
+    #[test]
+    fn scan_skips_nul_binaries_and_caps_pathological_lines() {
+        let root = tmp_root("scanbin");
+        // NUL-containing file with an ALLOWED extension: never surfaces (scan is a text channel)
+        std::fs::write(
+            root.join("movie.mp4"),
+            b"\x00\x00\x00\x1cftypisom needle-in-binary\x00",
+        )
+        .unwrap();
+        std::fs::write(root.join("ok.txt"), "fine\n").unwrap();
+        // minified-style single line (200KB, no newline until the end) followed by a normal line:
+        // delivered WHOLE — match completeness belongs to the predicate, not the transport
+        let long = format!("{}tail\nafter\n", "x".repeat(200 * 1024));
+        std::fs::write(root.join("mini.json"), long).unwrap();
+        let ms = mounts_at(&root, false);
+        let mut st = scan_open(&ms, "/t", ScanOpts::default()).unwrap();
+        let mut all = Vec::new();
+        loop {
+            let c = scan_next_chunk(&mut st).unwrap();
+            if c.is_empty() {
+                break;
+            }
+            all.extend(c);
+        }
+        let files: Vec<&str> = all
+            .iter()
+            .map(|l| l.file.rsplit('/').next().unwrap())
+            .collect();
+        assert!(!files.contains(&"movie.mp4"), "{files:?}");
+        let mini: Vec<&ScanLine> = all
+            .iter()
+            .filter(|l| l.file.ends_with("mini.json"))
+            .collect();
+        assert_eq!(mini.len(), 2);
+        assert_eq!(mini[0].text.chars().count(), 200 * 1024 + 4); // 'x'*200KB + "tail", nothing cut
+        assert!(mini[0].text.ends_with("tail"));
+        assert_eq!(mini[1].text, "after");
+        assert_eq!(mini[1].no, 2);
+        assert!(all.iter().any(|l| l.text == "fine"));
+    }
+
+    #[test]
+    fn scan_hard_cuts_monster_lines_beyond_the_heap_scale() {
+        let root = tmp_root("scanmonster");
+        // a single 9MB line: past the 8MB read bound the line is cut (marked '…') and its
+        // remainder drained — the bound ≈ what the 64MB cage heap could hold anyway
+        let mut blob = String::with_capacity(9 * 1024 * 1024 + 8);
+        for _ in 0..9 * 1024 * 1024 {
+            blob.push('x');
+        }
+        blob.push_str("needle\n");
+        std::fs::write(root.join("blob.txt"), blob.as_bytes()).unwrap();
+        std::fs::write(root.join("after.txt"), "still scanned\n").unwrap();
+        let ms = mounts_at(&root, false);
+        let mut st = scan_open(&ms, "/t", ScanOpts::default()).unwrap();
+        let mut all = Vec::new();
+        loop {
+            let c = scan_next_chunk(&mut st).unwrap();
+            if c.is_empty() {
+                break;
+            }
+            all.extend(c);
+        }
+        let blob_lines: Vec<&ScanLine> = all
+            .iter()
+            .filter(|l| l.file.ends_with("blob.txt"))
+            .collect();
+        assert_eq!(blob_lines.len(), 1);
+        assert_eq!(blob_lines[0].text.len(), (SCAN_LINE_HARD + 1) as usize + 3); // take-limit bytes + '…' (3 bytes UTF-8)
+        assert!(blob_lines[0].text.ends_with('…'));
+        assert!(!blob_lines[0].text.contains("needle")); // beyond the cut — documented incompleteness
+                                                         // the drain ended exactly at the line's end: the next file still scans with correct numbering
+        let after: Vec<&ScanLine> = all
+            .iter()
+            .filter(|l| l.file.ends_with("after.txt"))
+            .collect();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].text, "still scanned");
     }
 
     #[test]
@@ -478,26 +1347,6 @@ mod tests {
     }
 
     #[test]
-    fn search_skips_are_replaceable() {
-        let root = tmp_root("search");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::write(root.join(".git/config"), "needle-here").unwrap();
-        std::fs::write(root.join("code.rs"), "needle-too").unwrap();
-        let ms = mounts_at(&root, false);
-        let defaults = search_files(
-            &ms,
-            "needle",
-            20,
-            SKIP_DIRS.iter().map(|s| s.to_string()).collect(),
-            SKIP_EXTS.iter().map(|s| s.to_string()).collect(),
-        )
-        .unwrap();
-        assert_eq!(defaults.len(), 1); // .git skipped by default
-        let all = search_files(&ms, "needle", 20, vec![], vec![]).unwrap();
-        assert_eq!(all.len(), 2); // empty overrides scan everything
-    }
-
-    #[test]
     fn write_restores_crlf_bom_and_lone_cr() {
         let root = tmp_root("shape");
         let ms = mounts_at(&root, true);
@@ -545,5 +1394,103 @@ mod tests {
         assert!(resolve_mount(&ms, "/nope/x")
             .unwrap_err()
             .contains("not under any mount"));
+    }
+
+    #[test]
+    fn strip_mount_is_component_wise() {
+        let root = tmp_root("prefix");
+        let ms = mounts_at(&root, false);
+        // "/t" must never capture "/tmp2/…" — the old textual prefix silently misfiled neighbors
+        assert!(strip_mount(&ms, "/tmp2/fs.rs").is_err());
+        assert_eq!(strip_mount(&ms, "/t").unwrap().1, "");
+        assert_eq!(strip_mount(&ms, "/t/").unwrap().1, "");
+        assert_eq!(strip_mount(&ms, "/t/a/b.rs").unwrap().1, "a/b.rs");
+        // sibling-prefix mounts resolve by component, independent of registration order
+        for ms in [
+            vec![
+                Mount::from_canonical("/a", root.clone(), false).unwrap(),
+                Mount::from_canonical("/ab", root.clone(), false).unwrap(),
+            ],
+            vec![
+                Mount::from_canonical("/ab", root.clone(), false).unwrap(),
+                Mount::from_canonical("/a", root.clone(), false).unwrap(),
+            ],
+        ] {
+            assert_eq!(strip_mount(&ms, "/ab").unwrap().0.virtual_path(), "/ab/");
+            assert_eq!(strip_mount(&ms, "/ab/x").unwrap().0.virtual_path(), "/ab/");
+            assert_eq!(strip_mount(&ms, "/a/x").unwrap().0.virtual_path(), "/a/");
+        }
+    }
+
+    #[test]
+    fn glob_terminates_on_pathological_patterns() {
+        // exponential backtracking bait: with the old recursive matcher this hung a whole poll
+        let name: String = "a".repeat(40);
+        assert!(!file_matches_glob("*a*a*a*a*a*a*a*a*a*b", &name));
+        assert!(file_matches_glob(&format!("*{}", "a".repeat(40)), &name));
+        // deep `**` chains must not recurse (multi-MB patterns once overflowed the native stack)
+        let deep: Vec<char> = "*".repeat(2000).chars().collect();
+        assert!(glob_match(&deep, &"x/y/z".chars().collect::<Vec<_>>()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tail_symlinks_resolve_through_the_boundary_decision() {
+        let root = tmp_root("symlink");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("secret.txt"), "top secret").unwrap();
+        let outside = tmp_root("symlink-out");
+        std::fs::write(outside.join("private.txt"), "private").unwrap();
+        // outward symlink on every channel's final component…
+        std::os::unix::fs::symlink(outside.join("private.txt"), root.join("leak.txt")).unwrap();
+        // …while a symlink that stays inside the mount is legitimate repo furniture
+        std::os::unix::fs::symlink(root.join("secret.txt"), root.join("alias.txt")).unwrap();
+        let ms = mounts_at(&root, false);
+        let err = read_text(&ms, "/t/leak.txt").unwrap_err();
+        assert!(err.contains("escapes mount root"), "{err}");
+        assert!(read_window(&ms, "/t/leak.txt", 1, 5).is_err());
+        assert_eq!(read_text(&ms, "/t/alias.txt").unwrap(), "top secret");
+        // scan never follows symlinks (rg default without -L): outward or inward, links are skipped
+        std::os::unix::fs::symlink(&outside, root.join("sub/evil")).unwrap();
+        let mut st = scan_open(&ms, "/t", ScanOpts::default()).unwrap();
+        let mut files = Vec::new();
+        loop {
+            let c = scan_next_chunk(&mut st).unwrap();
+            if c.is_empty() {
+                break;
+            }
+            files.extend(c.into_iter().map(|l| l.file));
+        }
+        assert!(!files.iter().any(|f| f.contains("private")), "{files:?}");
+        assert!(!files.iter().any(|f| f.contains("leak")), "{files:?}");
+        assert!(!files.iter().any(|f| f.contains("alias")), "{files:?}");
+        // a scan ROOT that is itself an outward symlink is rejected by the same boundary rule
+        std::os::unix::fs::symlink(&outside, root.join("rootlink")).unwrap();
+        assert!(scan_open(&ms, "/t/rootlink", ScanOpts::default()).is_err());
+    }
+
+    #[test]
+    fn text_channel_rejects_files_beyond_the_cage_heap() {
+        let root = tmp_root("huge");
+        let f = std::fs::File::create(root.join("huge.bin")).unwrap();
+        f.set_len(crate::MEM_LIMIT as u64 + 1).unwrap(); // sparse: no bytes actually written
+        let ms = mounts_at(&root, false);
+        let err = read_text(&ms, "/t/huge.bin").unwrap_err();
+        assert!(err.contains("64MB cage heap"), "{err}");
+    }
+
+    #[test]
+    fn text_channel_strips_a_leading_bom() {
+        let root = tmp_root("bom");
+        std::fs::write(root.join("b.txt"), b"\xEF\xBB\xBFa\r\nb").unwrap();
+        let ms = mounts_at(&root, false);
+        assert_eq!(read_text(&ms, "/t/b.txt").unwrap(), "a\nb");
+        // write restores what the target had: the round trip is shape-preserving both ways
+        let ms = mounts_at(&root, true);
+        write_file(&ms, "/t/b.txt", "c\nd").unwrap();
+        assert_eq!(
+            std::fs::read(root.join("b.txt")).unwrap(),
+            b"\xEF\xBB\xBFc\r\nd"
+        );
     }
 }

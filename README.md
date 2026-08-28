@@ -1,43 +1,46 @@
 # terrarium
 
-An agent runtime where **the model's actions are programs, not tool calls.** Each turn the LLM writes one complete ES2020 JavaScript program; the kernel executes it in a fresh sandbox cage (64 MB heap / 1 MB stack / hard deadline) and hands back one JSON result. Loops, retries, branching, parallelism, sub-agent delegation — everything an agent harness usually implements — are language constructs *inside* the program. The harness is not a tool dispatcher; it is a kernel: execute, enforce limits, return JSON.
+An agent runtime where the model's actions are programs, not tool calls. Each turn submits one complete ES2020 JavaScript program; the kernel runs it in a fresh QuickJS cage with a 64 MB heap, 1 MB stack, and hard deadline, then returns one structured JSON result.
 
 [中文文档](README.zh-CN.md)
 
 ## The protocol
 
-One session is: task → programs → final answer. Every model reply is exactly one of two things:
+One agent session is a sequence of programs. A model reply must contain one closed `run` fence:
 
-- a fenced `run` block — one complete program; the kernel executes it and feeds the JSON result back as the next message
-- a `FINAL:` line — the committed answer; nothing after it is extracted or run
-
-````
-task:   Where does the kernel set its HTTP timeout?
-
-reply:  ```run
-        return host.fs.search("http client", 20).filter(h => h.startsWith("/proj/src/"))
-        ```
-        (the repo is scanned host-side — file contents never enter the model's context)
-
-result: {"round":3,"ok":true,"result":"[\"/proj/src/main.rs:262: …\"]","stdout":"","error":null,"timed_out":false,"elapsed_ms":6}
-
-reply:  FINAL: src/main.rs:262 — the HTTP client is built there with a 120 s per-request timeout.
+````text
+```run
+for await (const line of host.fs.scan("/proj/src", {glob: "*.rs"})) {
+  if (line.text.includes("http client")) return `${line.file}:${line.no}`;
+}
+```
 ````
 
-Why a `run` fence, not ` ```javascript `? A language tag describes content, and models write language-tagged fences all the time to *show* code. `run` is an instruction to the runtime with exactly one meaning: execute this program. (The kernel still tolerates ` ```js `/` ```javascript ` fences and `<run>` tags as a robustness fallback, but the contract teaches a single marker. And the dialect is not plain JavaScript anyway: top-level `return` and `await`, `host.*` APIs, `runBlock`/`spawnAgent` built-ins.)
+A normal `return` ends only that run. The session ends when the program calls `host.agent.answer(text)`:
 
-## Why programs, not tool calls
+````text
+```run
+host.agent.answer("The HTTP client is configured in src/llm.rs.");
+```
+````
 
-- One round-trip, one unit of work: a whole plan executes per turn instead of one tool call — context is spent on results, not on turn-taking.
-- Control flow is free: retry is `try/catch`, branching is `if`, parallelism is `Promise.all`, delegation is `spawnAgent(task)` — no harness feature has to exist before the model can use it.
-- The capability surface stays tiny because the language is the combinator: `host.fs` and `host.llm` are all there is.
-- Failures are cheap: each run gets a fresh cage; a dead run (OOM, timeout) kills that run only — the session survives and the next run starts clean.
+The parser accepts only a complete `run` fence. An unclosed fence is a protocol error. A reply without a run program is also a protocol error. There is no text-based completion marker.
+
+Every run is evaluated as one async function body, so top-level `return` and `await` have the same meaning in every program. The result keeps JSON values as JSON instead of formatting them as strings.
+
+## Why programs
+
+- A whole unit of work executes per turn; context is spent on findings instead of tool-call bookkeeping.
+- JavaScript supplies control flow, retries, branching, and concurrency through ordinary language constructs.
+- The host surface stays small: filesystem capabilities, nested text-only LLM calls, and the explicit session answer function.
+- Each run has a fresh cage, so a failed run does not corrupt the next run.
 
 ## The cage
 
-- Per run: 64 MB heap, 1 MB stack, one hard deadline. Defaults to 2 s; agent mode caps it at 300 s, and a program can request a larger budget with a `// timeout-ms: N` first line.
-- Filesystem access only through mounts declared at launch (`--mount /virt=real`; writable only with `:rw`). Escapes (`..`, symlinks out of the root) are rejected by path physics, not judgment — a policy denial belongs in the final answer, not in a retry.
-- API keys live in the host process environment; the sandbox never sees them.
+- Per run: 64 MB heap, 1 MB stack, and one hard deadline. Agent mode defaults to 10 seconds; single-run mode defaults to 2 seconds. A first-line `// timeout-ms: N` directive may raise an agent run up to 300 seconds.
+- Captured stdout is limited to 16 KB. Host file reads use bounded windows or a bounded whole-file channel.
+- Filesystem access exists only under operator-declared mounts. `:rw` is required for writes. Path escapes and symlinks that resolve outside a mount are rejected; scans never follow symlinks.
+- API credentials remain in the host process environment and are never exposed to JavaScript.
 
 ## Quick start
 
@@ -46,12 +49,16 @@ cargo build --release
 echo 'return 1+1' | ./target/release/terrarium
 ```
 
+The command prints one JSON object:
+
 ```json
 {
   "ok": true,
-  "result": "2",
+  "value": 2,
+  "answer": null,
   "stdout": "",
   "error": null,
+  "termination": "returned",
   "timed_out": false,
   "elapsed_ms": 1,
   "target": "x86_64-linux",
@@ -61,7 +68,7 @@ echo 'return 1+1' | ./target/release/terrarium
 }
 ```
 
-Mount a project and print the full agent contract (the exact text your LLM is taught):
+Print the exact contract used for a mounted project:
 
 ```sh
 ./target/release/terrarium --mount /proj=$(pwd) --contract
@@ -69,44 +76,68 @@ Mount a project and print the full agent contract (the exact text your LLM is ta
 
 ## Command line
 
-Run mode — execute one program (code from argv, or stdin when omitted):
+Run one program from arguments, or from stdin when no code argument is supplied:
 
 ```sh
-terrarium [--timeout N] [--mount /virt=real[:rw]]... [--contract] [code]
+terrarium [--timeout-ms N] [--mount /virt=real[:rw]]... [--contract] [code]
 ```
 
-Agent mode — an outer loop that talks to an LLM; conversation state lives outside the cage, every run gets a fresh one:
+Run the outer agent loop:
 
 ```sh
 terrarium agent <task-file | task text> [--mount /virt=real[:rw]]... [--max-rounds N] [--run-timeout-ms N]
 ```
 
+All time values are milliseconds. Run mode exits `0` for a successful program, `1` for a failed run, and `2` for usage/configuration errors. Agent mode exits `0` after `host.agent.answer`, `1` for transport or usage failure, and `2` when the round budget is exhausted.
+
 ## Host API
 
-Inside a program the model gets `host` (run `host.help()` for the live surface, or `--contract` for the full contract):
+Inside a program, use `host.help()` for the live surface or `--contract` for the complete generated contract:
 
-- `host.fs.{list,read,text,search,write}` — zooming exploration: `list` (sizes come free) → windowed `read`; full-repo `search` runs host-side so file contents never enter the model's context; `text` reads a whole file into the program for spot edits; `write` is text-only, atomic, auto-creates parent dirs.
-- `host.llm.{call,chat}` — nested LLM turns.
+- `host.fs.list(dir)` lists one directory level, including sizes and symlink entries.
+- `host.fs.read(path, from, to)` reads a bounded line window. `to=Infinity` reads to EOF within the window budget.
+- `host.fs.text(path)` reads a whole text file into the program when it fits the 64 MB host budget.
+- `host.fs.scan(path, options)` streams text-file lines from a directory tree. It respects `.gitignore`, skips hidden entries, binaries, and symlinks by default, and validates option types. Traversal and decoding errors reject the scan rather than becoming an empty result.
+- `host.fs.write(path, content)` atomically writes text under a declared `:rw` mount and returns the byte count.
+- `host.llm.call(prompt, system)` and `host.llm.chat(messages, system)` make nested text requests through the configured OpenAI-compatible chat-completions endpoint.
+- `host.agent.answer(text)` commits the current agent session answer. Returning from a program never commits the session.
 
-Built into every program: `runBlock(code)` (nested run, same semantics) and `spawnAgent(task, {system?, maxTurns=8})` (fresh-context sub-agent — a main agent with a different context; one contract teaches both).
+The current model examples declare these capabilities:
+
+- `deepseek-v4-flash`: text input and text output; it does not accept image input.
+- `deepseek-v4-flash-vision-exp`: text or image input and text output.
+
+This phase only declares those capabilities. The implemented `host.llm` request payload is text-only; image file reading, encoding, and artifact transport are not implemented.
 
 ## Configuration
 
 | Variable | Purpose |
 |---|---|
-| `DEEPSEEK_API_KEY` | Required for `host.llm` and agent mode |
-| `TERRARIUM_LLM_BASE_URL` | Endpoint override (any OpenAI-compatible provider) |
-| `TERRARIUM_LLM_MODEL` | Model override |
+| `TERRARIUM_LLM_API_KEY` | API key for agent mode and `host.llm` |
+| `TERRARIUM_LLM_BASE_URL` | OpenAI-compatible chat-completions endpoint |
+| `TERRARIUM_LLM_MODEL` | Model ID sent upstream; defaults to `deepseek-v4-flash` |
+| `TERRARIUM_LOG_RUNS` | Set to `1` to log executed run source to stderr |
 
-Keys live only in the process environment — the sandbox can't see them. In agent mode, if the environment doesn't carry the key, terrarium also falls back to reading it from a `./.env` file.
+The binary does not load `.env` files. Supply credentials through the process environment or an external secret manager. Keep secret files outside mounted directories.
 
 ## Repository layout
 
-- `src/main.rs` — kernel pipeline: fresh cage per run, limits, cancellation protocol
-- `src/registry.rs` — host API registry; `host.help()` and the contract are generated from it, so they cannot drift
-- `src/fs.rs`, `src/llm.rs` — host capabilities (mounts, LLM endpoint)
-- `src/agent.rs` — the outer agent loop
-- `src/CONTRACT.md`, `src/MAIN.md`, `src/prelude.js` — teaching contract, role template, runtime helpers; compiled into the binary via `include_str!`
+- `src/lib.rs`, `src/kernel.rs` — reusable kernel boundary and one fresh cage per run
+- `src/main.rs`, `src/cli.rs` — process and terminal adapters
+- `src/agent.rs` — outer agent loop and run-fence parser
+- `src/fs.rs`, `src/llm.rs`, `src/registry.rs` — host capabilities and live API registry
+- `src/prompts/`, `src/runtime/` — embedded model prompt and JavaScript runtime assets
+- `docs/` — maintained design, protocol, configuration, security, and integration notes
+
+The library exposes `Kernel` and validated `Mount` for non-CLI callers. A future Web UI should add a service adapter over this library instead of spawning the binary or scraping stderr.
+
+## Documentation
+
+- [Design direction](docs/design.md)
+- [Current protocol](docs/protocol.md)
+- [Configuration](docs/configuration.md)
+- [Security boundary](docs/security.md)
+- [Web UI integration boundary](docs/web-ui.md)
 
 ## License
 
