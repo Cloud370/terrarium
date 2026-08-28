@@ -1,7 +1,9 @@
-//! host.llm —— nested model calls: call (one-shot) / chat (multi-turn, auto-prepends contract).
-//! Async-concurrent (Promise.all = max not sum), cancellable (watch token), transport hangs self-heal via 120s × 2 retries.
-//! Keys live only in this process's env; the sandbox can't see them. Usage accounting stays
-//! Rust-side (usage_json below) and rides along in the result JSON, never inside the cage.
+//! host.llm —— stateless nested model calls. `call(prompt, system)` sends exactly what the
+//! program provides; the nested model gets no contract, mounts, or host capabilities.
+//! Async-concurrent (Promise.all = max not sum), cancellable (watch token), transport hangs
+//! self-heal via 120s × 2 retries. Keys live only in this process's env; the sandbox can't see
+//! them. Usage accounting stays Rust-side (usage_json below) and rides along in the result JSON,
+//! never inside the cage.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -85,39 +87,6 @@ static LLM_OUT_TOKENS: AtomicU64 = AtomicU64::new(0);
 /// Concurrency bound for nested LLM calls — the network's analogue of the cage's heap limit.
 /// A Promise.all fanout beyond this queues instead of exhausting fds at the provider.
 static LLM_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
-
-#[derive(Clone)]
-struct ChatMsg {
-    role: String,
-    content: String,
-}
-
-impl<'js> rquickjs::FromJs<'js> for ChatMsg {
-    fn from_js(_ctx: &rquickjs::Ctx<'js>, value: rquickjs::Value<'js>) -> rquickjs::Result<Self> {
-        let obj = value.as_object().ok_or_else(|| rquickjs::Error::FromJs {
-            from: "message",
-            to: "object",
-            message: Some("message must be {role, content}".into()),
-        })?;
-        let role: String = obj.get("role")?;
-        // shape validation, not judgment: the system prompt has its own argument, and accepting
-        // an injected {role:"system"} would let mounted data talk past the contract
-        if role != "user" && role != "assistant" {
-            return Err(rquickjs::Error::FromJs {
-                from: "message",
-                to: "message",
-                message: Some(format!(
-                    "message.role must be 'user' or 'assistant' (got {role:?}); \
-                     the system prompt is the `system` argument"
-                )),
-            });
-        }
-        Ok(ChatMsg {
-            role,
-            content: obj.get("content")?,
-        })
-    }
-}
 
 fn http_client() -> &'static reqwest::Client {
     static C: OnceLock<reqwest::Client> = OnceLock::new();
@@ -278,20 +247,19 @@ async fn do_llm(mut messages: Vec<serde_json::Value>) -> Result<String, rquickjs
     Ok(content.to_string())
 }
 
-/// Registers the host.llm namespace; contract holds the full contract text (chat auto-prepends it to system)
+/// Registers the host.llm namespace: stateless calls only — the program owns every token sent.
 pub fn install<'js>(
     ctx: &Ctx<'js>,
     host: &Object<'js>,
-    contract: &str,
     cancel_tx: &watch::Sender<bool>,
 ) -> rquickjs::Result<()> {
     let llm_ns = Object::new(ctx.clone())?;
 
-    let cancel0 = cancel_tx.subscribe();
+    let cancel = cancel_tx.subscribe();
     let call_fn = Function::new(
         ctx.clone(),
         Async(move |prompt: String, system: Opt<String>| {
-            let mut cancel = cancel0.clone();
+            let mut cancel = cancel.clone();
             async move {
                 let mut messages = Vec::new();
                 if let Some(s) = system.0 {
@@ -306,32 +274,6 @@ pub fn install<'js>(
         }),
     )?;
     llm_ns.set("call", call_fn)?;
-
-    let cancel1 = cancel_tx.subscribe();
-    let contract = contract.to_string();
-    let chat_fn = Function::new(
-        ctx.clone(),
-        Async(move |messages: Vec<ChatMsg>, system: Opt<String>| {
-            let mut cancel = cancel1.clone();
-            let contract = contract.clone(); // clone per call, then move into the future (keeps the closure Fn)
-            async move {
-                // system prompt = standard contract (environment facts) + task-specific part
-                let sys = match system.0 {
-                    Some(s) if !s.trim().is_empty() => format!("{contract}\n\n# Task\n{s}"),
-                    _ => contract,
-                };
-                let mut msgs = vec![serde_json::json!({ "role": "system", "content": sys })];
-                for m in &messages {
-                    msgs.push(serde_json::json!({ "role": m.role, "content": m.content }));
-                }
-                tokio::select! {
-                    r = do_llm(msgs) => r,
-                    _ = cancel.changed() => Err(llm_err("cancel", "deadline: host.llm call cancelled".into())),
-                }
-            }
-        }),
-    )?;
-    llm_ns.set("chat", chat_fn)?;
 
     host.set("llm", llm_ns)
 }

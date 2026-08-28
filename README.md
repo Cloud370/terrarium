@@ -4,6 +4,22 @@ An agent runtime where the model's actions are programs, not tool calls. Each tu
 
 [中文文档](README.zh-CN.md)
 
+## Core direction
+
+Terrarium is a bounded program runtime: the model emits programs, the host exposes explicit capabilities, each run executes in a fresh cage. It is not a tool registry, a shell wrapper, an operating-system sandbox, or a multi-agent framework.
+
+Invariants:
+
+- Model actions are programs — one complete `run` block per turn, and nothing outside that block executes.
+- Capabilities stay explicit, minimal, typed, bounded, and observable; errors surface at the boundary instead of falling back silently.
+- Security lives in the host — mount scoping, `:rw` writes, resource limits, cancellation. Prompts describe behavior; they never provide the boundary.
+- No mutable state crosses runs, and credentials never enter the cage.
+- Core behavior is host code with no platform-specific external commands.
+- `host.fs.scan` is the only search engine: host-side pruning plus ordinary JavaScript filtering.
+- A stateless `host.llm.call` is not an agent session. A sub-agent becomes a capability only with its own lifecycle, budgets, cancellation, narrowed mounts, and structured result.
+
+Before adding any capability, answer: which real workflow needs it; what are its limits, cancellation, failure states, and permissions; does it work the same on Linux, macOS, and Windows; and can an existing capability express it? Prefer the smallest boundary, and keep speculative features out of the public contract.
+
 ## The protocol
 
 One agent session is a sequence of programs. A model reply must contain one closed `run` fence:
@@ -24,7 +40,7 @@ host.agent.answer("The HTTP client is configured in src/llm.rs.");
 ```
 ````
 
-The parser accepts only a complete `run` fence. An unclosed fence is a protocol error. A reply without a run program is also a protocol error. There is no text-based completion marker.
+The parser accepts exactly one complete `run` fence per reply. A missing fence, an unclosed fence, or more than one `run` fence is a protocol error — the parser never executes one block and silently ignores the rest. An opening fence is a line that reads exactly ```` ```run ```` and a closing fence is a standalone ```` ``` ```` line; inline triple backticks never open or close a block. Text outside the block is not executed. There is no text-based completion marker.
 
 Every run is evaluated as one async function body, so top-level `return` and `await` have the same meaning in every program. The result keeps JSON values as JSON instead of formatting them as strings.
 
@@ -92,14 +108,14 @@ All time values are milliseconds. Run mode exits `0` for a successful program, `
 
 ## Host API
 
-Inside a program, use `host.help()` for the live surface or `--contract` for the complete generated contract:
+The generated contract (`--contract`) documents the live surface:
 
 - `host.fs.list(dir)` lists one directory level, including sizes and symlink entries.
 - `host.fs.read(path, from, to)` reads a bounded line window. `to=Infinity` reads to EOF within the window budget.
 - `host.fs.text(path)` reads a whole text file into the program when it fits the 64 MB host budget.
 - `host.fs.scan(path, options)` streams text-file lines from a directory tree. It respects `.gitignore`, skips hidden entries, binaries, and symlinks by default, and validates option types. Traversal and decoding errors reject the scan rather than becoming an empty result.
 - `host.fs.write(path, content)` atomically writes text under a declared `:rw` mount and returns the byte count.
-- `host.llm.call(prompt, system)` and `host.llm.chat(messages, system)` make nested text requests through the configured OpenAI-compatible chat-completions endpoint.
+- `host.llm.call(prompt, system)` makes a nested text request through the configured OpenAI-compatible chat-completions endpoint. The call is stateless: the nested model sees only the supplied prompt and system text, with no contract, mounts, or host capabilities. There is no nested multi-turn chat; that belongs to a future sub-agent session.
 - `host.agent.answer(text)` commits the current agent session answer. Returning from a program never commits the session.
 
 The current model examples declare these capabilities:

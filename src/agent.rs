@@ -5,6 +5,7 @@ use tokio::sync::watch;
 
 use crate::{eval_js, fs, llm, truncate_utf8, ErrorKind, Outcome, MAX_TIMEOUT_MS};
 
+const COMMON: &str = include_str!("prompts/common.md");
 const ROLE_TEMPLATE: &str = include_str!("prompts/main.md");
 const RUN_TIMEOUT_DEFAULT_MS: u64 = 10_000;
 const FEEDBACK_CAP: usize = 12 * 1024;
@@ -21,34 +22,27 @@ pub struct RunProgram {
     pub timeout_ms: Option<u64>,
 }
 
-enum Hit {
-    Body(String),
-    Unclosed,
-}
-
-fn scan_run_fences(reply: &str) -> Option<Hit> {
-    let mut from = 0;
-    while let Some(rel) = reply[from..].find("```") {
-        let after = from + rel + 3;
-        let Some(eol) = reply[after..].find('\n') else {
-            from = after;
-            continue;
-        };
-        let line_end = after + eol;
-        if reply[after..line_end].trim() == "run" {
-            let body_start = line_end + 1;
-            return match reply[body_start..].find("```") {
-                Some(close) => Some(Hit::Body(
-                    reply[body_start..body_start + close]
-                        .trim_start_matches('\n')
-                        .to_string(),
-                )),
-                None => Some(Hit::Unclosed),
-            };
+/// Line-level fence scan: an opening fence is a line that trims to "```run", a closing fence is a
+/// line that trims to "```", and anything else — including inline triple backticks — is text.
+/// Returns the closed blocks and whether a trailing block was left open.
+fn scan_run_fences(reply: &str) -> (Vec<String>, bool) {
+    let mut blocks = Vec::new();
+    let mut body: Option<String> = None;
+    for line in reply.lines() {
+        let trimmed = line.trim();
+        if trimmed == "```" {
+            if let Some(source) = body.take() {
+                blocks.push(source.trim_start_matches('\n').to_string());
+            }
+            // a bare close line outside a run body is inert text
+        } else if trimmed == "```run" && body.is_none() {
+            body = Some(String::new());
+        } else if let Some(source) = body.as_mut() {
+            source.push_str(line);
+            source.push('\n');
         }
-        from = after;
     }
-    None
+    (blocks, body.is_some())
 }
 
 fn parse_timeout_directive(code: &str) -> Option<u64> {
@@ -66,16 +60,20 @@ pub(crate) enum Extracted {
     Run(RunProgram),
     NoRun,
     Truncated,
+    Multiple,
 }
 
 pub(crate) fn extract(reply: &str) -> Extracted {
-    match scan_run_fences(reply) {
-        Some(Hit::Body(code)) => Extracted::Run(RunProgram {
-            timeout_ms: parse_timeout_directive(&code),
-            code,
+    let (blocks, unclosed) = scan_run_fences(reply);
+    match (blocks.as_slice(), unclosed) {
+        ([], false) => Extracted::NoRun,
+        ([], true) => Extracted::Truncated,
+        ([code], false) => Extracted::Run(RunProgram {
+            timeout_ms: parse_timeout_directive(code),
+            code: code.clone(),
         }),
-        Some(Hit::Unclosed) => Extracted::Truncated,
-        None => Extracted::NoRun,
+        // more than one closed block, or a stray unclosed opening after a closed one
+        _ => Extracted::Multiple,
     }
 }
 
@@ -211,8 +209,10 @@ async fn run(task: &str, opts: &Options) -> i32 {
         .replace("{{RUN_CAP_MS}}", &MAX_TIMEOUT_MS.to_string())
         .replace("{{MODEL}}", &llm::model_name())
         .replace("{{MAX_ROUNDS}}", &opts.max_rounds.to_string());
+    // common principles -> dynamic environment contract -> this loop's role
     let system = format!(
-        "{}\n\n# Main agent\n\n{}",
+        "{}\n\n{}\n\n# Main agent\n\n{}",
+        COMMON,
         crate::contract(&opts.mounts),
         role
     );
@@ -232,17 +232,21 @@ async fn run(task: &str, opts: &Options) -> i32 {
                 return 1;
             }
         };
+        let block = extract(&reply);
         messages.push(serde_json::json!({"role": "assistant", "content": reply}));
-        let block = match extract(
-            messages.last().expect("assistant message")["content"]
-                .as_str()
-                .unwrap_or_default(),
-        ) {
+        let block = match block {
             Extracted::Run(block) => block,
             Extracted::Truncated => {
                 messages.push(serde_json::json!({
                     "role": "user",
                     "content": "protocol error: the run block was not closed; send one complete ```run program"
+                }));
+                continue;
+            }
+            Extracted::Multiple => {
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": "protocol error: reply contains more than one run block; send exactly one complete ```run program"
                 }));
                 continue;
             }
@@ -317,6 +321,35 @@ mod tests {
             extract("```javascript\nreturn 42\n```"),
             Extracted::NoRun
         ));
+    }
+
+    #[test]
+    fn exactly_one_run_block_is_enforced() {
+        let two = "```run\nreturn 1\n```\nnotes\n```run\nreturn 2\n```";
+        assert!(matches!(extract(two), Extracted::Multiple));
+        let stray_unclosed = "```run\nreturn 1\n```\ntail\n```run\nreturn 2";
+        assert!(matches!(extract(stray_unclosed), Extracted::Multiple));
+    }
+
+    #[test]
+    fn fence_lines_must_stand_alone() {
+        // inline triple backticks neither open nor close a program
+        let reply = "```run\nconst s = 'a```b';\nreturn s\n```";
+        let Extracted::Run(block) = extract(reply) else {
+            panic!("expected a run block")
+        };
+        assert!(block.code.contains("'a```b'"));
+        assert!(matches!(
+            extract("text ```run\nreturn 1\n```"),
+            Extracted::NoRun
+        ));
+        assert!(matches!(
+            extract("````run\nreturn 1\n````"),
+            Extracted::NoRun
+        ));
+        // other fenced blocks in surrounding prose stay inert
+        let with_prose = "look:\n```js\nfoo()\n```\n```run\nreturn 1\n```";
+        assert!(matches!(extract(with_prose), Extracted::Run(_)));
     }
 
     #[test]

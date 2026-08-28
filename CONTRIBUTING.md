@@ -22,6 +22,6 @@ cargo clippy --all-targets -- -D warnings   # lint (CI enforces this too)
 - CI must be green: `fmt --check`, `clippy -D warnings`, `test`, `build`.
 - Runtime prompts (`src/prompts/`) and the JavaScript prelude (`src/runtime/prelude.js`) are compiled into the binary via `include_str!` — treat them as code: changing them changes runtime behavior.
 - Maintained specifications live in `docs/` and should describe the current implementation or clearly label future behavior.
-- `src/registry.rs` is the single source of the host API surface: `host.help()` and the prompt contract are generated from it. Add new host capabilities there.
+- `src/registry.rs` is the single source of the host API surface: the prompt contract's `{{HOST_API}}` section is generated from it. Add new host capabilities there.
 - Keep presentation adapters thin: reusable behavior belongs in the library; `src/main.rs` and `src/cli.rs` handle process and terminal concerns.
 - By submitting a PR you agree your contributions are licensed under the [MIT license](LICENSE).

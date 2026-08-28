@@ -26,7 +26,7 @@ Every source is evaluated as one async function body. This gives one rule everyw
 - there is no last-expression fallback;
 - source shape is never inspected to choose script versus function semantics.
 
-The outer agent parser accepts exactly one closed `run` fence. It treats an unclosed fence or a response without a run program as a protocol error. A normal run return is an observation. `host.agent.answer(text)` is the explicit operation that commits the session answer.
+The outer agent parser accepts exactly one closed `run` fence per reply. A missing fence, an unclosed fence, or more than one `run` fence is a protocol error; the parser never executes one block and silently ignores the rest. Opening and closing fences must stand alone on their lines. A normal run return is an observation. `host.agent.answer(text)` is the explicit operation that commits the session answer.
 
 The runtime no longer has nested run or sub-agent primitives. JavaScript functions and promises are sufficient for computation and concurrency inside one run; a future independent execution primitive would need its own cancellation, budget, and result contract before being added.
 
@@ -52,10 +52,10 @@ A fresh runtime per run keeps a failed or timed-out program from poisoning the n
 
 ## 4. Host capabilities
 
-The registry is the single source for `host.help()` and the generated contract. The current surface is intentionally small:
+The registry is the single source for the generated contract. The current surface is intentionally small:
 
 - `host.fs.list`, `read`, `text`, `scan`, and `write`;
-- `host.llm.call` and `host.llm.chat` for text requests;
+- `host.llm.call` for stateless nested text requests — the nested model sees only what the program passes, with no contract, mounts, or host capabilities;
 - `host.agent.answer` for session completion.
 
 Mounts are the authorization boundary. The operator declares `/virtual=real` for read-only access or `/virtual=real:rw` for writes. Virtual paths are validated component-wise; overlapping virtual mount roots are rejected by the CLI mount parser. Reads and scans do not follow symlinks across the boundary, and writes validate the existing parent chain before creating missing directories.
@@ -96,7 +96,7 @@ The following are deliberately not part of the current contract:
 - artifacts and binary result storage;
 - JSONL trace events and replay;
 - a Web UI or HTTP service;
-- child runs or sub-agent sessions;
+- child runs or sub-agent sessions — a sub-agent is a controlled sub-session and must, before becoming a capability, define its own conversation history, round and per-run timeout budgets, total budget, cancellation, mounts that only inherit or narrow the parent's, structured result, explicit lifecycle state, and a recursion cap on further spawning;
 - token or cost hard budgets;
 - transactional effects or automatic rollback.
 

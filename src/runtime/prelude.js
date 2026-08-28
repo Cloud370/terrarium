@@ -2,8 +2,6 @@
 // Static asset: embedded via include_str!; editing this file edits every runtime foundation
 'use strict';
 
-const __rawlog = globalThis.__log;
-globalThis.__log = (s) => { __rawlog(s); };
 globalThis.print = (...a) => __log(a.map((v) => {
   if (typeof v === 'string') return v;
   if (typeof v === 'undefined') return 'undefined';
@@ -17,7 +15,7 @@ globalThis.console = { log: print, info: print, warn: print, error: print, debug
 const __nsProxy = (obj, path) => new Proxy(obj, {
   get(t, k) {
     if (typeof k !== 'string') return t[k];
-    if (!(k in t)) throw new Error(`${path}.${k} does not exist; available: ${Object.keys(t).join(', ')}; docs: host.help()`);
+    if (!(k in t)) throw new Error(`${path}.${k} does not exist; available: ${Object.keys(t).join(', ')}`);
     const v = t[k];
     if (typeof v === 'function') {
       return (...a) => {

@@ -31,7 +31,7 @@ The runtime keeps a small built-in capability declaration for the current exampl
 | `deepseek-v4-flash` | text | text | text |
 | `deepseek-v4-flash-vision-exp` | text, image | text | text |
 
-The second model's image capability is intentionally only a declaration in this phase. `host.llm.call` and `host.llm.chat` currently accept text strings and send text-only chat-completions messages. Image reading, base64/data URLs, artifact storage, and multimodal request parts are not implemented.
+The second model's image capability is intentionally only a declaration in this phase. `host.llm.call` currently accepts text strings and sends text-only chat-completions messages. Image reading, base64/data URLs, artifact storage, and multimodal request parts are not implemented.
 
 Provider responses are bounded at 4 MiB before JSON parsing. Error messages report status or a short parsing/read failure and do not echo provider response bodies.
 

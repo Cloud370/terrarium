@@ -16,7 +16,7 @@ return files;
 ```
 ````
 
-The fence must be closed. An unclosed fence is a protocol error, and a reply without a `run` program is also a protocol error. There are no compatibility fence types or text completion markers.
+A reply must contain exactly one closed `run` block. A missing block, an unclosed block, or more than one block is a protocol error; the parser never executes one block and silently ignores the rest. An opening fence is a line that reads exactly ```` ```run ```` and a closing fence is a standalone ```` ``` ```` line — inline triple backticks never open or close a block. There are no compatibility fence types or text completion markers.
 
 Returning from a program submits an observation for the next turn. To finish the whole agent session, the program must call:
 
@@ -63,11 +63,12 @@ Host calls reject with a useful error instead of silently producing an empty res
 
 ## LLM payload scope
 
-The current LLM surface is text-only:
+The current LLM surface is text-only and stateless:
 
-- `host.llm.call(prompt, system)` performs one text request;
-- `host.llm.chat(messages, system)` performs a text multi-turn request;
+- `host.llm.call(prompt, system)` performs one text request. The nested model sees only the supplied prompt and system text — no contract, mounts, or host capabilities;
 - the configured model ID is sent unchanged to the OpenAI-compatible endpoint.
+
+There is no nested multi-turn chat. A nested conversation with its own history, budgets, and cancellation would be a sub-agent session, which is future work.
 
 The built-in capability declaration says `deepseek-v4-flash` accepts text input only, while `deepseek-v4-flash-vision-exp` declares text and image input. The latter declaration does not enable image payloads yet.
 

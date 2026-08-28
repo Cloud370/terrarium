@@ -21,7 +21,7 @@ pub(crate) const MAX_TIMEOUT_MS: u64 = 300_000;
 const VALUE_CAP: usize = 12 * 1024;
 
 const PRELUDE: &str = include_str!("runtime/prelude.js");
-const CONTRACT_TEMPLATE: &str = include_str!("prompts/agent.md");
+const CONTRACT_TEMPLATE: &str = include_str!("prompts/contract.md");
 
 static LEAKED_RUNTIMES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -192,7 +192,6 @@ pub(crate) async fn eval_js(
         Err(e) => return failure(ErrorKind::Internal, format!("context init failed: {e:?}")),
     };
 
-    let contract = contract(mounts);
     let body = ctx.async_with(async |ctx| -> rquickjs::Result<Outcome> {
         let sink = logs.clone();
         let overflowed = overflowed.clone();
@@ -217,8 +216,7 @@ pub(crate) async fn eval_js(
         ctx.globals().set("__log", log_fn)?;
 
         let host = Object::new(ctx.clone())?;
-        registry::install(&ctx, &host)?;
-        llm::install(&ctx, &host, &contract, &cancel_tx)?;
+        llm::install(&ctx, &host, &cancel_tx)?;
         fs::install(&ctx, &host, mounts)?;
         let agent_ns = Object::new(ctx.clone())?;
         let answer_slot = answer.clone();
