@@ -19,14 +19,21 @@ The current filesystem API is intentionally text-oriented. `list`, windowed `rea
 
 ## Model data boundary
 
-Content sent through `host.llm` leaves the local process and is disclosed to the configured third-party endpoint. A mounted file is not automatically sent, but a program can read an operator-approved file and include it in a model request.
+Content sent through the main model request leaves the local process and is disclosed to the provider selected by the current turn's resolved profile. A mounted file is not automatically sent, but a program can read an operator-approved file and include it in the next observation or model-visible context.
 
-API keys are read only by the host process from `TERRARIUM_LLM_API_KEY`; they are not injected into JavaScript. The binary does not load `.env` files. Keep secret files outside mounted directories. Provider response bodies are bounded and are not copied into error messages by default.
+API keys are read only by the host process from the environment variable named by the selected profile; they are not injected into JavaScript. The resolved profile stores only that variable name, never its value. The binary does not load `.env` files. Keep secret files outside mounted directories. Provider response bodies are bounded and are not copied into error messages by default.
+
+JavaScript has no `host.llm.call` primitive. The outer model loop is the only model-call path, and each attempt is durably recorded before dispatch.
 
 The built-in vision model declaration does not currently enable image payloads. The implemented LLM path sends text-only chat-completions requests.
 
+## Sessions and access modes
+
+Agent sessions are append-only JSONL files containing prompts, resolved non-secret profiles, model observations, run boundaries, and answers. They may contain user prompts, source code, paths, model responses, program output, and answers. A session binds to its stored display and canonical working root, but the journal is not an authorization token and contains no access mode.
+
+Each invocation selects `workspace` by default, or `--read-only` or `--full-access`. An explicit `--mount /virtual=real[:rw]` remains installed for the entire invocation, including all runs and recovery. `--full-access` installs `/ -> /` and therefore permits real absolute paths visible to the current operating-system user, but it is not root access. The current host policy is applied when a run executes, including during recovery; resuming a session never restores permissions from journal data. A durable `run/start` without a result is recorded as unknown and is never replayed.
 ## Logs
 
-Stderr may contain model names, paths, timing, error messages, and run source when `TERRARIUM_LOG_RUNS=1`. Do not enable that setting when source or mounted data is sensitive. The project does not yet implement a JSONL session trace, artifact store, or Web UI service; those are future designs and must not be treated as existing security controls.
+Stderr may contain model names, paths, timing, error messages, and the newly created session ID. Protect the per-user state directory because the journal is ordinary application state and is not encrypted, signed, or redacted. Direct-run JSON output is an adapter result, not a durable trace.
 
 Report security issues privately to the repository owner until a dedicated disclosure address is published.

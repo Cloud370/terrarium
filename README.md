@@ -1,6 +1,6 @@
 # terrarium
 
-An agent runtime where the model's actions are programs, not tool calls. Each turn submits one complete ES2020 JavaScript program; the kernel runs it in a fresh QuickJS cage with a 64 MB heap, 1 MB stack, and hard deadline, then returns one structured JSON result.
+An agent runtime where the model's actions are programs, not tool calls. The default command runs a durable model-driven agent session; `terrarium run` is the explicit direct-JavaScript entry point. Each JavaScript run executes in a fresh QuickJS cage with a 64 MB heap, 1 MB stack, and hard deadline, then returns a structured result.
 
 [中文文档](README.zh-CN.md)
 
@@ -16,7 +16,7 @@ Invariants:
 - No mutable state crosses runs, and credentials never enter the cage.
 - Core behavior is host code with no platform-specific external commands.
 - `host.fs.scan` is the only search engine: host-side pruning plus ordinary JavaScript filtering.
-- A stateless `host.llm.call` is not an agent session. A sub-agent becomes a capability only with its own lifecycle, budgets, cancellation, narrowed mounts, and structured result.
+- Sessions are durable append-only JSONL files. Model requests and JavaScript runs cross a durable boundary before dispatch; uncertain runs are never replayed.
 
 Before adding any capability, answer: which real workflow needs it; what are its limits, cancellation, failure states, and permissions; does it work the same on Linux, macOS, and Windows; and can an existing capability express it? Prefer the smallest boundary, and keep speculative features out of the public contract.
 
@@ -48,7 +48,7 @@ Every run is evaluated as one async function body, so top-level `return` and `aw
 
 - A whole unit of work executes per turn; context is spent on findings instead of tool-call bookkeeping.
 - JavaScript supplies control flow, retries, branching, and concurrency through ordinary language constructs.
-- The host surface stays small: filesystem capabilities, nested text-only LLM calls, and the explicit session answer function.
+- The host surface stays small: bounded filesystem capabilities and the explicit session answer function. The main model is called by the trusted outer loop; JavaScript has no model-call primitive.
 - Each run has a fresh cage, so a failed run does not corrupt the next run.
 
 ## The cage
@@ -60,81 +60,87 @@ Every run is evaluated as one async function body, so top-level `return` and `aw
 
 ## Quick start
 
-```sh
-cargo build --release
-echo 'return 1+1' | ./target/release/terrarium
+Configure one or more model profiles in `config.toml`:
+
+```toml
+version = 1
+default_profile = "main"
+
+[providers.local]
+base_url = "http://127.0.0.1:11434/v1"
+
+[profiles.main]
+provider = "local"
+protocol = "openai-chat-completions"
+model = "qwen3-coder"
 ```
 
-The command prints one JSON object:
-
-```json
-{
-  "ok": true,
-  "value": 2,
-  "answer": null,
-  "stdout": "",
-  "error": null,
-  "termination": "returned",
-  "timed_out": false,
-  "elapsed_ms": 1,
-  "target": "x86_64-linux",
-  "limits": { "memory": "64MB", "stack": "1MB", "timeout_ms": 2000 },
-  "mounts": [],
-  "llm_usage": { "calls": 0, "cache_hit_tokens": 0, "cache_miss_tokens": 0, "output_tokens": 0 }
-}
-```
-
-Print the exact contract used for a mounted project:
+Start the model-driven agent in the current directory:
 
 ```sh
-./target/release/terrarium --mount /proj=$(pwd) --contract
+terrarium "review this project"
+terrarium --profile main --read-only "find the unused dependencies"
 ```
+
+To let one invocation use real absolute paths outside the working directory, select full access:
+
+```sh
+terrarium --full-access "read ~/chat/landscape-monitor"
+```
+
+For a narrower authorization that remains available to every run in the invocation, add an explicit mount:
+
+```sh
+terrarium --read-only \
+  --mount /landscape-monitor="$HOME/chat/landscape-monitor" \
+  "read landscape-monitor"
+```
+
+`--full-access` maps `/` to the current user's filesystem view; it does not bypass operating-system permissions. In restricted modes, the agent uses `/workspace` plus any explicit virtual mounts. JavaScript does not expand `~`; the prompt identifies the available roots and tells the model how to handle a denied path.
+
+For direct JavaScript execution, use the separate `run` command:
+
+```sh
+terrarium run -e 'return 1 + 1'
+```
+
+The agent stores its session under the per-user state directory and prints the session ID to stderr when creating a session. Direct runs create no session.
 
 ## Command line
 
-Run one program from arguments, or from stdin when no code argument is supplied:
-
 ```sh
-terrarium [--timeout-ms N] [--mount /virt=real[:rw]]... [--contract] [code]
+terrarium [--config PATH] [--profile NAME] [--read-only | --full-access] [--mount /virtual=real[:rw]] [--max-steps N] [--run-timeout-ms N] [message...]
+terrarium --resume SESSION_ID [--read-only | --full-access] [--mount /virtual=real[:rw]] [message...]
+terrarium run [-e SOURCE | FILE] [--read-only | --full-access] [--mount /virtual=real[:rw]] [--timeout-ms N]
 ```
 
-Run the outer agent loop:
-
-```sh
-terrarium agent <task-file | task text> [--mount /virt=real[:rw]]... [--max-rounds N] [--run-timeout-ms N]
-```
-
-All time values are milliseconds. Run mode exits `0` for a successful program, `1` for a failed run, and `2` for usage/configuration errors. Agent mode exits `0` after `host.agent.answer`, `1` for transport or usage failure, and `2` when the round budget is exhausted.
+The normal command always starts or resumes the model-driven agent. Message arguments are joined as text; non-terminal stdin supplies a message when no message argument is present. `--mount` entries apply to every run in the invocation. `workspace` is the default access mode, `--read-only` and `--full-access` are mutually exclusive, and access mode and mounts are never stored in the session. The agent exits `0` after `host.agent.answer`, and `2` for usage or configuration errors. Direct-run exits `0` for a successful program and `1` for a failed program.
 
 ## Host API
 
 The generated contract (`--contract`) documents the live surface:
 
-- `host.fs.list(dir)` lists one directory level, including sizes and symlink entries.
+- `host.fs.list(dir)` lists one directory level as sorted objects with `name`, `type` (`file`, `directory`, `symlink`, or `other`), and `size` in bytes for regular files (`null` otherwise).
 - `host.fs.read(path, from, to)` reads a bounded line window. `to=Infinity` reads to EOF within the window budget.
 - `host.fs.text(path)` reads a whole text file into the program when it fits the 64 MB host budget.
 - `host.fs.scan(path, options)` streams text-file lines from a directory tree. It respects `.gitignore`, skips hidden entries, binaries, and symlinks by default, and validates option types. Traversal and decoding errors reject the scan rather than becoming an empty result.
 - `host.fs.write(path, content)` atomically writes text under a declared `:rw` mount and returns the byte count.
-- `host.llm.call(prompt, system)` makes a nested text request through the configured OpenAI-compatible chat-completions endpoint. The call is stateless: the nested model sees only the supplied prompt and system text, with no contract, mounts, or host capabilities. There is no nested multi-turn chat; that belongs to a future sub-agent session.
 - `host.agent.answer(text)` commits the current agent session answer. Returning from a program never commits the session.
+
+The JavaScript host surface does not include `host.llm.call`; model requests belong to the trusted outer agent loop and are recorded in the session journal.
 
 The current model examples declare these capabilities:
 
 - `deepseek-v4-flash`: text input and text output; it does not accept image input.
 - `deepseek-v4-flash-vision-exp`: text or image input and text output.
 
-This phase only declares those capabilities. The implemented `host.llm` request payload is text-only; image file reading, encoding, and artifact transport are not implemented.
+This phase only declares these model capabilities. The outer model request payload is text-only; image file reading, encoding, and artifact transport are not implemented.
 
 ## Configuration
 
-| Variable | Purpose |
-|---|---|
-| `TERRARIUM_LLM_API_KEY` | API key for agent mode and `host.llm` |
-| `TERRARIUM_LLM_BASE_URL` | OpenAI-compatible chat-completions endpoint |
-| `TERRARIUM_LLM_MODEL` | Model ID sent upstream; defaults to `deepseek-v4-flash` |
-| `TERRARIUM_LOG_RUNS` | Set to `1` to log executed run source to stderr |
+The preferred configuration is a strict TOML file at `$XDG_CONFIG_HOME/terrarium/config.toml`, or `~/.config/terrarium/config.toml` on Unix when `XDG_CONFIG_HOME` is unset. Pass another file with `--config PATH`. Credentials are referenced by environment-variable name and are never stored in the session.
 
-The binary does not load `.env` files. Supply credentials through the process environment or an external secret manager. Keep secret files outside mounted directories.
+If no TOML file is selected, the legacy `TERRARIUM_LLM_API_KEY`, `TERRARIUM_LLM_BASE_URL`, and `TERRARIUM_LLM_MODEL` variables remain supported as a compatibility fallback. The binary does not load `.env` files.
 
 ## Repository layout
 

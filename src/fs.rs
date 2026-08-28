@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rquickjs::function::Opt;
-use rquickjs::{Ctx, Function, Object};
+use rquickjs::{Ctx, Function, Object, Value};
 
 #[derive(Clone, Debug)]
 pub struct Mount {
@@ -31,18 +31,22 @@ impl Mount {
     }
 
     pub(crate) fn from_canonical(virt: &str, root: PathBuf, rw: bool) -> Result<Self, String> {
-        if virt.len() < 2 || !virt.starts_with('/') || virt.contains("//") {
+        if (virt != "/" && virt.len() < 2) || !virt.starts_with('/') || virt.contains("//") {
             return Err(format!(
                 "invalid mount virtual prefix {virt:?} (expected /name=…)"
             ));
         }
-        if virt.split('/').any(|part| part == "." || part == "..") {
+        if virt != "/" && virt.split('/').any(|part| part == "." || part == "..") {
             return Err(format!(
                 "invalid mount virtual prefix {virt:?} (dot segments are not allowed)"
             ));
         }
         Ok(Self {
-            virt: format!("{virt}/"),
+            virt: if virt == "/" {
+                "/".into()
+            } else {
+                format!("{virt}/")
+            },
             root,
             rw,
         })
@@ -59,6 +63,9 @@ impl Mount {
     pub(crate) fn overlaps(&self, other: &Self) -> bool {
         let a = self.virt.trim_end_matches('/');
         let b = other.virt.trim_end_matches('/');
+        if self.virt == "/" || other.virt == "/" {
+            return true;
+        }
         a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
     }
 }
@@ -162,24 +169,50 @@ pub fn resolve_mount(mounts: &[Mount], js_path: &str) -> Result<PathBuf, String>
     }
 }
 
-fn list_dir(mounts: &[Mount], dir: &str) -> Result<Vec<String>, String> {
+#[derive(Debug, Clone)]
+struct ListEntry {
+    name: String,
+    entry_type: &'static str,
+    size: Option<u64>,
+}
+
+impl<'js> rquickjs::IntoJs<'js> for ListEntry {
+    fn into_js(self, ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Value<'js>> {
+        let obj = Object::new(ctx.clone())?;
+        obj.set("name", self.name)?;
+        obj.set("type", self.entry_type)?;
+        match self.size {
+            Some(size) => obj.set("size", size)?,
+            None => obj.set("size", Value::new_null(ctx.clone()))?,
+        }
+        Ok(obj.into_value())
+    }
+}
+
+fn list_dir(mounts: &[Mount], dir: &str) -> Result<Vec<ListEntry>, String> {
     let p = resolve_mount(mounts, dir)?;
     let mut out = Vec::new();
     for ent in std::fs::read_dir(&p).map_err(|e| format!("{dir}: {e}"))? {
         let ent = ent.map_err(|e| format!("{dir}: {e}"))?;
         let name = ent.file_name().to_string_lossy().into_owned();
         let meta = std::fs::symlink_metadata(ent.path()).map_err(|e| format!("{dir}: {e}"))?;
-        if meta.file_type().is_symlink() {
-            out.push(format!("{name}\tsymlink"));
+        let file_type = meta.file_type();
+        let (entry_type, size) = if file_type.is_symlink() {
+            ("symlink", None)
+        } else if meta.is_dir() {
+            ("directory", None)
+        } else if meta.is_file() {
+            ("file", Some(meta.len()))
         } else {
-            out.push(if meta.is_dir() {
-                format!("{name}/\tdir")
-            } else {
-                format!("{name}\t{}", meta.len())
-            });
-        }
+            ("other", None)
+        };
+        out.push(ListEntry {
+            name,
+            entry_type,
+            size,
+        });
     }
-    out.sort();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
 }
 
@@ -986,6 +1019,45 @@ mod tests {
     }
 
     #[test]
+    fn list_returns_structured_entries() {
+        let root = tmp_root("list-structured");
+        std::fs::create_dir(root.join("dir")).unwrap();
+        std::fs::write(root.join("file.txt"), "hello").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("file.txt"), root.join("link")).expect("symlink");
+        let entries = list_dir(&mounts_at(&root, false), "/t").unwrap();
+        assert_eq!(entries[0].name, "dir");
+        assert_eq!(entries[0].entry_type, "directory");
+        assert_eq!(entries[0].size, None);
+        assert_eq!(entries[1].name, "file.txt");
+        assert_eq!(entries[1].entry_type, "file");
+        assert_eq!(entries[1].size, Some(5));
+        #[cfg(unix)]
+        {
+            assert_eq!(entries[2].name, "link");
+            assert_eq!(entries[2].entry_type, "symlink");
+            assert_eq!(entries[2].size, None);
+        }
+    }
+    #[tokio::test]
+    async fn list_serializes_entries_for_javascript() {
+        let root = tmp_root("list-json");
+        std::fs::create_dir(root.join("dir")).unwrap();
+        std::fs::write(root.join("file.txt"), "hello").unwrap();
+        let mounts = mounts_at(&root, false);
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let out = crate::kernel::eval_js("return host.fs.list('/t')", 5_000, &mounts, tx).await;
+        assert!(out.ok, "error: {:?}", out.error);
+        assert_eq!(
+            out.value,
+            Some(serde_json::json!([
+                {"name": "dir", "type": "directory", "size": null},
+                {"name": "file.txt", "type": "file", "size": 5}
+            ]))
+        );
+    }
+
+    #[test]
     fn glob_basics() {
         assert!(file_matches_glob("*.rs", "src/main.rs"));
         assert!(!file_matches_glob("*.rs", "src/main.ts"));
@@ -1002,6 +1074,16 @@ mod tests {
         assert!(file_matches_glob("src/**/*.rs", "src/main.rs"));
     }
 
+    #[test]
+    fn filesystem_root_mount_accepts_absolute_paths() {
+        let mount = Mount::from_canonical("/", PathBuf::from("/"), true).unwrap();
+        assert_eq!(mount.virtual_path(), "/");
+        assert_eq!(
+            resolve_mount(std::slice::from_ref(&mount), "/"),
+            Ok(PathBuf::from("/"))
+        );
+        assert_eq!(resolve_mount(&[mount], "/tmp"), Ok(PathBuf::from("/tmp")));
+    }
     #[test]
     fn mount_paths_reject_ambiguous_components() {
         let root = tmp_root("mount-path");

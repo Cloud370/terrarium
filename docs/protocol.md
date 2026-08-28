@@ -1,6 +1,6 @@
 # Protocol
 
-This document describes the protocol implemented by the current binary and library.
+This document describes the protocol implemented by the current binary and library. The default `terrarium` command is a durable model-driven agent; `terrarium run` is the only direct JavaScript entry point.
 
 ## Agent replies
 
@@ -30,7 +30,7 @@ The call records the supplied text as the session answer. A normal `return` neve
 
 Every program is wrapped and evaluated as one async function body. Top-level `return` and `await` are therefore legal in every run. The kernel does not infer execution mode from source shape and does not use an implicit last-expression result.
 
-Each run uses a fresh QuickJS runtime with a 64 MiB heap, 1 MiB stack, bounded stdout, bounded host reads, and a validated deadline. Filesystem capabilities are available only under mounts supplied by the operator.
+Each run uses a fresh QuickJS runtime with a 64 MiB heap, 1 MiB stack, bounded stdout, bounded host reads, and a validated deadline. Filesystem capabilities are available only under mounts supplied by the operator. The agent invocation installs `/workspace` for the working root, or `/` for `--full-access`, plus any explicit `--mount` entries; that mount set is reused for every run in the invocation.
 
 ## Run result
 
@@ -63,13 +63,10 @@ Host calls reject with a useful error instead of silently producing an empty res
 
 ## LLM payload scope
 
-The current LLM surface is text-only and stateless:
+The main model request is owned by the trusted outer agent loop. Each request uses the current turn's frozen resolved profile and is persisted as `model/request` before one network dispatch; a retryable attempt-1 failure may create exactly one attempt 2. Failed model results are not projected into later model-visible history.
 
-- `host.llm.call(prompt, system)` performs one text request. The nested model sees only the supplied prompt and system text — no contract, mounts, or host capabilities;
-- the configured model ID is sent unchanged to the OpenAI-compatible endpoint.
-
-There is no nested multi-turn chat. A nested conversation with its own history, budgets, and cancellation would be a sub-agent session, which is future work.
+JavaScript has no `host.llm.call` or other in-program model-call primitive. The host surface is filesystem capabilities plus `host.agent.answer(text)` for session completion. The configured model ID is sent unchanged to the OpenAI-compatible endpoint.
 
 The built-in capability declaration says `deepseek-v4-flash` accepts text input only, while `deepseek-v4-flash-vision-exp` declares text and image input. The latter declaration does not enable image payloads yet.
 
-TOML provider registries, reasoning controls, image parts, artifacts, trace events, and a Web UI service are future work and are not accepted by the current binary.
+TOML provider/profile configuration and durable JSONL sessions are implemented. The session stores no credential value or access mode; `--read-only`, `workspace`, and `--full-access` are selected by the current invocation.

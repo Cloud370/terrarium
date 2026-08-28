@@ -1,6 +1,6 @@
 # Terrarium Design Direction
 
-This document records the small core that is implemented today and the boundaries for future work. It is not a promise that future sections already exist in the binary.
+This document records the small core that is implemented today and the boundaries for future work.
 
 ## 1. Core model
 
@@ -55,23 +55,17 @@ A fresh runtime per run keeps a failed or timed-out program from poisoning the n
 The registry is the single source for the generated contract. The current surface is intentionally small:
 
 - `host.fs.list`, `read`, `text`, `scan`, and `write`;
-- `host.llm.call` for stateless nested text requests — the nested model sees only what the program passes, with no contract, mounts, or host capabilities;
-- `host.agent.answer` for session completion.
+- `host.agent.answer` for session completion. The main model request is performed by the trusted outer loop; JavaScript has no nested model-call primitive.
 
-Mounts are the authorization boundary. The operator declares `/virtual=real` for read-only access or `/virtual=real:rw` for writes. Virtual paths are validated component-wise; overlapping virtual mount roots are rejected by the CLI mount parser. Reads and scans do not follow symlinks across the boundary, and writes validate the existing parent chain before creating missing directories.
+Mounts are the authorization boundary. The operator declares `/virtual=real` for read-only access or `/virtual=real:rw` for writes. The default model-driven agent binds its session to the current working root; `terrarium run` uses the current directory transiently. Agent invocations select `workspace` by default, or `--read-only` or `--full-access` for that invocation only. Explicit `--mount` entries apply to every run in that invocation. `--full-access` maps `/` to the real filesystem view of the current operating-system user. These modes and mounts are never stored in the journal.
 
 Scan defaults intentionally resemble ripgrep: `.gitignore` is respected, hidden entries and binaries are skipped, symlinks are not followed, and options are explicit. Traversal, opening, and decoding errors are observable rejections rather than empty streams.
 
 ## 5. LLM configuration and capabilities
 
-The implemented configuration is one explicit OpenAI-compatible chat-completions connection:
+The implemented configuration is a strict TOML document containing named providers and profiles. A provider supplies an HTTP(S) base URL and an optional credential environment-variable name; a profile selects the built-in `openai-chat-completions` protocol, exact model ID, and optional output-token and reasoning-effort settings. Each turn stores its resolved non-secret profile and exact system prompt.
 
-- `TERRARIUM_LLM_API_KEY`;
-- `TERRARIUM_LLM_BASE_URL`;
-- `TERRARIUM_LLM_MODEL`;
-- `TERRARIUM_LOG_RUNS`.
-
-The binary does not load `.env` files. The endpoint, credential, and model are process configuration, not separate runtime objects.
+When no TOML file is selected, the legacy `TERRARIUM_LLM_API_KEY`, `TERRARIUM_LLM_BASE_URL`, and `TERRARIUM_LLM_MODEL` variables remain a compatibility fallback. The binary does not load `.env` files.
 
 The built-in model examples declare:
 
@@ -80,21 +74,20 @@ deepseek-v4-flash             text -> text
 deepseek-v4-flash-vision-exp  text,image -> text
 ```
 
-This phase only declares image capability. The request payload remains text-only; image file reads, encoding, content parts, and artifact storage are not implemented.
+This phase only declares image capability. The request payload remains text-only; image file reads, encoding, content parts, and artifact storage are not implemented. The transport performs no hidden retry.
 
-## 6. Public boundary
+## 6. Durable sessions
 
-`Kernel` and validated `Mount` are the reusable library API. The CLI and outer agent loop are adapters. The agent loop currently prints terminal-oriented output and is not yet a service/session API.
+Agent sessions use one append-only JSONL file under the per-user state directory. The header binds the session to its absolute display and canonical working root. Each turn stores the user message, exact system prompt, resolved profile, and limits. Model requests and JavaScript runs are written before network dispatch or execution; an uncertain run is recorded as `outcome_unknown` and never replayed. Access mode belongs only to the current invocation.
+
+`Kernel` and validated `Mount` are the reusable library API. The CLI, durable session journal, and outer agent loop are adapters over that core. The default command runs the model-driven agent; direct JavaScript is intentionally isolated behind `terrarium run`.
 
 ## 7. Explicit future work
 
 The following are deliberately not part of the current contract:
 
-- TOML configuration files and a provider/model catalog;
-- reasoning-level controls;
 - multimodal request payloads and image transport;
 - artifacts and binary result storage;
-- JSONL trace events and replay;
 - a Web UI or HTTP service;
 - child runs or sub-agent sessions — a sub-agent is a controlled sub-session and must, before becoming a capability, define its own conversation history, round and per-run timeout budgets, total budget, cancellation, mounts that only inherit or narrow the parent's, structured result, explicit lifecycle state, and a recursion cap on further spawning;
 - token or cost hard budgets;

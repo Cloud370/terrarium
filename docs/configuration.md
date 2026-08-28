@@ -1,26 +1,52 @@
 # Configuration
 
-## Current configuration
+## TOML profiles
 
-The current binary uses one OpenAI-compatible chat-completions connection configured through environment variables:
+The preferred configuration is a strict TOML file at `$XDG_CONFIG_HOME/terrarium/config.toml`, or `~/.config/terrarium/config.toml` on Unix when `XDG_CONFIG_HOME` is unset. Pass another file with `--config PATH`. A selected TOML file is authoritative; invalid TOML is an error and does not fall back to environment variables.
+
+```toml
+version = 1
+default_profile = "main"
+
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+[profiles.main]
+provider = "openrouter"
+protocol = "openai-chat-completions"
+model = "anthropic/claude-sonnet-4"
+max_output_tokens = 32000
+reasoning_effort = "high"
+```
+
+Provider and profile names must match `[A-Za-z0-9][A-Za-z0-9._-]*`. Provider URLs must be HTTP or HTTPS and contain no credentials, query, or fragment; trailing slashes are normalized away. Unknown fields are errors. API key values are never accepted in configuration: `api_key_env` names the environment variable read only when a request is sent.
+
+A new turn uses `--profile NAME` when supplied, otherwise the configured `default_profile`. A later turn without `--profile` copies the previous turn's frozen resolved profile, prompt, and limits. The profile is not changed while a turn is open.
+
+## Compatibility fallback
+
+When no TOML file is selected, these legacy variables remain supported:
 
 | Variable | Meaning |
 |---|---|
-| `TERRARIUM_LLM_API_KEY` | API key used by agent mode and `host.llm` |
-| `TERRARIUM_LLM_BASE_URL` | Chat-completions endpoint; defaults to DeepSeek's endpoint |
-| `TERRARIUM_LLM_MODEL` | Model ID sent upstream; defaults to `deepseek-v4-flash` |
-| `TERRARIUM_LOG_RUNS` | Set to `1` to print executed run source to stderr |
+| `TERRARIUM_LLM_API_KEY` | Credential value; referenced by the compatibility profile |
+| `TERRARIUM_LLM_BASE_URL` | OpenAI-compatible service root or legacy `/chat/completions` endpoint |
+| `TERRARIUM_LLM_MODEL` | Exact model ID; defaults to `deepseek-v4-flash` |
 
-The binary does not load `.env` files. Credentials must already be present in the process environment or be supplied by an external secret manager. The sandbox cannot read these variables. Keep secret files outside mounted directories.
+The binary does not load `.env` files. Credentials must already be present in the process environment or be supplied by an external secret manager. Keep secret files outside mounted directories.
 
-Filesystem authorization is separate from LLM configuration and is declared at launch:
+## Access modes
+
+The model-driven agent is the default command:
 
 ```sh
---mount /virtual=/real/path
---mount /virtual=/real/path:rw
+terrarium [--config PATH] [--profile NAME] [--read-only | --full-access] [--mount /virtual=real[:rw]] [message...]
+terrarium --resume SESSION_ID [--read-only | --full-access] [--mount /virtual=real[:rw]] [message...]
+terrarium run [-e SOURCE | FILE] [--read-only | --full-access] [--mount /virtual=real[:rw]] [--timeout-ms N]
 ```
 
-The first form is read-only; the second permits `host.fs.write` below that virtual root.
+`workspace` is the default. `--read-only` and `--full-access` are mutually exclusive and apply only to the current invocation; they are never written to the session journal or restored from it. An explicit mount applies to the complete invocation, including every model-selected run and recovery. `--mount /virtual=real` is read-only; append `:rw` to authorize writes. In `--full-access`, `/` maps to the current user's real filesystem view. `terrarium run` is the direct JavaScript entry point and uses the same invocation-only access flags.
 
 ## Declared model capabilities
 
@@ -31,15 +57,6 @@ The runtime keeps a small built-in capability declaration for the current exampl
 | `deepseek-v4-flash` | text | text | text |
 | `deepseek-v4-flash-vision-exp` | text, image | text | text |
 
-The second model's image capability is intentionally only a declaration in this phase. `host.llm.call` currently accepts text strings and sends text-only chat-completions messages. Image reading, base64/data URLs, artifact storage, and multimodal request parts are not implemented.
+The second model's image capability is intentionally only a declaration in this phase. Image reading, base64/data URLs, artifact storage, and multimodal request parts are not implemented.
 
-Provider responses are bounded at 4 MiB before JSON parsing. Error messages report status or a short parsing/read failure and do not echo provider response bodies.
-
-## Future direction, not implemented
-
-A future configuration file may define multiple named connections and model metadata. That design is deliberately not part of the current binary contract. When it becomes necessary, it should preserve these rules:
-
-- credentials are environment references, never plaintext configuration values;
-- a model ID is the exact ID sent upstream, not a hidden alias;
-- endpoint, credential, and model selection are explicit and traceable;
-- modality declarations are checked before a request shape is selected.
+Provider responses are bounded at 4 MiB before JSON parsing. The transport performs no hidden retry; the agent journal authorizes at most one retry for a model step.

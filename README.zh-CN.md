@@ -1,6 +1,6 @@
 # terrarium
 
-一个把模型动作实现为程序而非工具调用的 agent 运行时。每轮模型提交一段完整的 ES2020 JavaScript 程序；内核在全新的 QuickJS 笼子中执行，限制 64MB 堆、1MB 栈和硬截止时间，然后返回一个结构化 JSON 结果。
+一个把模型动作实现为程序而非工具调用的 agent 运行时。默认命令运行持久化的模型驱动 agent 会话；`terrarium run` 是明确的直接 JavaScript 入口。每次 JavaScript 运行都在全新的 QuickJS 笼子中执行，限制 64MB 堆、1MB 栈和硬截止时间，然后返回结构化结果。
 
 [English documentation](README.md)
 
@@ -16,7 +16,7 @@ Terrarium 是一个有边界的程序运行时：模型输出程序，宿主提�
 - 可变状态不跨运行传递，凭据永不进入笼子。
 - 核心行为是宿主代码，不依赖平台特定的外部命令。
 - `host.fs.scan` 是唯一的搜索引擎：宿主侧剪枝加普通 JavaScript 过滤。
-- 无状态的 `host.llm.call` 不是 agent 会话。sub-agent 只有在拥有独立生命周期、预算、取消机制、收窄后的挂载和结构化结果之后，才可能成为一种能力。
+- 会话是持久化的仅追加 JSONL 文件。模型请求和 JavaScript 运行在派发或执行之前跨越持久化边界；结果不确定的运行绝不重放。
 
 新增任何能力之前先回答：哪个真实工作流需要它；它的限额、取消、失败状态和权限是什么；在 Linux、macOS、Windows 上行为是否一致；现有能力能否表达它？优先选择最小的边界，投机性功能不进入公开契约。
 
@@ -48,7 +48,7 @@ host.agent.answer("HTTP client 配置位于 src/llm.rs。");
 
 - 每轮执行一个完整工作单元，上下文用于承载发现，而不是工具调用往返。
 - 重试、分支和并发直接使用 JavaScript 的普通语言构造。
-- 宿主能力面保持很小：文件系统、文本型嵌套 LLM 调用，以及显式的会话回答函数。
+- 宿主能力面保持很小：有边界的文件系统能力，以及显式的会话回答函数。主模型由可信的外层循环调用；JavaScript 没有模型调用原语。
 - 每次运行使用全新笼子，失败不会污染下一次运行。
 
 ## 笼子
@@ -60,81 +60,87 @@ host.agent.answer("HTTP client 配置位于 src/llm.rs。");
 
 ## 快速开始
 
-```sh
-cargo build --release
-echo 'return 1+1' | ./target/release/terrarium
+在 `config.toml` 中配置一个或多个模型配置档：
+
+```toml
+version = 1
+default_profile = "main"
+
+[providers.local]
+base_url = "http://127.0.0.1:11434/v1"
+
+[profiles.main]
+provider = "local"
+protocol = "openai-chat-completions"
+model = "qwen3-coder"
 ```
 
-命令输出一个 JSON 对象：
-
-```json
-{
-  "ok": true,
-  "value": 2,
-  "answer": null,
-  "stdout": "",
-  "error": null,
-  "termination": "returned",
-  "timed_out": false,
-  "elapsed_ms": 1,
-  "target": "x86_64-linux",
-  "limits": { "memory": "64MB", "stack": "1MB", "timeout_ms": 2000 },
-  "mounts": [],
-  "llm_usage": { "calls": 0, "cache_hit_tokens": 0, "cache_miss_tokens": 0, "output_tokens": 0 }
-}
-```
-
-打印挂载项目使用的完整契约：
+在当前目录启动模型驱动 agent：
 
 ```sh
-./target/release/terrarium --mount /proj=$(pwd) --contract
+terrarium "review this project"
+terrarium --profile main --read-only "find the unused dependencies"
 ```
+
+如果一次调用需要读取工作目录之外的真实绝对路径，可以选择 full access：
+
+```sh
+terrarium --full-access "读取 ~/chat/landscape-monitor"
+```
+
+如果只需要授权一个更窄的目录，可声明一个在本次调用的所有运行中都有效的挂载：
+
+```sh
+terrarium --read-only \
+  --mount /landscape-monitor="$HOME/chat/landscape-monitor" \
+  "读取 landscape-monitor"
+```
+
+`--full-access` 将 `/` 映射到当前操作系统用户可见的文件系统，但不会绕过操作系统权限。受限模式下 agent 使用 `/workspace` 以及显式虚拟挂载。JavaScript 不会展开 `~`；prompt 会列出可用根目录，并说明如何处理被拒绝的路径。
+
+直接执行 JavaScript 使用独立的 `run` 命令：
+
+```sh
+terrarium run -e 'return 1 + 1'
+```
+
+agent 会话存储在每用户状态目录中，创建会话时将会话 ID 打印到 stderr；直接运行不会创建会话。
 
 ## 命令行
 
-从参数运行一个程序；没有代码参数时从 stdin 读取：
-
 ```sh
-terrarium [--timeout-ms N] [--mount /virt=real[:rw]]... [--contract] [code]
+terrarium [--config PATH] [--profile NAME] [--read-only | --full-access] [--mount /virtual=real[:rw]] [--max-steps N] [--run-timeout-ms N] [消息...]
+terrarium --resume SESSION_ID [--read-only | --full-access] [--mount /virtual=real[:rw]] [消息...]
+terrarium run [-e SOURCE | FILE] [--read-only | --full-access] [--mount /virtual=real[:rw]] [--timeout-ms N]
 ```
 
-运行外层 agent 循环：
-
-```sh
-terrarium agent <任务文件 | 任务文本> [--mount /virt=real[:rw]]... [--max-rounds N] [--run-timeout-ms N]
-```
-
-所有时间单位均为毫秒。运行模式退出码为：成功 `0`、程序失败 `1`、用法或配置错误 `2`。agent 模式退出码为：调用 `host.agent.answer` 后 `0`、传输或用法失败 `1`、轮次预算耗尽 `2`。
+普通命令始终启动或恢复模型驱动 agent。没有消息参数时，非终端 stdin 可提供消息。`--mount` 对本次调用的每一次运行都有效。默认访问模式是 `workspace`；`--read-only` 与 `--full-access` 互斥；访问模式和挂载都不会写入会话。agent 在 `host.agent.answer` 后以 `0` 退出；直接运行在程序成功时以 `0` 退出，失败时以 `1` 退出。
 
 ## Host API
 
 生成的契约（`--contract`）就是实时能力面的完整文档：
 
-- `host.fs.list(dir)` 列出一级目录，包含大小和符号链接条目。
+- `host.fs.list(dir)` 将一级目录返回为按名称排序的对象数组，字段为 `name`、`type`（`file`、`directory`、`symlink` 或 `other`）和 `size`；普通文件的 `size` 是字节数，其他类型为 `null`。
 - `host.fs.read(path, from, to)` 读取有界行窗口；`to=Infinity` 在窗口预算内读取到 EOF。
 - `host.fs.text(path)` 在不超过 64MB 宿主预算时，把整个文本文件读入程序。
 - `host.fs.scan(path, options)` 从目录树流式读取文本文件行。默认尊重 `.gitignore`、跳过隐藏项、二进制和符号链接，并严格校验选项类型。遍历、打开或解码错误会拒绝 scan，不会静默变成空结果。
 - `host.fs.write(path, content)` 在声明为 `:rw` 的挂载下原子写入文本，返回字节数。
-- `host.llm.call(prompt, system)` 通过配置的 OpenAI 兼容端点发起嵌套文本请求。该调用是无状态的：嵌套模型只看到传入的 prompt 和 system 文本，没有契约、挂载或宿主能力。不存在嵌套多轮会话；那属于未来的 sub-agent 会话。
 - `host.agent.answer(text)` 提交当前 agent 会话回答。从程序返回永远不会提交整个会话。
+
+JavaScript 宿主能力面不包含 `host.llm.call`；模型请求属于可信的外层 agent 循环，并记录在会话日志中。
 
 当前模型示例声明以下能力：
 
 - `deepseek-v4-flash`：文本输入、文本输出，不支持图像输入。
 - `deepseek-v4-flash-vision-exp`：文本或图像输入、文本输出。
 
-本阶段只声明能力。实际 `host.llm` 请求仍是文本 payload；图像读取、编码和 artifact 传输尚未实现。
+本阶段只声明这些模型能力。外层模型请求仍是文本 payload；图像读取、编码和 artifact 传输尚未实现。
 
 ## 配置
 
-| 变量 | 用途 |
-|---|---|
-| `TERRARIUM_LLM_API_KEY` | agent 模式和 `host.llm` 使用的 API key |
-| `TERRARIUM_LLM_BASE_URL` | OpenAI 兼容 chat-completions 端点 |
-| `TERRARIUM_LLM_MODEL` | 发给上游的模型 ID，默认 `deepseek-v4-flash` |
-| `TERRARIUM_LOG_RUNS` | 设为 `1` 时将执行的程序源码记录到 stderr |
+推荐使用严格 TOML 配置文件：`$XDG_CONFIG_HOME/terrarium/config.toml`；在 Unix 且未设置 `XDG_CONFIG_HOME` 时使用 `~/.config/terrarium/config.toml`。可用 `--config PATH` 指定其他文件。凭据只通过环境变量名引用，永远不会存入会话。
 
-二进制不会加载 `.env` 文件。通过进程环境或外部 secret manager 提供凭据，并将秘密文件放在挂载目录之外。
+没有选中 TOML 文件时，仍兼容遗留的 `TERRARIUM_LLM_API_KEY`、`TERRARIUM_LLM_BASE_URL` 和 `TERRARIUM_LLM_MODEL` 环境变量。二进制不会加载 `.env` 文件。
 
 ## 仓库结构
 

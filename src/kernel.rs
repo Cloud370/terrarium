@@ -37,20 +37,24 @@ pub(crate) fn truncate_utf8(s: &str, cap: usize) -> String {
     format!("{}…[truncated]", &s[..end])
 }
 
+fn mount_label(mount: &fs::Mount) -> String {
+    if mount.virt == "/" {
+        "/".into()
+    } else {
+        mount.virt.trim_end_matches('/').to_string()
+    }
+}
+
 /// Contract = static teaching template + registry-generated API surface + actual mounts.
 pub(crate) fn contract(mounts: &[fs::Mount]) -> String {
-    let ro: Vec<String> = mounts
-        .iter()
-        .filter(|m| !m.rw)
-        .map(|m| m.virt.trim_end_matches('/').to_string())
-        .collect();
-    let rw: Vec<String> = mounts
-        .iter()
-        .filter(|m| m.rw)
-        .map(|m| m.virt.trim_end_matches('/').to_string())
-        .collect();
+    contract_for(mounts, "configured model")
+}
+
+pub(crate) fn contract_for(mounts: &[fs::Mount], model: &str) -> String {
+    let ro: Vec<String> = mounts.iter().filter(|m| !m.rw).map(mount_label).collect();
+    let rw: Vec<String> = mounts.iter().filter(|m| m.rw).map(mount_label).collect();
     let mut mounts_line = String::new();
-    mounts_line.push_str(&format!("{}\n", llm::capability_text(&llm::model_name())));
+    mounts_line.push_str(&format!("{}\n", llm::capability_text(model)));
     if !ro.is_empty() {
         mounts_line.push_str(&format!(
             "Read-only mounts: {} (`host.fs.scan` runs with ripgrep's defaults here — .gitignore respected, \
@@ -216,7 +220,6 @@ pub(crate) async fn eval_js(
         ctx.globals().set("__log", log_fn)?;
 
         let host = Object::new(ctx.clone())?;
-        llm::install(&ctx, &host, &cancel_tx)?;
         fs::install(&ctx, &host, mounts)?;
         let agent_ns = Object::new(ctx.clone())?;
         let answer_slot = answer.clone();
@@ -432,7 +435,9 @@ impl Kernel {
 
 #[cfg(test)]
 mod tests {
-    use super::{add_mount, eval_js, truncate_utf8, ErrorKind, Termination};
+    use std::path::PathBuf;
+
+    use super::{add_mount, contract_for, eval_js, truncate_utf8, ErrorKind, Termination};
     use tokio::sync::watch;
 
     #[test]
@@ -444,6 +449,12 @@ mod tests {
         assert_eq!(truncate_utf8("short", 100), "short");
     }
 
+    #[test]
+    fn full_access_contract_describes_root_mount() {
+        let mount = crate::fs::Mount::from_canonical("/", PathBuf::from("/"), true).unwrap();
+        let contract = contract_for(&[mount], "test-model");
+        assert!(contract.contains("Writable mounts: /"), "{contract}");
+    }
     #[test]
     fn mount_declarations_are_validated_or_rejected() {
         let mut ms = Vec::new();
