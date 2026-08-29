@@ -26,7 +26,7 @@ Every source is evaluated as one async function body. This gives one rule everyw
 - there is no last-expression fallback;
 - source shape is never inspected to choose script versus function semantics.
 
-The outer agent parser accepts exactly one closed `run` fence per reply. A missing fence, an unclosed fence, or more than one `run` fence is a protocol error; the parser never executes one block and silently ignores the rest. Opening and closing fences must stand alone on their lines. A normal run return is an observation. `host.agent.answer(text)` is the explicit operation that commits the session answer.
+The outer agent parser accepts exactly one closed `run` fence per reply. A missing fence, an unclosed fence, or more than one `run` fence is a protocol error; the parser never executes one block and silently ignores the rest. Opening and closing fences must stand alone on their lines. In agent mode, a successful program must return exactly `{to: "model", facts: {...}}` or `{to: "user", message: "..."}`. The first ends the current run and continues the same turn; the second ends the turn and hands control to the user. Format and recoverable operation errors are model observations, not automatic handoffs. Direct `terrarium run` keeps ordinary JSON-compatible return values.
 
 The runtime no longer has nested run or sub-agent primitives. JavaScript functions and promises are sufficient for computation and concurrency inside one run; a future independent execution primitive would need its own cancellation, budget, and result contract before being added.
 
@@ -38,7 +38,6 @@ The library returns a structured `Outcome`:
 Outcome
 ├── ok
 ├── value             JSON-compatible value | absent
-├── answer            session answer | absent
 ├── stdout
 ├── error             {kind, message} | absent
 ├── termination       returned | failed | timed_out | cancelled | fatal
@@ -54,8 +53,8 @@ A fresh runtime per run keeps a failed or timed-out program from poisoning the n
 
 The registry is the single source for the generated contract. The current surface is intentionally small:
 
-- `host.fs.list`, `read`, `text`, `scan`, and `write`;
-- `host.agent.answer` for session completion. The main model request is performed by the trusted outer loop; JavaScript has no nested model-call primitive.
+- `host.fs.list`, `read`, `text`, `scan`, `walk`, and `write`. `scan` and `walk` share one traversal engine: scan streams a tree's lines, walk streams its file entries.
+- The tagged agent return protocol: `to: "model"` for same-turn continuation and `to: "user"` for an explicit user handoff. The main model request is performed by the trusted outer loop; JavaScript has no nested model-call primitive.
 
 Mounts are the authorization boundary. The operator declares `/virtual=real` for read-only access or `/virtual=real:rw` for writes. The default model-driven agent binds its session to the current working root; `terrarium run` uses the current directory transiently. Agent invocations select `workspace` by default, or `--read-only` or `--full-access` for that invocation only. Explicit `--mount` entries apply to every run in that invocation. `--full-access` maps `/` to the real filesystem view of the current operating-system user. These modes and mounts are never stored in the journal.
 

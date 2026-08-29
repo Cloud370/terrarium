@@ -15,6 +15,7 @@ const ROLE_TEMPLATE: &str = include_str!("prompts/main.md");
 const RUN_TIMEOUT_DEFAULT_MS: u64 = 10_000;
 const DEFAULT_MAX_STEPS: u64 = 256;
 const FEEDBACK_CAP: usize = 12 * 1024;
+const FACTS_CAP: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessMode {
@@ -95,43 +96,118 @@ pub(crate) fn extract(reply: &str) -> Extracted {
     }
 }
 
-fn feedback(out: &Outcome) -> String {
+fn feedback(out: &Outcome, turn: u64, step: u64) -> String {
     let payload = serde_json::json!({
-        "ok": out.ok,
-        "value": out.value,
-        "stdout": out.stdout,
-        "error": out.error,
-        "termination": out.termination,
-        "timedOut": out.timed_out,
-        "elapsedMs": out.elapsed_ms,
+        "turn": turn,
+        "step": step,
+        "to": "model",
+        "run": {
+            "ok": out.ok,
+            "error": out.error,
+            "termination": out.termination,
+            "timedOut": out.timed_out,
+            "elapsedMs": out.elapsed_ms,
+        },
     });
     if payload.to_string().len() <= FEEDBACK_CAP {
         return payload.to_string();
     }
     serde_json::json!({
-        "ok": false,
-        "value": null,
-        "stdout": crate::truncate_utf8(&out.stdout, 4096),
-        "error": {"kind": ErrorKind::Protocol, "message": "run result exceeded the feedback limit"},
-        "termination": "failed",
-        "timedOut": false,
-        "elapsedMs": out.elapsed_ms,
-        "truncated": true,
+        "turn": turn,
+        "step": step,
+        "to": "model",
+        "run": {
+            "ok": false,
+            "error": {"kind": ErrorKind::Protocol, "message": "run result exceeded the feedback limit"},
+            "termination": "failed",
+            "timedOut": false,
+            "elapsedMs": out.elapsed_ms,
+        },
     })
     .to_string()
 }
 
-fn observation_for_extract(extracted: &Extracted) -> Option<String> {
+fn parse_disposition(value: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+    let value = value.ok_or_else(|| {
+        "agent program must end with a top-level return of {to: \"model\", facts: {...}} or {to: \"user\", message: \"...\"}; the run completed with no returned value — a return inside an async IIFE or callback never reaches the host".to_string()
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        "agent program must return an object with to: \"model\" or to: \"user\"".to_string()
+    })?;
+    let to = object
+        .get("to")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "agent program return is missing string field to".to_string())?;
+    match to {
+        "model" => {
+            if object.len() != 2 || !object.contains_key("facts") {
+                return Err("to: \"model\" requires exactly the fields to and facts".into());
+            }
+            if !object["facts"].is_object() {
+                return Err("to: \"model\" requires facts to be an object".into());
+            }
+            if serde_json::to_vec(&object["facts"])
+                .map(|facts| facts.len() > FACTS_CAP)
+                .unwrap_or(true)
+            {
+                return Err(format!(
+                    "to: \"model\" facts exceed the {FACTS_CAP}-byte limit; write large data to an authorized file and return its path"
+                ));
+            }
+            Ok(serde_json::json!({"to":"model","facts":object["facts"]}))
+        }
+        "user" => {
+            if object.len() != 2 || !object.contains_key("message") {
+                return Err("to: \"user\" requires exactly the fields to and message".into());
+            }
+            let message = object["message"]
+                .as_str()
+                .ok_or_else(|| "to: \"user\" requires message to be a string".to_string())?;
+            Ok(serde_json::json!({"to":"user","message":message}))
+        }
+        _ => Err(format!(
+            "unsupported to value {to:?}; use \"model\" or \"user\""
+        )),
+    }
+}
+
+fn model_observation(turn: u64, step: u64, disposition: &serde_json::Value) -> String {
+    serde_json::json!({
+        "turn": turn,
+        "step": step,
+        "to": "model",
+        "facts": disposition["facts"],
+    })
+    .to_string()
+}
+
+fn protocol_observation(turn: u64, step: u64, message: impl Into<String>) -> String {
+    serde_json::json!({
+        "turn": turn,
+        "step": step,
+        "to": "model",
+        "error": {"kind": ErrorKind::Protocol, "message": message.into()},
+    })
+    .to_string()
+}
+
+fn observation_for_extract(turn: u64, step: u64, extracted: &Extracted) -> Option<String> {
     Some(match extracted {
-        Extracted::Truncated => {
-            "protocol error: no program was executed; close the single ```run block and send one complete program with no prose or other code block".into()
-        }
-        Extracted::Multiple => {
-            "protocol error: no program was executed; the response contained multiple run blocks; combine the work into exactly one complete ```run program".into()
-        }
-        Extracted::NoRun => {
-            "protocol error: no program was executed; send exactly one complete ```run program with no prose or other code block".into()
-        }
+        Extracted::Truncated => protocol_observation(
+            turn,
+            step,
+            "no program was executed; close the single ```run block and send one complete program with no prose or other code block",
+        ),
+        Extracted::Multiple => protocol_observation(
+            turn,
+            step,
+            "no program was executed; the response contained multiple run blocks; combine the work into exactly one complete ```run program",
+        ),
+        Extracted::NoRun => protocol_observation(
+            turn,
+            step,
+            "no program was executed; send exactly one complete ```run program with no prose or other code block",
+        ),
         Extracted::Run(_) => return None,
     })
 }
@@ -268,10 +344,12 @@ fn copy_turn(
 async fn execute_run(
     journal: &mut Journal,
     run_seq: u64,
+    turn: u64,
+    step: u64,
     action: &serde_json::Value,
     mounts: &[Mount],
     limits: (u64, u64),
-) -> Result<Option<String>, String> {
+) -> Result<(), String> {
     let source = action["source"]
         .as_str()
         .ok_or_else(|| "run action has no source".to_string())?;
@@ -282,19 +360,13 @@ async fn execute_run(
         .min(MAX_TIMEOUT_MS);
     let (cancel_tx, _cancel_rx) = watch::channel(false);
     let outcome = eval_js(source, timeout, mounts, cancel_tx).await;
-    let answer = outcome.answer.clone();
-    let observation = if answer.is_none() {
-        Some(feedback(&outcome))
-    } else {
-        None
-    };
+    let returned = outcome.value.clone();
     let mut data = serde_json::json!({
         "runSeq": run_seq,
         "status": "completed",
         "outcome": {
             "ok": outcome.ok,
             "value": outcome.value,
-            "answer": outcome.answer,
             "stdout": outcome.stdout,
             "error": outcome.error,
             "termination": outcome.termination,
@@ -302,11 +374,26 @@ async fn execute_run(
             "elapsedMs": outcome.elapsed_ms,
         },
     });
-    if let Some(observation) = observation {
-        data["observation"] = serde_json::Value::String(observation);
+    if outcome.ok {
+        match parse_disposition(returned) {
+            Ok(disposition) if disposition["to"] == "model" => {
+                data["disposition"] = disposition.clone();
+                data["observation"] =
+                    serde_json::Value::String(model_observation(turn, step, &disposition));
+            }
+            Ok(disposition) => {
+                data["disposition"] = disposition;
+            }
+            Err(error) => {
+                data["observation"] =
+                    serde_json::Value::String(protocol_observation(turn, step, error));
+            }
+        }
+    } else {
+        data["observation"] = serde_json::Value::String(feedback(&outcome, turn, step));
     }
     journal.append("run/result", data)?;
-    Ok(answer)
+    Ok(())
 }
 
 fn recover_unknown_run(journal: &mut Journal, run_seq: u64) -> Result<(), String> {
@@ -351,12 +438,14 @@ fn next_step(journal: &Journal) -> u64 {
 fn process_model_result(
     journal: &mut Journal,
     request_seq: u64,
+    turn: u64,
+    step: u64,
     content: String,
     default_timeout: u64,
     max_timeout: u64,
 ) -> Result<(), String> {
     let extracted = extract(&content);
-    let action = if let Some(message) = observation_for_extract(&extracted) {
+    let action = if let Some(message) = observation_for_extract(turn, step, &extracted) {
         serde_json::json!({"kind":"observation","message":message})
     } else if let Extracted::Run(program) = extracted {
         serde_json::json!({
@@ -400,7 +489,20 @@ async fn model_attempt(
     match llm::complete(&profile, messages).await {
         Ok(content) => {
             let limits = turn_timeouts(turn);
-            process_model_result(journal, request_seq, content, limits.0, limits.1)
+            let turn_number = journal
+                .events
+                .iter()
+                .filter(|event| event.kind == "turn/start" && event.seq <= turn.seq)
+                .count() as u64;
+            process_model_result(
+                journal,
+                request_seq,
+                turn_number,
+                step,
+                content,
+                limits.0,
+                limits.1,
+            )
         }
         Err(error) => {
             journal.append(
@@ -501,22 +603,29 @@ async fn drive(mut journal: Journal, mounts: &[Mount]) -> i32 {
                     Err(_) => return 1,
                 };
                 let limits = turn_timeouts(&turn);
-                match execute_run(&mut journal, run_seq, &last.data["action"], mounts, limits).await
+                let turn_number = journal
+                    .events
+                    .iter()
+                    .filter(|event| event.kind == "turn/start" && event.seq <= turn.seq)
+                    .count() as u64;
+                let step = journal
+                    .events
+                    .iter()
+                    .find(|event| event.seq == last.data["requestSeq"].as_u64().unwrap_or(0))
+                    .and_then(|event| event.data["step"].as_u64())
+                    .unwrap_or(1);
+                match execute_run(
+                    &mut journal,
+                    run_seq,
+                    turn_number,
+                    step,
+                    &last.data["action"],
+                    mounts,
+                    limits,
+                )
+                .await
                 {
-                    Ok(Some(answer)) => {
-                        if journal
-                            .append(
-                                "turn/end",
-                                serde_json::json!({"reason":"answered","answerRunSeq":run_seq}),
-                            )
-                            .is_err()
-                        {
-                            return 1;
-                        }
-                        println!("{answer}");
-                        return 0;
-                    }
-                    Ok(None) => {}
+                    Ok(()) => {}
                     Err(_) => return 1,
                 }
                 continue;
@@ -531,22 +640,45 @@ async fn drive(mut journal: Journal, mounts: &[Mount]) -> i32 {
                 continue;
             }
             "run/result" => {
-                if last.data["status"] == "completed"
-                    && last.data["outcome"]["answer"].as_str().is_some()
-                {
-                    let answer_run_seq = last.data["runSeq"].as_u64().unwrap_or(0);
-                    let answer = last.data["outcome"]["answer"].as_str().unwrap_or_default();
-                    if journal
-                        .append(
-                            "turn/end",
-                            serde_json::json!({"reason":"answered","answerRunSeq":answer_run_seq}),
-                        )
-                        .is_err()
-                    {
-                        return 1;
+                if last.data["status"] == "completed" {
+                    if last.data["disposition"]["to"] == "user" {
+                        let message = last.data["disposition"]["message"]
+                            .as_str()
+                            .unwrap_or_default();
+                        if journal
+                            .append(
+                                "turn/end",
+                                serde_json::json!({
+                                    "reason":"handed_off",
+                                    "handoffRunSeq":last.data["runSeq"]
+                                }),
+                            )
+                            .is_err()
+                        {
+                            return 1;
+                        }
+                        println!("{message}");
+                        return 0;
                     }
-                    println!("{answer}");
-                    return 0;
+                    // Read old journals written before tagged dispositions existed.
+                    if last.data.get("disposition").is_none() {
+                        if let Some(answer) = last.data["outcome"]["answer"].as_str() {
+                            if journal
+                                .append(
+                                    "turn/end",
+                                    serde_json::json!({
+                                        "reason":"answered",
+                                        "answerRunSeq":last.data["runSeq"]
+                                    }),
+                                )
+                                .is_err()
+                            {
+                                return 1;
+                            }
+                            println!("{answer}");
+                            return 0;
+                        }
+                    }
                 }
             }
             "turn/start" => {}
@@ -870,7 +1002,23 @@ mod tests {
         assert!(main_end < tool_start, "{prompt}");
         assert!(tool_start < list_rule, "{prompt}");
         assert!(
-            prompt.contains("Make one defensive, task-complete attempt"),
+            prompt.contains("An error is not automatically a user-facing result"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "A `catch` block that merely reports an error must not hand off to the user"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "When returning an error to the model, include only a short classification"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("return {to: \"user\", message: `Could not complete"),
             "{prompt}"
         );
         assert!(
@@ -930,10 +1078,107 @@ mod tests {
     }
 
     #[test]
-    fn exactly_one_run_block_is_enforced() {
-        assert!(matches!(
-            extract("```run\nreturn 1\n```\n```run\nreturn 2\n```"),
-            Extracted::Multiple
+    fn dispositions_are_strict_and_protocol_errors_stay_model_bound() {
+        assert_eq!(
+            parse_disposition(Some(serde_json::json!({
+                "to": "model",
+                "facts": {"count": 2}
+            })))
+            .unwrap(),
+            serde_json::json!({"to":"model","facts":{"count":2}})
+        );
+        assert_eq!(
+            parse_disposition(Some(serde_json::json!({
+                "to": "user",
+                "message": "done"
+            })))
+            .unwrap(),
+            serde_json::json!({"to":"user","message":"done"})
+        );
+        for value in [
+            serde_json::json!("done"),
+            serde_json::json!({"to":"model"}),
+            serde_json::json!({"to":"model","facts":"large text"}),
+            serde_json::json!({"to":"user","message":"done","facts":{}}),
+            serde_json::json!({"to":"agent","facts":{}}),
+        ] {
+            assert!(parse_disposition(Some(value)).is_err());
+        }
+        // a run with no returned value gets the teachable variant, not a bare schema complaint
+        let missing = parse_disposition(None).unwrap_err();
+        assert!(missing.contains("top-level return"), "{missing}");
+        assert!(missing.contains("async IIFE"), "{missing}");
+
+        let observation = observation_for_extract(3, 4, &Extracted::NoRun).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&observation).unwrap();
+        assert_eq!(value["to"], "model");
+        assert_eq!(value["turn"], 3);
+        assert_eq!(value["step"], 4);
+        assert_eq!(value["error"]["kind"], "protocol");
+    }
+
+    #[test]
+    fn oversized_model_facts_are_rejected_before_model_projection() {
+        let oversized = "x".repeat(4097);
+        let error = parse_disposition(Some(serde_json::json!({
+            "to": "model",
+            "facts": {"text": oversized}
+        })))
+        .unwrap_err();
+        assert!(error.contains("facts"), "{error}");
+        assert!(error.contains("limit"), "{error}");
+    }
+
+    #[test]
+    fn model_observation_contains_only_bounded_disposition_facts() {
+        let observation = model_observation(
+            2,
+            5,
+            &serde_json::json!({"to":"model","facts":{"path":"/workspace/report.txt"}}),
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&observation).unwrap(),
+            serde_json::json!({
+                "turn": 2,
+                "step": 5,
+                "to": "model",
+                "facts": {"path": "/workspace/report.txt"}
+            })
+        );
+    }
+
+    #[test]
+    fn prompt_distinguishes_recoverable_errors_from_user_handoff() {
+        let mounts = invocation_mounts(AccessMode::Full, "/tmp", Vec::new()).unwrap();
+        let profile = config::ResolvedProfile {
+            name: "test".into(),
+            protocol: "openai-chat-completions".into(),
+            base_url: "https://example.test".into(),
+            api_key_env: None,
+            model: "test-model".into(),
+            max_output_tokens: None,
+            reasoning_effort: None,
+        };
+        let prompt = system_prompt(&profile, "/tmp", 100, &mounts);
+        assert!(prompt.contains("An error is not automatically a user-facing result"));
+        assert!(prompt.contains(
+            "A failure inside one step of a larger plan is a recoverable operation error, not a blocked plan"
         ));
+        assert!(prompt.contains(
+            "A `catch` block that merely reports an error must not hand off to the user"
+        ));
+        assert!(prompt.contains("protocol observation means the host rejected the response format"));
+        assert!(
+            prompt.contains("Do not wrap the program in an async IIFE"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Agent `facts` must serialize to at most 4096 bytes"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("to: \"model\""));
+        // walk is the file-level primitive; scan yields must never be counted as files
+        assert!(prompt.contains("host.fs.walk"));
+        assert!(prompt.contains("Counting scan yields counts LINES"));
     }
 }

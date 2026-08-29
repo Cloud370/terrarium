@@ -121,9 +121,9 @@ JavaScript 程序则不同。如果 `run/start` 已持久化但 `run/result` 缺
 
 **会话（Session）** 是存储在一个 JSONL 文件中的一个持久对话。
 
-**轮（Turn）** 以一条用户消息开始，以一个回答、取消、步骤数耗尽或终态失败结束。一轮完成并不意味着会话完成。
+**轮（Turn）** 以一条用户消息开始，并在显式交还用户、取消、步骤数耗尽或终态失败时结束。成功的 `{to: "model", facts: {...}}` 会保持本轮打开。一轮完成并不意味着会话完成。
 
-**步（Step）** 是一轮内一次逻辑上的主 agent 决策。正常的一步以一次成功的助手响应以及一个程序结果或协议观察结束。终态的模型失败可以在步骤成功之前结束本轮。
+**步（Step）** 是一轮内一次逻辑上的主 agent 决策。一步在模型响应以及程序结果、协议观察或可恢复错误观察之后结束。`{to: "model", facts: {...}}` 会在同一轮开始下一步；`{to: "user", message: "..."}` 会交还用户并结束本轮。终态的模型失败可以在步骤成功之前结束本轮。
 
 **尝试（Attempt）** 是一步的一次持久化尝试。它最多授权一次网络派发。如果进程在记录尝试之后停止，日志无法知道派发是否发生，因此该尝试视为已消耗，其供应商侧结果未知。
 
@@ -381,9 +381,10 @@ API 密钥的值绝不写入。
 |---|---|
 | `type` | 事件名称 |
 | `seq` | 从 1 开始的连续会话内序列号 |
+| `ts` | 可选的追加墙钟时间，epoch 毫秒；字段引入前写入的日志中没有它 |
 | `data` | 事件专属对象 |
 
-顺序由序列号而非时间定义。JSON 字段使用 `camelCase`。
+顺序由序列号而非时间定义。JSON 字段使用 `camelCase`。`ts` 面向运维取证——每步模型延迟和轮次时长可直接从日志读出——绝不投影进模型可见上下文。
 
 未知事件类型、重复序列号、序列号缺口、格式错误的完整行以及无效的事件形态均为错误。已有的完整事件从不被改写。恢复时只允许移除末尾不完整的物理行。
 
@@ -416,7 +417,7 @@ turn/end
 
 `model/request` 的 `seq` 标识该请求。`run/start` 的 `seq` 标识该运行。不再生成单独的请求、运行或绑定 ID。
 
-以下对象形态是规范性的。在日志版本 1 中，未知字段视为错误。描述为"可缺省"的字段直接省略，而不是编码为 `null`，除非 `Kernel::Outcome` 本身的既有形态就使用 `null`。
+以下对象形态是规范性的。在日志版本 1 中，未知字段视为错误。描述为“可缺省”的字段直接省略，而不是编码为 `null`，除非 `Kernel::Outcome` 本身的既有形态就使用 `null`。Agent 的 `run/result` 会存储规范化的 tagged disposition；旧日志中的 `answer` 字段只为兼容读取保留，当前 agent 不会再写入。
 
 ### 9.1 `turn/start`
 
@@ -555,7 +556,7 @@ turn/end
 
 ### 9.6 `run/result`
 
-正常结果存储完整的内核结果（outcome），并且当该运行没有回答本轮时，还存储添加到主对话中的确切观察：
+正常结果存储完整的内核结果和规范化的 agent disposition。`to: "model"` 还会存储加入主对话的、有界观察；`to: "user"` 存储用户消息但省略 observation：
 
 ```json
 {
@@ -567,22 +568,23 @@ turn/end
     "status": "completed",
     "outcome": {
       "ok": true,
-      "value": "...",
-      "answer": null,
+      "value": null,
       "stdout": "",
       "error": null,
       "termination": "returned",
       "timedOut": false,
       "elapsedMs": 20
     },
-    "observation": "{\"ok\":true,\"value\":...,\"stdout\":\"\",\"error\":null,\"termination\":\"returned\",\"timedOut\":false,\"elapsedMs\":20}"
+    "disposition": {
+      "to": "model",
+      "facts": {"matches": [{"file": "/workspace/src/llm.rs", "line": 12}]}
+    },
+    "observation": "{\"turn\":1,\"step\":1,\"to\":\"model\",\"facts\":{\"matches\":[{\"file\":\"/workspace/src/llm.rs\",\"line\":12}]}}"
   }
 }
 ```
 
-当 outcome 包含回答时，`observation` 缺省。
-
-当 `run/start` 存在但没有结果时，恢复使用一个不同的变体：
+`to: "user"` 的 disposition 会存储 `message`，不存储 observation，并触发 `turn/end` 的 `handed_off`。可恢复的运行或协议错误则存储有界的模型观察，不会自动交还用户。
 
 ```json
 {
@@ -601,26 +603,27 @@ turn/end
 
 ### 9.7 `turn/end`
 
+显式交还用户时追加 `turn/end`：
+
 ```json
 {
   "type": "turn/end",
-  "seq": 6,
-  "time": 1787890000300,
+  "seq": 9,
   "data": {
-    "reason": "answered",
-    "answerRunSeq": 4
+    "reason": "handed_off",
+    "handoffRunSeq": 8
   }
 }
 ```
 
-原因（reason）有：
+原因有：
 
-- `answered`；
+- `handed_off`：已完成的 `to: "user"` disposition；
 - `step_limit`；
 - `failed`；
 - `cancelled`。
 
-只有 `answered` 需要 `answerRunSeq`。回答本身保留在被引用的内核结果中。
+只有 `handed_off` 需要 `handoffRunSeq`，且它必须指向一个 disposition 目标为 `user` 的已完成运行。旧日志中的 `answered` 和 `answerRunSeq` 仍可读取，但当前 agent 不再写入。
 
 ## 10. 对话投影
 
@@ -654,7 +657,7 @@ turn/end
 4. 追加 `model/result`；
 5. 若为可重试失败，为同一步骤追加尝试 2；
 6. 若成功，处理存储的 action；
-7. 在其协议观察、运行结果或回答之后结束该步骤；
+7. 在其协议观察、运行结果、可恢复错误观察或显式交还用户之后结束该步骤；
 8. 仅在需要另一次主 agent 决策时递增步骤。
 
 一步的多次尝试绝不重叠。尝试 2 必须跟随尝试 1 的可重试失败结果。不存在尝试 3。
@@ -672,7 +675,7 @@ turn/end
 
 超时可能使供应商侧结果未知。尝试 2 可能重复供应商侧的工作或费用。Terrarium 记录这种不确定性，且绝不做第三次尝试。
 
-在一个未产生回答的成功步骤之后，Terrarium 开始下一步，除非这会超出该轮存储的 `maxSteps`。此时它追加 `turn/end`，`reason: "step_limit"`。
+在一个成功返回 `to: "model"` 的步骤，或发生可恢复的协议/运行错误之后，Terrarium 开始下一步，除非这会超出该轮存储的 `maxSteps`。成功返回 `to: "user"` 时，以 `reason: "handed_off"` 结束本轮。达到步骤上限时追加 `turn/end`，`reason: "step_limit"`。
 
 ## 12. 恢复与修复
 
@@ -727,9 +730,7 @@ terrarium run [-e SOURCE | FILE] [--read-only | --full-access] [--mount /virtual
 
 ### 12.6 已完成的运行没有后续
 
-如果其 outcome 包含回答，追加 `turn/end`，`reason: "answered"`。
-
-否则使用其存储的观察，进入下一步，或在步骤上限处闭合。
+如果 disposition 目标是 `user`，追加 `turn/end`，`reason: "handed_off"`，并带上对应的 `handoffRunSeq`；只打印一次 disposition 中的消息。`to: "model"`、有界的运行错误观察或协议观察都会进入下一步，或在步骤上限处闭合。为兼容旧日志，没有 disposition 但 `outcome.answer` 为字符串的已完成运行，仍以旧的 `answered` 原因闭合。
 
 ### 12.7 协议观察没有后续
 
@@ -749,10 +750,11 @@ terrarium run [-e SOURCE | FILE] [--read-only | --full-access] [--mount /virtual
 - 尝试仅限 1 和 2；
 - 尝试 2 必须跟随同一步骤中尝试 1 的可重试失败；
 - 每步至多一次尝试成功；
-- 成功的模型结果恰好包含一个 action；
+- 一次成功的模型结果恰好包含一个 action；
 - 一个运行 action 至多一个 `run/start`；
 - 一次运行至多一个结果；
-- `answered` 的轮引用一个包含回答的已完成运行；
+- 成功的 `to: "model"` 运行带有模型观察，且 facts 序列化后不超过 4096 字节；
+- `handed_off` 的轮引用一个带有 user disposition 的已完成运行；
 - 在下一个 `turn/start` 之前，`turn/end` 之后没有事件。
 
 校验会报告违规的序列号和不变量。Terrarium 不会为了使无效日志可用而静默丢弃完整事件。
@@ -813,7 +815,8 @@ API 密钥的值只存在于宿主进程内存和请求头中。它们绝不会�
 - 没有 `run/start` 的已存储运行 action 执行一次。
 - `run/start` 已持久化但没有结果的运行绝不重新执行。
 - 已存储的运行结果或协议观察直接继续，不重新生成其文本。
-- 已回答的轮保持闭合。
+- 已存储的 `to: "user"` disposition 只以 `handed_off` 结束本轮一次。
+- 旧的已回答轮保持闭合。
 
 ## 16. 显式的非目标
 

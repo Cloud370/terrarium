@@ -150,9 +150,9 @@ The generated host contract exposes `host.fs.list(dir)` as sorted objects with `
 
 **Session** is one durable conversation stored in one JSONL file.
 
-**Turn** begins with one user message and ends with an answer, cancellation, step-limit exhaustion, or terminal failure. A completed turn does not complete the session.
+**Turn** begins with one user message and ends with an explicit user handoff, cancellation, step-limit exhaustion, or terminal failure. A successful `{to: "model", facts: {...}}` disposition keeps the turn open. A completed turn does not complete the session.
 
-**Step** is one logical main-agent decision inside a turn. A normal step ends with a successful assistant response and either a program result or a protocol observation. A terminal model failure may end the turn before the step succeeds.
+**Step** is one logical main-agent decision inside a turn. A step ends after its model response and either a JavaScript run result, a protocol observation, or a recoverable error observation. A `{to: "model", facts: {...}}` run result starts the next step in the same turn. A `{to: "user", message: "..."}` run result ends the turn by handing control back to the user. A terminal model failure may end the turn before the step succeeds.
 
 **Attempt** is one durable try at a step. It authorizes at most one network dispatch. If the process stops after recording an attempt, the journal cannot know whether dispatch occurred, so that attempt remains consumed and its provider outcome is unknown.
 
@@ -429,9 +429,10 @@ Envelope fields are:
 |---|---|
 | `type` | Event name |
 | `seq` | Contiguous session-local sequence beginning at 1 |
+| `ts` | Optional wall-clock append time, epoch milliseconds; absent in journals written before the field existed |
 | `data` | Event-specific object |
 
-Sequence defines order. JSON fields use `camelCase`.
+Sequence defines order. JSON fields use `camelCase`. `ts` is operator-facing forensics — per-step model latency and turn duration are readable directly from the journal — and is never projected into model-visible context.
 
 Unknown event types, duplicate sequences, sequence gaps, malformed complete lines, and invalid event shapes are errors. Existing complete events are never rewritten. Only an incomplete final physical line may be removed during recovery.
 
@@ -464,7 +465,7 @@ turn/end
 
 The `seq` of `model/request` identifies that request. The `seq` of `run/start` identifies that run. No separate request, run, or binding IDs are generated.
 
-The object shapes below are normative. Unknown fields are errors in journal version 1. Fields described as absent are omitted rather than encoded as `null`, except where `Kernel::Outcome` itself uses `null` as part of its existing shape.
+The object shapes below are normative. Unknown fields are errors in journal version 1. Fields described as absent are omitted rather than encoded as `null`, except where `Kernel::Outcome` itself uses `null` as part of its existing shape. Agent `run/result` events store a normalized tagged `disposition`; legacy `answer` fields may be read for compatibility but are never written by the current agent.
 
 ### 9.1 `turn/start`
 
@@ -597,7 +598,7 @@ The event is durable before JavaScript begins executing. Its sequence identifies
 
 ### 9.6 `run/result`
 
-A normal result stores the full kernel outcome and, when the run did not answer the turn, the exact observation added to the main conversation:
+A normal result stores the full kernel outcome and the normalized agent disposition. A `to: "model"` disposition also stores the exact bounded observation added to the main conversation:
 
 ```json
 {
@@ -608,20 +609,49 @@ A normal result stores the full kernel outcome and, when the run did not answer 
     "status": "completed",
     "outcome": {
       "ok": true,
-      "value": "...",
-      "answer": null,
+      "value": null,
       "stdout": "",
       "error": null,
       "termination": "returned",
       "timedOut": false,
       "elapsedMs": 20
     },
-    "observation": "{\"ok\":true,\"value\":...,\"stdout\":\"\",\"error\":null,\"termination\":\"returned\",\"timedOut\":false,\"elapsedMs\":20}"
+    "disposition": {
+      "to": "model",
+      "facts": {"matches": [{"file": "/workspace/src/llm.rs", "line": 12}]}
+    },
+    "observation": "{\"turn\":1,\"step\":1,\"to\":\"model\",\"facts\":{\"matches\":[{\"file\":\"/workspace/src/llm.rs\",\"line\":12}]}}"
   }
 }
 ```
 
-When the outcome contains an answer, `observation` is absent.
+A `to: "user"` disposition stores the user-facing message and omits `observation`:
+
+```json
+{
+  "type": "run/result",
+  "seq": 8,
+  "data": {
+    "runSeq": 7,
+    "status": "completed",
+    "outcome": {
+      "ok": true,
+      "value": null,
+      "stdout": "",
+      "error": null,
+      "termination": "returned",
+      "timedOut": false,
+      "elapsedMs": 8
+    },
+    "disposition": {
+      "to": "user",
+      "message": "The HTTP client is configured in src/llm.rs."
+    }
+  }
+}
+```
+
+A failed run stores a compact model observation with turn and step coordinates, status, termination, timeout, elapsed time, and bounded error information. It does not automatically copy its return value or stdout into model context.
 
 Recovery uses a distinct variant when `run/start` exists but no result does:
 
@@ -641,25 +671,27 @@ Recovery uses a distinct variant when `run/start` exists but no result does:
 
 ### 9.7 `turn/end`
 
+A user handoff appends `turn/end`:
+
 ```json
 {
   "type": "turn/end",
-  "seq": 6,
+  "seq": 9,
   "data": {
-    "reason": "answered",
-    "answerRunSeq": 4
+    "reason": "handed_off",
+    "handoffRunSeq": 8
   }
 }
 ```
 
 Reasons are:
 
-- `answered`;
+- `handed_off` for a completed `to: "user"` disposition;
 - `step_limit`;
 - `failed`;
 - `cancelled`.
 
-`answerRunSeq` is required only for `answered`. The answer itself remains in the referenced kernel outcome.
+`handoffRunSeq` is required only for `handed_off` and must reference a completed run whose disposition targets `user`. The legacy `answered` reason and `answerRunSeq` field remain readable for older journals but are not written by the current agent.
 
 ## 10. Conversation projection
 
@@ -691,7 +723,7 @@ For each new step:
 4. append `model/result`;
 5. on a retryable failure, append attempt 2 for the same step;
 6. on success, process the stored action;
-7. end the step after its protocol observation, run result, or answer;
+7. end the step after its protocol observation, run result, recoverable error observation, or explicit user handoff;
 8. increment the step only when another main-agent decision is needed.
 
 Attempts for one step never overlap. Attempt 2 must follow a retryable failed result for attempt 1. There is no attempt 3.
@@ -709,7 +741,7 @@ Configuration errors, HTTP 4xx other than 429, and invalid provider responses ar
 
 A timeout can leave the provider outcome unknown. Attempt 2 may duplicate provider work or cost. Terrarium records the uncertainty and never makes a third attempt.
 
-After a successful step that did not answer, Terrarium begins the next step unless doing so would exceed the turn's stored `maxSteps`. In that case it appends `turn/end` with `reason: "step_limit"`.
+After a successful `to: "model"` step, or after a recoverable protocol or run error, Terrarium begins the next step unless doing so would exceed the turn's stored `maxSteps`. A successful `to: "user"` disposition ends the turn with `reason: "handed_off"`. At the step limit it appends `turn/end` with `reason: "step_limit"`.
 
 ## 12. Resume and recovery
 
@@ -766,9 +798,7 @@ It appends `run/result` with `status: "outcome_unknown"` and the exact recovery 
 
 ### 12.6 Completed run has no continuation
 
-If its outcome contains an answer, append `turn/end` with `reason: "answered"`.
-
-Otherwise use its stored observation and begin the next step, or close at the step limit.
+If its disposition targets `user`, append `turn/end` with `reason: "handed_off"` and the referenced `handoffRunSeq`. Print the disposition message once. A `to: "model"` disposition, a compact run-error observation, or a protocol observation continues to the next step, or closes at the step limit. For compatibility, an older completed run with `outcome.answer` but no disposition is closed with the legacy `answered` reason.
 
 ### 12.7 Protocol observation has no continuation
 
@@ -792,7 +822,8 @@ A version 1 journal is valid only when:
 - a successful model result contains exactly one action;
 - one run action has at most one `run/start`;
 - one run has at most one result;
-- an answered turn references a completed run containing an answer;
+- a completed `to: "model"` run has a model observation whose facts serialize to at most 4096 bytes;
+- a `handed_off` turn references a completed run with a user disposition;
 - no event follows `turn/end` until the next `turn/start`.
 
 Validation reports the offending sequence and invariant. Terrarium does not silently discard complete events to make an invalid journal usable.
@@ -871,7 +902,8 @@ All acceptance tests use a local mock HTTP server. No real third-party model ser
 - A host denial during recovered execution is stored as an ordinary run result and the source is not retried automatically.
 - A run with durable `run/start` and no result is never re-executed.
 - A stored run outcome or protocol observation continues without regenerating its text.
-- An answered turn remains closed.
+- A stored `to: "user"` disposition closes the turn exactly once with `handed_off`.
+- A legacy answered turn remains closed.
 
 ## 16. Explicit non-goals
 

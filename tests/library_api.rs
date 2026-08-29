@@ -74,5 +74,7 @@ fn kernel_renders_the_current_contract() {
     let contract = kernel.contract();
 
     assert!(contract.contains("host.fs.list(dir)"));
-    assert!(contract.contains("host.agent.answer(text)"));
+    assert!(contract.contains("to: \"model\""));
+    assert!(contract.contains("to: \"user\""));
+    assert!(!contract.contains("host.agent.answer"));
 }

@@ -142,7 +142,6 @@ async fn run_direct(args: &[String]) -> i32 {
         serde_json::json!({
             "ok": outcome.ok,
             "value": outcome.value,
-            "answer": outcome.answer,
             "stdout": outcome.stdout,
             "error": outcome.error,
             "termination": outcome.termination,

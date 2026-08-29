@@ -103,7 +103,6 @@ pub struct RunError {
 pub struct Outcome {
     pub ok: bool,
     pub value: Option<serde_json::Value>,
-    pub answer: Option<String>,
     pub error: Option<RunError>,
     pub termination: Termination,
     pub stdout: String,
@@ -115,7 +114,6 @@ fn failure(kind: ErrorKind, msg: impl Into<String>) -> Outcome {
     Outcome {
         ok: false,
         value: None,
-        answer: None,
         error: Some(RunError {
             kind,
             message: msg.into(),
@@ -181,7 +179,6 @@ pub(crate) async fn eval_js(
     };
     let logs: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let overflowed: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
-    let answer: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
     let rt = match AsyncRuntime::new() {
         Ok(rt) => rt,
@@ -221,20 +218,12 @@ pub(crate) async fn eval_js(
 
         let host = Object::new(ctx.clone())?;
         fs::install(&ctx, &host, mounts)?;
-        let agent_ns = Object::new(ctx.clone())?;
-        let answer_slot = answer.clone();
-        let answer_fn = Function::new(ctx.clone(), move |text: String| {
-            *answer_slot.borrow_mut() = Some(text);
-        })?;
-        agent_ns.set("answer", answer_fn)?;
-        host.set("agent", agent_ns)?;
         ctx.globals().set("host", host)?;
         ctx.eval::<Value, _>(PRELUDE)?;
 
         let mut out = Outcome {
             ok: true,
             value: None,
-            answer: None,
             error: None,
             termination: Termination::Returned,
             stdout: String::new(),
@@ -304,9 +293,6 @@ pub(crate) async fn eval_js(
                 });
             }
         }
-        if out.ok {
-            out.answer = answer.borrow().clone();
-        }
         Ok(out)
     });
 
@@ -324,7 +310,6 @@ pub(crate) async fn eval_js(
                     o.timed_out = true;
                     o.termination = Termination::TimedOut;
                     o.value = None;
-                    o.answer = None;
                     o.error = Some(RunError { kind: ErrorKind::Runtime, message: "deadline exceeded".into() });
                     Some(o)
                 }
@@ -351,7 +336,6 @@ pub(crate) async fn eval_js(
     if out.termination == Termination::Returned && out.elapsed_ms >= timeout_ms {
         out.ok = false;
         out.value = None;
-        out.answer = None;
         out.timed_out = true;
         out.termination = Termination::TimedOut;
         out.error = Some(RunError {
@@ -466,10 +450,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn async_function_body_and_explicit_answer_work() {
+    async fn async_function_body_and_explicit_return_work() {
         let (tx, _rx) = watch::channel(false);
         let out = eval_js(
-            "function value() { return 41; }\nhost.agent.answer(String(value() + 1));\nreturn {ok: true, values: [1, 2]};",
+            "function value() { return 41; }\nreturn {to: 'model', facts: {value: value() + 1}};",
             5_000,
             &[],
             tx,
@@ -478,9 +462,8 @@ mod tests {
         assert!(out.ok, "error: {:?}", out.error);
         assert_eq!(
             out.value,
-            Some(serde_json::json!({"ok": true, "values": [1, 2]}))
+            Some(serde_json::json!({"to": "model", "facts": {"value": 42}}))
         );
-        assert_eq!(out.answer.as_deref(), Some("42"));
         assert_eq!(out.termination, Termination::Returned);
     }
 

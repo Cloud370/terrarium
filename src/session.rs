@@ -32,7 +32,19 @@ pub struct Event {
     #[serde(rename = "type")]
     pub kind: String,
     pub seq: u64,
+    /// Wall-clock append time, epoch milliseconds. Operator-facing forensics (per-step LLM
+    /// latency, turn duration); never projected into model-visible context. Absent in
+    /// journals written before the field existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ts: Option<u64>,
     pub data: Value,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 pub struct Journal {
@@ -177,6 +189,7 @@ impl Journal {
         let event = Event {
             kind: kind.into(),
             seq,
+            ts: Some(now_ms()),
             data,
         };
         validate_event(&event, &self.events)?;
@@ -295,6 +308,31 @@ fn validate_profile(value: &Value, seq: u64) -> Result<(), String> {
     if let Some(effort) = profile.get("reasoningEffort") {
         if !matches!(effort.as_str(), Some("low" | "medium" | "high")) {
             return Err(format!("event {seq} profile.reasoningEffort is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_disposition(value: &Value, seq: u64) -> Result<(), String> {
+    let disposition = object(value, seq, "run disposition")?;
+    let to = string_field(disposition, "to", seq, "run disposition")?;
+    match to {
+        "model" => {
+            exact_keys(disposition, &["to", "facts"], &[], seq, "run disposition")?;
+            if !disposition["facts"].is_object() {
+                return Err(format!(
+                    "event {seq} run disposition facts must be an object"
+                ));
+            }
+        }
+        "user" => {
+            exact_keys(disposition, &["to", "message"], &[], seq, "run disposition")?;
+            string_field(disposition, "message", seq, "run disposition")?;
+        }
+        _ => {
+            return Err(format!(
+                "event {seq} has unsupported run disposition target {to:?}"
+            ))
         }
     }
     Ok(())
@@ -654,7 +692,7 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
                     exact_keys(
                         data,
                         &["runSeq", "status", "outcome"],
-                        &["observation"],
+                        &["disposition", "observation"],
                         event.seq,
                         "run/result data",
                     )?;
@@ -664,19 +702,17 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
                         &[
                             "ok",
                             "value",
-                            "answer",
                             "stdout",
                             "error",
                             "termination",
                             "timedOut",
                             "elapsedMs",
                         ],
-                        &[],
+                        &["answer"],
                         event.seq,
                         "run outcome",
                     )?;
                     if outcome["ok"].as_bool().is_none()
-                        || outcome["answer"].as_str().is_none() && !outcome["answer"].is_null()
                         || outcome["stdout"].as_str().is_none()
                         || outcome["timedOut"].as_bool().is_none()
                         || outcome["elapsedMs"].as_u64().is_none()
@@ -686,12 +722,60 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
                             event.seq
                         ));
                     }
-                    let answered = outcome["answer"].as_str().is_some();
-                    if answered == data.get("observation").is_some() {
+                    if let Some(answer) = outcome.get("answer") {
+                        if answer.as_str().is_none() && !answer.is_null() {
+                            return Err(format!(
+                                "event {} legacy run answer must be a string or null",
+                                event.seq
+                            ));
+                        }
+                    }
+                    if let Some(disposition) = data.get("disposition") {
+                        validate_disposition(disposition, event.seq)?;
+                        let to = disposition["to"].as_str().unwrap_or_default();
+                        if to == "model" {
+                            let observation = data.get("observation").ok_or_else(|| {
+                                format!(
+                                    "event {} model disposition needs an observation",
+                                    event.seq
+                                )
+                            })?;
+                            let bytes = serde_json::to_vec(&disposition["facts"]).map_err(|e| {
+                                format!("event {} cannot serialize run facts: {e}", event.seq)
+                            })?;
+                            if bytes.len() > 4096 {
+                                return Err(format!(
+                                    "event {} run disposition facts exceed the 4096-byte limit",
+                                    event.seq
+                                ));
+                            }
+                            if observation.as_str().is_none() {
+                                return Err(format!(
+                                    "event {} run observation must be a string",
+                                    event.seq
+                                ));
+                            }
+                        } else if data.get("observation").is_some() {
+                            return Err(format!(
+                                "event {} user disposition must not have an observation",
+                                event.seq
+                            ));
+                        }
+                    } else if data.get("observation").is_none()
+                        && outcome.get("answer").and_then(Value::as_str).is_none()
+                    {
                         return Err(format!(
-                            "event {} run observation does not match answer presence",
+                            "event {} completed run needs disposition or observation",
                             event.seq
                         ));
+                    }
+                    if let Some(observation) = data.get("observation") {
+                        if observation.as_str().is_none() {
+                            return Err(format!(
+                                "event {} run observation must be a string",
+                                event.seq
+                            ));
+                        }
                     }
                     if let Some(error) = outcome.get("error") {
                         if !error.is_null() {
@@ -731,32 +815,45 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
             exact_keys(
                 data,
                 &["reason"],
-                &["answerRunSeq"],
+                &["answerRunSeq", "handoffRunSeq"],
                 event.seq,
                 "turn/end data",
             )?;
             let reason = string_field(data, "reason", event.seq, "turn/end data")?;
-            if !matches!(reason, "answered" | "step_limit" | "failed" | "cancelled") {
+            if !matches!(
+                reason,
+                "answered" | "handed_off" | "step_limit" | "failed" | "cancelled"
+            ) {
                 return Err(format!(
                     "event {} has unsupported turn end reason {reason:?}",
                     event.seq
                 ));
             }
-            if reason == "answered" {
+            if reason == "handed_off" {
+                let run_seq = data["handoffRunSeq"].as_u64().ok_or_else(|| {
+                    format!("event {} handed_off turn needs handoffRunSeq", event.seq)
+                })?;
+                let run = prior
+                    .iter()
+                    .find(|item| {
+                        item.kind == "run/result"
+                            && item.data["runSeq"].as_u64() == Some(run_seq)
+                            && item.data["status"] == "completed"
+                            && item.data["disposition"]["to"] == "user"
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "event {} references missing completed user handoff run {run_seq}",
+                            event.seq
+                        )
+                    })?;
+                if run.data["disposition"]["message"].as_str().is_none() {
+                    return Err(format!("event {} handoff has no message", event.seq));
+                }
+            } else if reason == "answered" {
                 let run_seq = data["answerRunSeq"].as_u64().ok_or_else(|| {
                     format!("event {} answered turn needs answerRunSeq", event.seq)
                 })?;
-                let current_turn_seq = prior
-                    .iter()
-                    .rfind(|item| item.kind == "turn/start")
-                    .map(|item| item.seq)
-                    .unwrap_or(0);
-                if run_seq <= current_turn_seq {
-                    return Err(format!(
-                        "event {} answer references a run from another turn",
-                        event.seq
-                    ));
-                }
                 let run = prior
                     .iter()
                     .find(|item| {
@@ -773,9 +870,9 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
                 if run.data["outcome"]["answer"].as_str().is_none() {
                     return Err(format!("event {} answer run has no answer", event.seq));
                 }
-            } else if data.contains_key("answerRunSeq") {
+            } else if data.contains_key("answerRunSeq") || data.contains_key("handoffRunSeq") {
                 return Err(format!(
-                    "event {} non-answered turn cannot contain answerRunSeq",
+                    "event {} non-terminal-answer turn cannot contain answer references",
                     event.seq
                 ));
             }
@@ -896,36 +993,176 @@ mod tests {
     }
 
     #[test]
+    fn appended_events_stamp_non_decreasing_wall_clock_ts() {
+        let _guard = STATE_LOCK.lock().unwrap();
+        let (mut journal, state) = test_journal();
+        start(&mut journal);
+        journal
+            .append("model/request", serde_json::json!({"step":1,"attempt":1}))
+            .unwrap();
+        let stamps: Vec<u64> = journal
+            .events
+            .iter()
+            .map(|event| event.ts.expect("append stamps ts"))
+            .collect();
+        assert_eq!(stamps.len(), 2);
+        assert!(stamps.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(stamps[0] >= 1_500_000_000_000); // a plausible epoch-ms
+        drop(journal);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn legacy_events_without_ts_still_deserialize() {
+        let legacy: Event =
+            serde_json::from_str(r#"{"type":"turn/start","seq":1,"data":{}}"#).unwrap();
+        assert!(legacy.ts.is_none());
+        let stamped: Event = serde_json::from_str(
+            r#"{"type":"turn/start","seq":1,"ts":1700000000123,"data":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(stamped.ts, Some(1700000000123));
+        let bad =
+            serde_json::from_str::<Event>(r#"{"type":"turn/start","seq":1,"ts":"x","data":{}}"#);
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn projection_keeps_model_facts_but_not_user_handoff_messages() {
+        let events = vec![
+            Event {
+                kind: "turn/start".into(),
+                seq: 1,
+                ts: None,
+                data: serde_json::json!({"message":"inspect","systemPrompt":"system","profile":{"name":"p","protocol":"openai-chat-completions","baseUrl":"https://x","model":"m"},"limits":{"maxSteps":2,"defaultRunTimeoutMs":1,"maxRunTimeoutMs":2}}),
+            },
+            Event {
+                kind: "model/result".into(),
+                seq: 2,
+                ts: None,
+                data: serde_json::json!({"requestSeq":1,"ok":true,"content":"```run\nreturn {}\n```","action":{"kind":"run","source":"return {}\n","timeoutMs":1}}),
+            },
+            Event {
+                kind: "run/result".into(),
+                seq: 3,
+                ts: None,
+                data: serde_json::json!({"runSeq":2,"status":"completed","outcome":{"ok":true,"value":null,"stdout":"","error":null,"termination":"returned","timedOut":false,"elapsedMs":1},"disposition":{"to":"model","facts":{"count":2}},"observation":"{\"turn\":1,\"step\":1,\"to\":\"model\",\"facts\":{\"count\":2}}"}),
+            },
+            Event {
+                kind: "run/result".into(),
+                seq: 4,
+                ts: None,
+                data: serde_json::json!({"runSeq":3,"status":"completed","outcome":{"ok":true,"value":null,"stdout":"","error":null,"termination":"returned","timedOut":false,"elapsedMs":1},"disposition":{"to":"user","message":"private handoff"}}),
+            },
+        ];
+        let projection = project(&events, 5);
+        assert!(projection.iter().any(|message| message["content"].as_str()
+            == Some("{\"turn\":1,\"step\":1,\"to\":\"model\",\"facts\":{\"count\":2}}")));
+        assert!(!projection
+            .iter()
+            .any(|message| message["content"] == "private handoff"));
+    }
+
+    #[test]
+    fn completed_successful_run_requires_disposition_or_protocol_observation() {
+        let _guard = STATE_LOCK.lock().unwrap();
+        let (mut journal, state) = test_journal();
+        start(&mut journal);
+        journal
+            .append("model/request", serde_json::json!({"step":1,"attempt":1}))
+            .unwrap();
+        journal
+            .append(
+                "model/result",
+                serde_json::json!({"requestSeq":2,"ok":true,"content":"```run\nreturn {}\n```","action":{"kind":"run","source":"return {}\n","timeoutMs":1}}),
+            )
+            .unwrap();
+        journal
+            .append("run/start", serde_json::json!({"modelResultSeq":3}))
+            .unwrap();
+        let error = journal
+            .append(
+                "run/result",
+                serde_json::json!({"runSeq":4,"status":"completed","outcome":{"ok":true,"value":null,"stdout":"","error":null,"termination":"returned","timedOut":false,"elapsedMs":1}}),
+            )
+            .unwrap_err();
+        assert!(error.contains("disposition"), "{error}");
+        drop(journal);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn oversized_model_facts_are_rejected_by_journal_validation() {
+        let _guard = STATE_LOCK.lock().unwrap();
+        let (mut journal, state) = test_journal();
+        start(&mut journal);
+        journal
+            .append("model/request", serde_json::json!({"step":1,"attempt":1}))
+            .unwrap();
+        journal
+            .append(
+                "model/result",
+                serde_json::json!({"requestSeq":2,"ok":true,"content":"```run\nreturn tagged\n```","action":{"kind":"run","source":"return tagged\n","timeoutMs":1}}),
+            )
+            .unwrap();
+        journal
+            .append("run/start", serde_json::json!({"modelResultSeq":3}))
+            .unwrap();
+        let error = journal
+            .append(
+                "run/result",
+                serde_json::json!({
+                    "runSeq":4,
+                    "status":"completed",
+                    "outcome":{"ok":true,"value":null,"stdout":"","error":null,"termination":"returned","timedOut":false,"elapsedMs":1},
+                    "disposition":{"to":"model","facts":{"text":"x".repeat(4097)}},
+                    "observation":"{}"
+                }),
+            )
+            .unwrap_err();
+        assert!(error.contains("facts"), "{error}");
+        assert!(error.contains("limit"), "{error}");
+        drop(journal);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
     fn projection_omits_failed_model_attempts_and_uses_latest_prompt() {
         let events = vec![
             Event {
                 kind: "turn/start".into(),
                 seq: 1,
+                ts: None,
                 data: serde_json::json!({"message":"old","systemPrompt":"old-system","profile":{"name":"p","protocol":"openai-chat-completions","baseUrl":"https://x","model":"m"},"limits":{"maxSteps":2,"defaultRunTimeoutMs":1,"maxRunTimeoutMs":2}}),
             },
             Event {
                 kind: "turn/end".into(),
                 seq: 2,
+                ts: None,
                 data: serde_json::json!({"reason":"failed"}),
             },
             Event {
                 kind: "turn/start".into(),
                 seq: 3,
+                ts: None,
                 data: serde_json::json!({"message":"new","systemPrompt":"new-system","profile":{"name":"p","protocol":"openai-chat-completions","baseUrl":"https://x","model":"m"},"limits":{"maxSteps":2,"defaultRunTimeoutMs":1,"maxRunTimeoutMs":2}}),
             },
             Event {
                 kind: "model/request".into(),
                 seq: 4,
+                ts: None,
                 data: serde_json::json!({"step":1,"attempt":1}),
             },
             Event {
                 kind: "model/result".into(),
                 seq: 5,
+                ts: None,
                 data: serde_json::json!({"requestSeq":4,"ok":false,"error":{"kind":"transport","message":"x","retryable":true}}),
             },
             Event {
                 kind: "model/request".into(),
                 seq: 6,
+                ts: None,
                 data: serde_json::json!({"step":1,"attempt":2}),
             },
         ];

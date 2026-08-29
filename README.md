@@ -8,6 +8,22 @@ An agent runtime where the model's actions are programs, not tool calls. The def
 
 Terrarium is a bounded program runtime: the model emits programs, the host exposes explicit capabilities, each run executes in a fresh cage. It is not a tool registry, a shell wrapper, an operating-system sandbox, or a multi-agent framework.
 
+### Reasoning discipline
+
+Every new capability starts with first principles, not with an API shape or an implementation pattern. Before adding it, answer these questions in order:
+
+1. What user outcome does this enable, and what is the smallest workflow that proves the outcome?
+2. Which facts and effects must cross the current boundary, and which are only temporary computation?
+3. Who owns each state, who may change it, and when does it begin and end?
+4. What is the smallest explicit interface that makes that ownership and lifecycle visible?
+5. What happens on failure, timeout, cancellation, process loss, restart, partial completion, and denied permission?
+6. Which data belongs in model context, which belongs in durable state, and which must remain outside both?
+7. Can the existing boundaries express the workflow? If so, prefer composing them over adding a new abstraction.
+
+Keep control flow separate from data flow: a result should say who acts next, while large or sensitive data should cross boundaries by an explicit, bounded reference. Facts owned by the host must be derived by the host, not reported by the model. Optimize for the fewest steps that establish correctness, never for spending or exposing a step budget. Do not introduce a lifecycle, storage layer, routing mechanism, or capability without a concrete consumer and a complete contract for its limits and recovery.
+
+The design is good when its behavior can be reconstructed from its boundaries: a user, a model, or a future maintainer should be able to tell what persists, what is released, who acts next, and how uncertainty is handled without reading hidden implementation details.
+
 Invariants:
 
 - Model actions are programs — one complete `run` block per turn, and nothing outside that block executes.
@@ -15,40 +31,40 @@ Invariants:
 - Security lives in the host — mount scoping, `:rw` writes, resource limits, cancellation. Prompts describe behavior; they never provide the boundary.
 - No mutable state crosses runs, and credentials never enter the cage.
 - Core behavior is host code with no platform-specific external commands.
-- `host.fs.scan` is the only search engine: host-side pruning plus ordinary JavaScript filtering.
+- `host.fs.walk` and `host.fs.scan` share one traversal engine — walk streams a tree's file entries, scan streams its lines — so host-side pruning plus ordinary JavaScript filtering remains the only search mechanism.
 - Sessions are durable append-only JSONL files. Model requests and JavaScript runs cross a durable boundary before dispatch; uncertain runs are never replayed.
 
 Before adding any capability, answer: which real workflow needs it; what are its limits, cancellation, failure states, and permissions; does it work the same on Linux, macOS, and Windows; and can an existing capability express it? Prefer the smallest boundary, and keep speculative features out of the public contract.
 
 ## The protocol
 
-One agent session is a sequence of programs. A model reply must contain one closed `run` fence:
+One agent turn is a sequence of steps. Each model response must contain one closed `run` fence, and each successful program must return one explicit disposition:
 
 ````text
 ```run
+const matches = [];
 for await (const line of host.fs.scan("/proj/src", {glob: "*.rs"})) {
-  if (line.text.includes("http client")) return `${line.file}:${line.no}`;
+  if (line.text.includes("http client")) matches.push({file: line.file, line: line.no});
 }
+return {to: "model", facts: {matches}};
 ```
 ````
 
-A normal `return` ends only that run. The session ends when the program calls `host.agent.answer(text)`:
+`to: "model"` ends the current JavaScript run and continues the same user turn. `to: "user"` ends the current turn and prints its message:
 
 ````text
 ```run
-host.agent.answer("The HTTP client is configured in src/llm.rs.");
+return {to: "user", message: "The HTTP client is configured in src/llm.rs."};
 ```
 ````
 
-The parser accepts exactly one complete `run` fence per reply. A missing fence, an unclosed fence, or more than one `run` fence is a protocol error — the parser never executes one block and silently ignores the rest. An opening fence is a line that reads exactly ```` ```run ```` and a closing fence is a standalone ```` ``` ```` line; inline triple backticks never open or close a block. Text outside the block is not executed. There is no text-based completion marker.
-
-Every run is evaluated as one async function body, so top-level `return` and `await` have the same meaning in every program. The result keeps JSON values as JSON instead of formatting them as strings.
+A normal `return` releases the run's local JavaScript state; it does not by itself finish a turn. A returned error is not automatically a user-facing result: format, parse, traversal, validation, timeout, and other recoverable failures should return short facts to `to: "model"` so the next step can correct the work. Use `to: "user"` only when the result is established or a specific user action, missing input, authorization, or decision is required. A `catch` block that merely reports an error must not end the turn.
 
 ## Why programs
 
-- A whole unit of work executes per turn; context is spent on findings instead of tool-call bookkeeping.
+- A whole unit of work executes per step; context is spent on findings instead of tool-call bookkeeping.
 - JavaScript supplies control flow, retries, branching, and concurrency through ordinary language constructs.
-- The host surface stays small: bounded filesystem capabilities and the explicit session answer function. The main model is called by the trusted outer loop; JavaScript has no model-call primitive.
+- The host surface stays small: bounded filesystem capabilities and explicit model/user dispositions. The main model is called by the trusted outer loop; JavaScript has no model-call primitive.
 - Each run has a fresh cage, so a failed run does not corrupt the next run.
 
 ## The cage
@@ -114,7 +130,7 @@ terrarium --resume SESSION_ID [--read-only | --full-access] [--mount /virtual=re
 terrarium run [-e SOURCE | FILE] [--read-only | --full-access] [--mount /virtual=real[:rw]] [--timeout-ms N]
 ```
 
-The normal command always starts or resumes the model-driven agent. Message arguments are joined as text; non-terminal stdin supplies a message when no message argument is present. `--mount` entries apply to every run in the invocation. `workspace` is the default access mode, `--read-only` and `--full-access` are mutually exclusive, and access mode and mounts are never stored in the session. The agent exits `0` after `host.agent.answer`, and `2` for usage or configuration errors. Direct-run exits `0` for a successful program and `1` for a failed program.
+The normal command always starts or resumes the model-driven agent. Message arguments are joined as text; non-terminal stdin supplies a message when no message argument is present. `--mount` entries apply to every run in the invocation. `workspace` is the default access mode, `--read-only` and `--full-access` are mutually exclusive, and access mode and mounts are never stored in the session. The agent exits `0` after a program returns `to: "user"`, and `2` for usage or configuration errors. Direct-run exits `0` for a successful program and `1` for a failed program.
 
 ## Host API
 
@@ -124,8 +140,10 @@ The generated contract (`--contract`) documents the live surface:
 - `host.fs.read(path, from, to)` reads a bounded line window. `to=Infinity` reads to EOF within the window budget.
 - `host.fs.text(path)` reads a whole text file into the program when it fits the 64 MB host budget.
 - `host.fs.scan(path, options)` streams text-file lines from a directory tree. It respects `.gitignore`, skips hidden entries, binaries, and symlinks by default, and validates option types. Traversal and decoding errors reject the scan rather than becoming an empty result.
+- `host.fs.walk(path, options)` streams one `{file, size}` per regular file from a directory tree — the file-level twin of `scan`, with the same pruning and the same options; files are never opened. Counting files or summing sizes is a walk; counting `scan` yields counts lines.
 - `host.fs.write(path, content)` atomically writes text under a declared `:rw` mount and returns the byte count.
-- `host.agent.answer(text)` commits the current agent session answer. Returning from a program never commits the session.
+
+Agent programs use the tagged return protocol described above for model continuation or user handoff. There is no `host.agent.answer` API.
 
 The JavaScript host surface does not include `host.llm.call`; model requests belong to the trusted outer agent loop and are recorded in the session journal.
 

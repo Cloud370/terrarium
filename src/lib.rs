@@ -16,6 +16,4 @@ pub use config::{Config, ProfileConfig, ProviderConfig, ResolvedProfile};
 pub use fs::Mount;
 pub use kernel::{ErrorKind, Kernel, Outcome, RunError, Termination};
 
-pub(crate) use kernel::{
-    add_mount, contract_for, eval_js, truncate_utf8, MAX_TIMEOUT_MS, MEM_LIMIT,
-};
+pub(crate) use kernel::{add_mount, contract_for, eval_js, MAX_TIMEOUT_MS, MEM_LIMIT};

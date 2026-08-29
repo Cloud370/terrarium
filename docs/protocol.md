@@ -4,27 +4,26 @@ This document describes the protocol implemented by the current binary and libra
 
 ## Agent replies
 
-The outer agent loop accepts one complete fenced program per model turn:
+The outer agent loop accepts one complete fenced program per model step:
 
 ````text
 ```run
-const files = [];
+const matches = [];
 for await (const line of host.fs.scan("/proj/src", {glob: "*.rs"})) {
-  if (line.text.includes("http client")) files.push(`${line.file}:${line.no}`);
+  if (line.text.includes("http client")) matches.push({file: line.file, line: line.no});
 }
-return files;
+return {to: "model", facts: {matches}};
 ```
 ````
 
-A reply must contain exactly one closed `run` block. A missing block, an unclosed block, or more than one block is a protocol error; the parser never executes one block and silently ignores the rest. An opening fence is a line that reads exactly ```` ```run ```` and a closing fence is a standalone ```` ``` ```` line — inline triple backticks never open or close a block. There are no compatibility fence types or text completion markers.
+A reply must contain exactly one closed `run` block. A missing block, an unclosed block, or more than one block is a protocol error; the parser never executes one block and silently ignores the rest. An opening fence is a line that reads exactly ```` ```run ```` and a closing fence is a standalone ```` ``` ```` line. Inline triple backticks never open or close a block, and text outside the block is not executed.
 
-Returning from a program submits an observation for the next turn. To finish the whole agent session, the program must call:
+In agent mode, a successful program must return exactly one tagged disposition:
 
-```js
-host.agent.answer("The decisive finding is ...");
-```
+- `{to: "model", facts: {...}}` ends the current JavaScript run and continues the same user turn. `facts` is a small, bounded object that serializes to at most 4096 bytes for the next model step.
+- `{to: "user", message: "..."}` ends the current turn and prints the message to the user. Use this only when the result is established or a specific user action, missing input, authorization, or decision is required.
 
-The call records the supplied text as the session answer. A normal `return` never does this, even when its value looks like a final report.
+A normal top-level `return` releases the run's local JavaScript state; it does not by itself finish a turn. A format, parse, traversal, validation, timeout, or other recoverable operation error is model feedback, not an automatic user handoff. The next step should correct the operation, narrow the scope, or gather the missing evidence. A `catch` block that merely reports an error must return short facts to `to: "model"`, not hand control to the user. Only a real need for user input, authorization, or a decision belongs in `to: "user"`.
 
 ## Run semantics
 
@@ -40,7 +39,6 @@ Single-run mode writes one JSON object. The reusable library returns the same fi
 {
   "ok": true,
   "value": {"answer": 42},
-  "answer": null,
   "stdout": "",
   "error": null,
   "termination": "returned",
@@ -50,22 +48,23 @@ Single-run mode writes one JSON object. The reusable library returns the same fi
 ```
 
 - `value` is an optional JSON-compatible value returned by the program. `undefined` becomes `null` in the CLI JSON object.
-- `answer` is non-null only after `host.agent.answer(text)` was called.
-- `error` is either `null` or `{kind, message}`. Kinds are `runtime`, `capability`, `configuration`, `internal`, and `protocol`.
+- `error` is either `null` or `{kind, message}`.
 - `termination` is `returned`, `failed`, `timed_out`, `cancelled`, or `fatal`.
 - `timed_out` is a compatibility convenience and is true only for a timed-out run.
 
-The CLI adds target, limits, mount, and process-lifetime LLM usage metadata. These are adapter fields, not additional kernel protocol requirements.
+The direct `terrarium run` command accepts any JSON-compatible return value. Agent mode validates the returned value at the host boundary as one of the two tagged dispositions and records the normalized disposition in `run/result`.
 
 ## Host error behavior
 
-Host calls reject with a useful error instead of silently producing an empty result. In particular, scan traversal, file opening, and UTF-8 decoding failures carry the virtual path. Scan option fields reject when their types are wrong. Hidden entries, symlinks, binary files, and `.gitignore` matches are intentional scan exclusions, not errors.
+Host calls reject with a useful error instead of silently producing an empty result. In particular, scan traversal, file opening, and UTF-8 decoding failures carry the virtual path. Scan option fields reject when their types are wrong. Hidden entries, symlinks, binary files, and `.gitignore` matches are intentional scan exclusions, not errors. `walk` shares scan's traversal engine and option set; it yields `{file, size}` entries and reports traversal failures only, since it never opens files.
+
+A failed JavaScript run produces a compact model observation containing turn and step coordinates, status, termination, timeout, elapsed time, and a bounded error classification. It does not automatically copy the returned value or stdout into model context. A successful `to: "model"` disposition produces an observation containing the same coordinates and its bounded facts. A successful `to: "user"` disposition produces no model observation; the outer loop appends `turn/end` with `reason: "handed_off"` and prints the message.
 
 ## LLM payload scope
 
 The main model request is owned by the trusted outer agent loop. Each request uses the current turn's frozen resolved profile and is persisted as `model/request` before one network dispatch; a retryable attempt-1 failure may create exactly one attempt 2. Failed model results are not projected into later model-visible history.
 
-JavaScript has no `host.llm.call` or other in-program model-call primitive. The host surface is filesystem capabilities plus `host.agent.answer(text)` for session completion. The configured model ID is sent unchanged to the OpenAI-compatible endpoint.
+JavaScript has no `host.llm.call` or other in-program model-call primitive. The host surface is filesystem capabilities plus the tagged return protocol for continuing or handing off a turn. The configured model ID is sent unchanged to the OpenAI-compatible endpoint.
 
 The built-in capability declaration says `deepseek-v4-flash` accepts text input only, while `deepseek-v4-flash-vision-exp` declares text and image input. The latter declaration does not enable image payloads yet.
 

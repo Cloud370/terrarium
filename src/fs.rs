@@ -493,7 +493,7 @@ fn entry_ignored(scopes: &[IgnoreScope], rel_from_root: &str, name: &str, is_dir
 
 /// Load dir/.gitignore as a scope (base = dir rel to scan root); empty when absent.
 /// A symlinked rule file is not read — following it could pull ignore rules from outside the mount.
-fn load_scope(dir: &Path, root: &Path) -> Result<IgnoreScope, String> {
+fn load_scope(dir: &Path, root: &Path, label: &str) -> Result<IgnoreScope, String> {
     let base = dir
         .strip_prefix(root)
         .unwrap_or(dir)
@@ -503,11 +503,11 @@ fn load_scope(dir: &Path, root: &Path) -> Result<IgnoreScope, String> {
     let text = match std::fs::symlink_metadata(&gi) {
         Ok(md) if md.file_type().is_symlink() => String::new(),
         Ok(_) => std::fs::read_to_string(&gi)
-            .map_err(|e| format!("scan {base}/.gitignore: cannot read ignore file: {e}"))?,
+            .map_err(|e| format!("{label} {base}/.gitignore: cannot read ignore file: {e}"))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => {
             return Err(format!(
-                "scan {base}/.gitignore: cannot inspect ignore file: {e}"
+                "{label} {base}/.gitignore: cannot inspect ignore file: {e}"
             ))
         }
     };
@@ -534,29 +534,47 @@ impl<'js> rquickjs::IntoJs<'js> for ScanLine {
     }
 }
 
-/// Walk state for one scan: directories still to enumerate, candidate files queued, current reader.
-/// Nothing is cached across calls — state lives exactly as long as the iterator the program holds.
+/// One candidate file from the walker: real path to open, virtual path to report, size in bytes.
+/// walk yields these as-is; scan opens `.real` and streams `.virt`'s lines.
+#[derive(Debug)]
+struct ScanFile {
+    real: PathBuf,
+    virt: String,
+    size: u64,
+}
+
+/// Walk state for one scan or walk: directories still to enumerate, candidate files queued,
+/// current reader (scan only). Nothing is cached across calls — state lives exactly as long
+/// as the iterator the program holds.
 #[derive(Debug)]
 struct ScanState {
+    label: &'static str, // "scan" | "walk" — error provenance for the model
     dir_queue: Vec<(PathBuf, Vec<IgnoreScope>)>,
     root: PathBuf,
     virt_base: String,
-    files: VecDeque<(PathBuf, String)>,
+    files: VecDeque<ScanFile>,
     cur: Option<(BufReader<std::fs::File>, String)>,
     lineno: usize,
     opts: ScanOpts,
     done: bool,
 }
 
-fn scan_open(mounts: &[Mount], js_path: &str, opts: ScanOpts) -> Result<ScanState, String> {
+/// scan and walk share one traversal engine; only the yield unit differs (lines vs entries).
+fn open_tree(
+    mounts: &[Mount],
+    js_path: &str,
+    opts: ScanOpts,
+    label: &'static str,
+) -> Result<ScanState, String> {
     let real = resolve_mount(mounts, js_path)?;
     let meta = std::fs::metadata(&real).map_err(|e| format!("{js_path}: {e}"))?;
     if !meta.is_dir() {
         return Err(format!(
-            "{js_path} is not a directory — scan walks a tree (single files go through host.fs.read)"
+            "{js_path} is not a directory — walk and scan traverse a tree (single files go through host.fs.read)"
         ));
     }
     Ok(ScanState {
+        label,
         dir_queue: vec![(real.clone(), Vec::new())],
         root: real,
         virt_base: js_path.trim_end_matches('/').to_string(),
@@ -566,6 +584,14 @@ fn scan_open(mounts: &[Mount], js_path: &str, opts: ScanOpts) -> Result<ScanStat
         opts,
         done: false,
     })
+}
+
+fn scan_open(mounts: &[Mount], js_path: &str, opts: ScanOpts) -> Result<ScanState, String> {
+    open_tree(mounts, js_path, opts, "scan")
+}
+
+fn walk_open(mounts: &[Mount], js_path: &str, opts: ScanOpts) -> Result<ScanState, String> {
+    open_tree(mounts, js_path, opts, "walk")
 }
 
 fn scan_virtual_path(st: &ScanState, path: &Path) -> String {
@@ -587,13 +613,14 @@ fn walk_one_dir(st: &mut ScanState) -> Result<(), String> {
         st.done = true;
         return Ok(());
     };
+    let label = st.label;
     let display = scan_virtual_path(st, &dir);
     let entries = std::fs::read_dir(&dir)
-        .map_err(|e| format!("scan {display}: cannot read directory: {e}"))?;
+        .map_err(|e| format!("{label} {display}: cannot read directory: {e}"))?;
     // this dir's own .gitignore joins the inherited scopes for its entries and all descendants
     let mut child_scopes = scopes;
     if st.opts.gitignore {
-        let sc = load_scope(&dir, &st.root)?;
+        let sc = load_scope(&dir, &st.root, label)?;
         if !sc.pats.is_empty() {
             child_scopes.push(sc);
         }
@@ -602,7 +629,7 @@ fn walk_one_dir(st: &mut ScanState) -> Result<(), String> {
     let mut found = Vec::new();
     for ent in entries {
         let ent =
-            ent.map_err(|e| format!("scan {display}: cannot inspect directory entry: {e}"))?;
+            ent.map_err(|e| format!("{label} {display}: cannot inspect directory entry: {e}"))?;
         let name = ent.file_name().to_string_lossy().into_owned();
         // hidden first (cheapest, rg's default), then explicit extras, then gitignore
         if st.opts.skip_hidden && name.starts_with('.') {
@@ -614,7 +641,8 @@ fn walk_one_dir(st: &mut ScanState) -> Result<(), String> {
         // are scan material.
         let ft = ent.file_type().map_err(|e| {
             format!(
-                "scan {}: cannot inspect entry: {e}",
+                "{} {}: cannot inspect entry: {e}",
+                label,
                 scan_virtual_path(st, &ent.path())
             )
         })?;
@@ -656,11 +684,20 @@ fn walk_one_dir(st: &mut ScanState) -> Result<(), String> {
                     continue;
                 }
             }
-            found.push((p, format!("{}/{}", st.virt_base, rel)));
+            // size from the directory entry itself — walk never opens the file
+            let size = ent
+                .metadata()
+                .map_err(|e| format!("{label} {}: cannot inspect file: {e}", scan_virtual_path(st, &p)))?
+                .len();
+            found.push(ScanFile {
+                real: p,
+                virt: format!("{}/{}", st.virt_base, rel),
+                size,
+            });
         }
     }
     subdirs.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic walk order: by path, scopes just ride along
-    found.sort();
+    found.sort_by(|a, b| a.virt.cmp(&b.virt));
     st.dir_queue.extend(subdirs);
     st.files.extend(found);
     Ok(())
@@ -678,7 +715,10 @@ fn scan_next_chunk(st: &mut ScanState) -> Result<Vec<ScanLine>, String> {
             if st.files.is_empty() {
                 break;
             }
-            let (p, v) = st.files.pop_front().expect("files non-empty");
+            let (p, v) = match st.files.pop_front() {
+                Some(ScanFile { real, virt, .. }) => (real, virt),
+                None => break,
+            };
             let f =
                 std::fs::File::open(&p).map_err(|e| format!("scan {v}: cannot open file: {e}"))?;
             let mut r = BufReader::new(f);
@@ -765,6 +805,44 @@ fn scan_next_chunk(st: &mut ScanState) -> Result<Vec<ScanLine>, String> {
         }
     }
     Ok(lines)
+}
+
+/// One yielded file entry for walk: the virtual path and its size in bytes.
+/// Deliberately not list-shaped — every entry IS a regular file, so a constant
+/// `type` field would be noise; counting yields counts files, by construction.
+#[derive(Debug)]
+struct WalkEntry {
+    file: String,
+    size: u64,
+}
+
+impl<'js> rquickjs::IntoJs<'js> for WalkEntry {
+    fn into_js(self, ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Value<'js>> {
+        let obj = Object::new(ctx.clone())?;
+        obj.set("file", self.file)?;
+        obj.set("size", self.size)?;
+        Ok(obj.into_value())
+    }
+}
+
+/// Next chunk of file entries for walk; an EMPTY chunk is the exhaustion signal.
+/// Same walker as scan, one layer up: pruning already happened in walk_one_dir,
+/// and files are never opened here — no content, no binary sniffing, no UTF-8 risk.
+fn walk_next_chunk(st: &mut ScanState) -> Result<Vec<WalkEntry>, String> {
+    let mut entries = Vec::new();
+    while entries.len() < SCAN_CHUNK {
+        while st.files.is_empty() && !st.done {
+            walk_one_dir(st)?;
+        }
+        if st.files.is_empty() {
+            break;
+        }
+        match st.files.pop_front() {
+            Some(ScanFile { virt, size, .. }) => entries.push(WalkEntry { file: virt, size }),
+            None => break,
+        }
+    }
+    Ok(entries)
 }
 
 /// Existing target's shape, from a 4KB sample (dsh detectLineEndings semantics): leading BOM + majority EOL.
@@ -891,6 +969,47 @@ fn js_err(msg: String) -> rquickjs::Error {
     }
 }
 
+/// Shared option parsing for scan and walk — the options are traversal-level, so the two
+/// APIs accept the exact same set (defaults follow ripgrep).
+fn parse_tree_opts(o: &Object<'_>) -> rquickjs::Result<ScanOpts> {
+    let mut so = ScanOpts::default(); // ripgrep defaults: gitignore respected, dot-entries skipped
+    so.skip_dirs = o
+        .get::<_, Option<Vec<String>>>("skipDirs")
+        .map_err(|e| js_err(format!("skipDirs must be an array of strings: {e}")))?
+        .unwrap_or_default();
+    so.skip_exts = o
+        .get::<_, Option<Vec<String>>>("skipExts")
+        .map_err(|e| js_err(format!("skipExts must be an array of strings: {e}")))?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.to_lowercase())
+        .collect();
+    if let Some(v) = o
+        .get::<_, Option<String>>("glob")
+        .map_err(|e| js_err(format!("glob must be a string: {e}")))?
+    {
+        if v.chars().count() > GLOB_PAT_MAX {
+            return Err(js_err(format!(
+                "glob pattern longer than {GLOB_PAT_MAX} chars — not a real-world glob"
+            )));
+        }
+        so.glob = Some(v);
+    }
+    if let Some(v) = o
+        .get::<_, Option<bool>>("gitignore")
+        .map_err(|e| js_err(format!("gitignore must be a boolean: {e}")))?
+    {
+        so.gitignore = v;
+    }
+    if let Some(v) = o
+        .get::<_, Option<bool>>("hidden")
+        .map_err(|e| js_err(format!("hidden must be a boolean: {e}")))?
+    {
+        so.skip_hidden = !v; // {hidden: true} includes dot-entries, rg's --hidden polarity
+    }
+    Ok(so)
+}
+
 /// Registers the host.fs namespace
 pub fn install<'js>(ctx: &Ctx<'js>, host: &Object<'js>, mounts: &[Mount]) -> rquickjs::Result<()> {
     let fsobj = Object::new(ctx.clone())?;
@@ -921,56 +1040,16 @@ pub fn install<'js>(ctx: &Ctx<'js>, host: &Object<'js>, mounts: &[Mount]) -> rqu
     fsobj.set("read", read_fn)?;
 
     let m = mounts.clone();
-    // scan: chunked line stream — next() resolves to a lines array; empty array = exhausted.
+    // scan and walk share one traversal engine: scan streams the tree's LINES,
+    // walk streams its FILE ENTRIES. next() resolves to an array; empty = exhausted.
     // The async-iterator blessing (Symbol.asyncIterator, chunk flattening) lives in prelude.js.
     let scan_fn = Function::new(
         ctx.clone(),
         move |ctx: Ctx<'js>, path: String, opts: Opt<Object>| -> rquickjs::Result<Object> {
-            let mut so = ScanOpts::default(); // ripgrep defaults: gitignore respected, dot-entries skipped
-            if let Some(o) = opts.0 {
-                so.skip_dirs = o
-                    .get::<_, Option<Vec<String>>>("skipDirs")
-                    .map_err(|e| {
-                        js_err(format!(
-                            "scan option skipDirs must be an array of strings: {e}"
-                        ))
-                    })?
-                    .unwrap_or_default();
-                so.skip_exts = o
-                    .get::<_, Option<Vec<String>>>("skipExts")
-                    .map_err(|e| {
-                        js_err(format!(
-                            "scan option skipExts must be an array of strings: {e}"
-                        ))
-                    })?
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|s| s.to_lowercase())
-                    .collect();
-                if let Some(v) = o
-                    .get::<_, Option<String>>("glob")
-                    .map_err(|e| js_err(format!("scan option glob must be a string: {e}")))?
-                {
-                    if v.chars().count() > GLOB_PAT_MAX {
-                        return Err(js_err(format!(
-                            "glob pattern longer than {GLOB_PAT_MAX} chars — not a real-world glob"
-                        )));
-                    }
-                    so.glob = Some(v);
-                }
-                if let Some(v) = o
-                    .get::<_, Option<bool>>("gitignore")
-                    .map_err(|e| js_err(format!("scan option gitignore must be a boolean: {e}")))?
-                {
-                    so.gitignore = v;
-                }
-                if let Some(v) = o
-                    .get::<_, Option<bool>>("hidden")
-                    .map_err(|e| js_err(format!("scan option hidden must be a boolean: {e}")))?
-                {
-                    so.skip_hidden = !v; // {hidden: true} includes dot-entries, rg's --hidden polarity
-                }
-            }
+            let so = match opts.0 {
+                Some(o) => parse_tree_opts(&o)?,
+                None => ScanOpts::default(),
+            };
             let st = scan_open(&m, &path, so).map_err(js_err)?;
             let rc: Rc<RefCell<ScanState>> = Rc::new(RefCell::new(st));
             let next_fn = Function::new(
@@ -986,6 +1065,30 @@ pub fn install<'js>(ctx: &Ctx<'js>, host: &Object<'js>, mounts: &[Mount]) -> rqu
         },
     )?;
     fsobj.set("scan", scan_fn)?;
+
+    let m = mounts.clone();
+    let walk_fn = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, path: String, opts: Opt<Object>| -> rquickjs::Result<Object> {
+            let so = match opts.0 {
+                Some(o) => parse_tree_opts(&o)?,
+                None => ScanOpts::default(),
+            };
+            let st = walk_open(&m, &path, so).map_err(js_err)?;
+            let rc: Rc<RefCell<ScanState>> = Rc::new(RefCell::new(st));
+            let next_fn = Function::new(
+                ctx.clone(),
+                rquickjs::function::Async(move || {
+                    let rc = rc.clone();
+                    async move { walk_next_chunk(&mut rc.borrow_mut()).map_err(js_err) }
+                }),
+            )?;
+            let it = Object::new(ctx.clone())?;
+            it.set("next", next_fn)?;
+            Ok(it)
+        },
+    )?;
+    fsobj.set("walk", walk_fn)?;
 
     let m = mounts.clone();
     let text_fn = Function::new(ctx.clone(), move |path: String| {
@@ -1201,6 +1304,119 @@ mod tests {
         // not-a-directory is a caller error
         let err = scan_open(&ms, "/t/x/a.rs", ScanOpts::default()).unwrap_err();
         assert!(err.contains("not a directory"), "{err}");
+    }
+
+    #[test]
+    fn walk_yields_files_with_sizes_and_scan_pruning_parity() {
+        let root = tmp_root("walk");
+        std::fs::create_dir_all(root.join("x/y")).unwrap();
+        std::fs::create_dir_all(root.join("x/.git")).unwrap();
+        std::fs::write(root.join("x/a.rs"), "one\ntwo\n").unwrap();
+        std::fs::write(root.join("x/c.txt"), "four\n").unwrap();
+        std::fs::write(root.join("x/y/b.rs"), "three\n").unwrap();
+        std::fs::write(root.join("x/.git/config"), "needle\n").unwrap();
+        let ms = mounts_at(&root, false);
+
+        let drain_walk = |mut st: ScanState| {
+            let mut all = Vec::new();
+            loop {
+                let c = walk_next_chunk(&mut st).unwrap();
+                if c.is_empty() {
+                    break;
+                }
+                all.extend(c);
+            }
+            all
+        };
+        let drain_scan_files = |mut st: ScanState| {
+            let mut files = Vec::new();
+            loop {
+                let c = scan_next_chunk(&mut st).unwrap();
+                if c.is_empty() {
+                    break;
+                }
+                for l in c {
+                    if files.last() != Some(&l.file) {
+                        files.push(l.file);
+                    }
+                }
+            }
+            files
+        };
+
+        // defaults: same file set as scan, in the same deterministic order, with sizes
+        let walked: Vec<(String, u64)> = drain_walk(walk_open(&ms, "/t/x", ScanOpts::default()).unwrap())
+            .into_iter()
+            .map(|e| (e.file, e.size))
+            .collect();
+        assert_eq!(
+            walked,
+            vec![
+                ("/t/x/a.rs".to_string(), 8),
+                ("/t/x/c.txt".to_string(), 5),
+                ("/t/x/y/b.rs".to_string(), 6),
+            ]
+        );
+        let scanned = drain_scan_files(scan_open(&ms, "/t/x", ScanOpts::default()).unwrap());
+        assert_eq!(
+            walked.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>(),
+            scanned,
+            "walk and scan must prune identically"
+        );
+
+        // glob filters host-side: non-matching files are never touched
+        let rs: Vec<String> =
+            drain_walk(walk_open(&ms, "/t/x", ScanOpts { glob: Some("*.rs".into()), ..ScanOpts::default() }).unwrap())
+                .into_iter()
+                .map(|e| e.file)
+                .collect();
+        assert_eq!(rs, ["/t/x/a.rs".to_string(), "/t/x/y/b.rs".to_string()]);
+
+        // {hidden: true} surfaces dot-entries (rg --hidden polarity), parity with scan
+        let with_hidden = drain_walk(
+            walk_open(&ms, "/t/x", ScanOpts { skip_hidden: false, ..ScanOpts::default() }).unwrap(),
+        );
+        assert!(with_hidden.iter().any(|e| e.file.ends_with(".git/config")));
+
+        // skipDirs is the same opt-in extra prune
+        std::fs::create_dir_all(root.join("x/vendor")).unwrap();
+        std::fs::write(root.join("x/vendor/v.rs"), "vend\n").unwrap();
+        let pruned = drain_walk(
+            walk_open(&ms, "/t/x", ScanOpts { skip_dirs: vec!["vendor".into()], ..ScanOpts::default() }).unwrap(),
+        );
+        assert!(!pruned.iter().any(|e| e.file.contains("vendor")));
+
+        // walk never opens files: a NUL binary counts as an entry even though scan
+        // (a text channel) never yields its lines — the layering, made observable
+        std::fs::write(root.join("x/bin.dat"), b"\x00\x01binary").unwrap();
+        let w = drain_walk(walk_open(&ms, "/t/x", ScanOpts::default()).unwrap());
+        assert!(w.iter().any(|e| e.file.ends_with("bin.dat")));
+        let s = drain_scan_files(scan_open(&ms, "/t/x", ScanOpts::default()).unwrap());
+        assert!(!s.iter().any(|f| f.ends_with("bin.dat")));
+
+        // not-a-directory is the same caller error as scan
+        let err = walk_open(&ms, "/t/x/a.rs", ScanOpts::default()).unwrap_err();
+        assert!(err.contains("not a directory"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn walk_streams_through_the_prelude_bridge() {
+        let root = tmp_root("walk-js");
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::write(root.join("d/a.rs"), "x\n").unwrap();
+        std::fs::write(root.join("d/b.txt"), "y\n").unwrap();
+        std::fs::write(root.join("d/c.rs"), "z\n").unwrap();
+        let mounts = mounts_at(&root, false);
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let out = crate::kernel::eval_js(
+            "let n = 0, bytes = 0;\nfor await (const f of host.fs.walk('/t/d', {glob: '*.rs'})) { n++; bytes += f.size; }\nreturn {n, bytes};",
+            5_000,
+            &mounts,
+            tx,
+        )
+        .await;
+        assert!(out.ok, "error: {:?}", out.error);
+        assert_eq!(out.value, Some(serde_json::json!({"n": 2, "bytes": 4})));
     }
 
     #[test]

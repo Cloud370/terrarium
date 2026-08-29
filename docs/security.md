@@ -15,7 +15,7 @@ Filesystem access exists only under operator-declared mounts:
 
 Mounts are validated before a run starts. Virtual paths reject ambiguous components and lexical escapes. Existing parent directories are canonicalized before writes create missing directories. Scans do not follow symlinks. A read-only mount is a policy boundary; the program cannot promote it to writable access.
 
-The current filesystem API is intentionally text-oriented. `list`, windowed `read`, bounded `text`, streaming `scan`, and atomic text `write` expose no ambient filesystem API. Scan traversal, open, and decoding failures are returned to the program rather than silently discarded.
+The current filesystem API is intentionally text-oriented. `list`, windowed `read`, bounded `text`, streaming `scan`, entry-streaming `walk`, and atomic text `write` expose no ambient filesystem API. Scan traversal, open, and decoding failures are returned to the program rather than silently discarded; `walk` never opens files, so it carries only traversal failures.
 
 ## Model data boundary
 

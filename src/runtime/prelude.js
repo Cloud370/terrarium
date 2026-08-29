@@ -31,21 +31,23 @@ const __nsProxy = (obj, path) => new Proxy(obj, {
 });
 globalThis.host = __nsProxy(host, 'host');
 
-// scan(): flatten host chunks into a per-line async iterator — for-await yields {file, no, text} one by one.
+// scan()/walk(): flatten host chunks into per-item async iterators — for-await over scan
+// yields {file, no, text} lines, over walk yields {file, size} entries, one by one.
 {
-  const __scanRaw = host.fs.scan;
-  host.fs.scan = (path, opts) => {
+  const __streamify = (rawFn, name) => (path, opts) => {
     let raw;
-    try { raw = __scanRaw(path, opts); }
-    catch (e) { throw new Error(String(e && e.message || e).replace(/^host\.fs\.scan\(\.\.\.\) call failed: /, '')); }
+    try { raw = rawFn(path, opts); }
+    catch (e) { throw new Error(String(e && e.message || e).replace(`host.fs.${name}(...) call failed: `, '')); }
     return {
       [Symbol.asyncIterator]: async function* () {
         while (true) {
-          const lines = await raw.next();
-          if (!lines.length) return;
-          for (const l of lines) yield l;
+          const items = await raw.next();
+          if (!items.length) return;
+          for (const it of items) yield it;
         }
       },
     };
   };
+  host.fs.scan = __streamify(host.fs.scan, 'scan');
+  host.fs.walk = __streamify(host.fs.walk, 'walk');
 }
