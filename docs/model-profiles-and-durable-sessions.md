@@ -822,7 +822,7 @@ A version 1 journal is valid only when:
 - a successful model result contains exactly one action;
 - one run action has at most one `run/start`;
 - one run has at most one result;
-- a completed `to: "model"` run has a model observation whose facts serialize to at most 4096 bytes;
+- a completed `to: "model"` run has a model observation whose facts serialize to at most 16384 bytes;
 - a `handed_off` turn references a completed run with a user disposition;
 - no event follows `turn/end` until the next `turn/start`.
 

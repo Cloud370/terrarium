@@ -5,6 +5,7 @@ use tokio::sync::watch;
 use crate::{
     add_mount, config, eval_js,
     fs::Mount,
+    kernel::FACTS_CAP,
     llm,
     session::{project, turn_data, Event, Journal},
     ErrorKind, Outcome, MAX_TIMEOUT_MS,
@@ -14,8 +15,7 @@ const COMMON: &str = include_str!("prompts/common.md");
 const ROLE_TEMPLATE: &str = include_str!("prompts/main.md");
 const RUN_TIMEOUT_DEFAULT_MS: u64 = 10_000;
 const DEFAULT_MAX_STEPS: u64 = 256;
-const FEEDBACK_CAP: usize = 12 * 1024;
-const FACTS_CAP: usize = 4 * 1024;
+const FEEDBACK_CAP: usize = 24 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessMode {
@@ -96,19 +96,35 @@ pub(crate) fn extract(reply: &str) -> Extracted {
     }
 }
 
+fn write_feedback(out: &Outcome) -> Option<serde_json::Value> {
+    if out.writes.is_empty() && !out.writes_truncated {
+        return None;
+    }
+    Some(serde_json::json!({
+        "writes": out.writes,
+        "writesTruncated": out.writes_truncated,
+    }))
+}
+
 fn feedback(out: &Outcome, turn: u64, step: u64) -> String {
+    let mut run = serde_json::json!({
+        "ok": out.ok,
+        "error": out.error,
+        "termination": out.termination,
+        "timedOut": out.timed_out,
+        "elapsedMs": out.elapsed_ms,
+    });
+    if let Some(writes) = write_feedback(out) {
+        run["writes"] = writes["writes"].clone();
+        run["writesTruncated"] = writes["writesTruncated"].clone();
+    }
     let payload = serde_json::json!({
         "turn": turn,
         "step": step,
         "to": "model",
-        "run": {
-            "ok": out.ok,
-            "error": out.error,
-            "termination": out.termination,
-            "timedOut": out.timed_out,
-            "elapsedMs": out.elapsed_ms,
-        },
+        "run": run,
     });
+
     if payload.to_string().len() <= FEEDBACK_CAP {
         return payload.to_string();
     }
@@ -171,14 +187,23 @@ fn parse_disposition(value: Option<serde_json::Value>) -> Result<serde_json::Val
     }
 }
 
-fn model_observation(turn: u64, step: u64, disposition: &serde_json::Value) -> String {
-    serde_json::json!({
+fn model_observation_with_writes(
+    turn: u64,
+    step: u64,
+    disposition: &serde_json::Value,
+    out: &Outcome,
+) -> String {
+    let mut result = serde_json::json!({
         "turn": turn,
         "step": step,
         "to": "model",
         "facts": disposition["facts"],
-    })
-    .to_string()
+    });
+    if let Some(writes) = write_feedback(out) {
+        result["writes"] = writes["writes"].clone();
+        result["writesTruncated"] = writes["writesTruncated"].clone();
+    }
+    result.to_string()
 }
 
 fn protocol_observation(turn: u64, step: u64, message: impl Into<String>) -> String {
@@ -189,6 +214,25 @@ fn protocol_observation(turn: u64, step: u64, message: impl Into<String>) -> Str
         "error": {"kind": ErrorKind::Protocol, "message": message.into()},
     })
     .to_string()
+}
+
+fn protocol_observation_with_writes(
+    turn: u64,
+    step: u64,
+    message: impl Into<String>,
+    out: &Outcome,
+) -> String {
+    let mut result = serde_json::json!({
+        "turn": turn,
+        "step": step,
+        "to": "model",
+        "error": {"kind": ErrorKind::Protocol, "message": message.into()},
+    });
+    if let Some(writes) = write_feedback(out) {
+        result["writes"] = writes["writes"].clone();
+        result["writesTruncated"] = writes["writesTruncated"].clone();
+    }
+    result.to_string()
 }
 
 fn observation_for_extract(turn: u64, step: u64, extracted: &Extracted) -> Option<String> {
@@ -372,21 +416,28 @@ async fn execute_run(
             "termination": outcome.termination,
             "timedOut": outcome.timed_out,
             "elapsedMs": outcome.elapsed_ms,
+            "writes": outcome.writes,
+            "writesTruncated": outcome.writes_truncated,
         },
     });
     if outcome.ok {
         match parse_disposition(returned) {
             Ok(disposition) if disposition["to"] == "model" => {
                 data["disposition"] = disposition.clone();
-                data["observation"] =
-                    serde_json::Value::String(model_observation(turn, step, &disposition));
+                data["observation"] = serde_json::Value::String(model_observation_with_writes(
+                    turn,
+                    step,
+                    &disposition,
+                    &outcome,
+                ));
             }
             Ok(disposition) => {
                 data["disposition"] = disposition;
             }
             Err(error) => {
-                data["observation"] =
-                    serde_json::Value::String(protocol_observation(turn, step, error));
+                data["observation"] = serde_json::Value::String(protocol_observation_with_writes(
+                    turn, step, error, &outcome,
+                ));
             }
         }
     } else {
@@ -505,17 +556,38 @@ async fn model_attempt(
             )
         }
         Err(error) => {
-            journal.append(
-                "model/result",
-                serde_json::json!({
-                    "requestSeq": request_seq,
-                    "ok": false,
-                    "error": {"kind": error.kind, "message": error.message, "retryable": error.retryable}
-                }),
-            )?;
+            journal.append("model/result", transport_model_result(request_seq, attempt, &error))?;
             Ok(())
         }
     }
+}
+
+fn transport_model_result(
+    request_seq: u64,
+    attempt: u64,
+    error: &llm::LlmError,
+) -> serde_json::Value {
+    serde_json::json!({
+        "requestSeq": request_seq,
+        "ok": false,
+        "error": {
+            "kind": error.kind,
+            "message": error.message,
+            "retryable": error.retryable && attempt == 1,
+        }
+    })
+}
+
+fn interrupted_model_result(request: &Event) -> serde_json::Value {
+    serde_json::json!({
+        "requestSeq": request.seq,
+        "ok": false,
+        "error": {
+            "kind": "interrupted",
+            "message": "request interrupted before result was durable",
+            "retryable": request.data["attempt"].as_u64() == Some(1),
+        }
+    })
 }
 
 async fn drive(mut journal: Journal, mounts: &[Mount]) -> i32 {
@@ -535,14 +607,7 @@ async fn drive(mut journal: Journal, mounts: &[Mount]) -> i32 {
                     continue;
                 }
                 if journal
-                    .append(
-                        "model/result",
-                        serde_json::json!({
-                            "requestSeq": last.seq,
-                            "ok": false,
-                            "error": {"kind":"interrupted", "message":"request interrupted before result was durable", "retryable":true}
-                        }),
-                    )
+                    .append("model/result", interrupted_model_result(&last))
                     .is_err()
                 {
                     return 1;
@@ -559,7 +624,8 @@ async fn drive(mut journal: Journal, mounts: &[Mount]) -> i32 {
                     let step = request
                         .and_then(|event| event.data["step"].as_u64())
                         .unwrap_or(1);
-                    if model_attempt(&mut journal, &turn, step, 2).await.is_err() {
+                    if let Err(e) = model_attempt(&mut journal, &turn, step, 2).await {
+                        eprintln!("terrarium: {e}");
                         return 1;
                     }
                     continue;
@@ -569,6 +635,11 @@ async fn drive(mut journal: Journal, mounts: &[Mount]) -> i32 {
                 } else {
                     "failed"
                 };
+                if reason == "failed" {
+                    if let Some(message) = last.data["error"]["message"].as_str() {
+                        eprintln!("terrarium: model call failed after retries: {message}");
+                    }
+                }
                 if journal
                     .append("turn/end", serde_json::json!({"reason":reason}))
                     .is_err()
@@ -695,7 +766,8 @@ async fn drive(mut journal: Journal, mounts: &[Mount]) -> i32 {
             }
             continue;
         }
-        if model_attempt(&mut journal, &turn, step, 1).await.is_err() {
+        if let Err(e) = model_attempt(&mut journal, &turn, step, 1).await {
+            eprintln!("terrarium: {e}");
             return 1;
         }
     }
@@ -998,37 +1070,42 @@ mod tests {
         assert!(!prompt.contains("maxSteps"), "{prompt}");
         let main_end = prompt.find("</main_instructions>").unwrap();
         let tool_start = prompt.find("<tool_contract>").unwrap();
-        let list_rule = prompt.find("host.fs.list(dir)`").unwrap();
+        let list_rule = prompt.find("host.fs.list(dir)").unwrap();
         assert!(main_end < tool_start, "{prompt}");
         assert!(tool_start < list_rule, "{prompt}");
         assert!(
-            prompt.contains("An error is not automatically a user-facing result"),
-            "{prompt}"
-        );
-        assert!(
             prompt.contains(
-                "A `catch` block that merely reports an error must not hand off to the user"
+                "Treat one run as the largest safe deterministic work unit, not as one tool call"
             ),
             "{prompt}"
         );
         assert!(
-            prompt.contains(
-                "When returning an error to the model, include only a short classification"
-            ),
+            prompt.contains("Define the evidence and success postcondition that establish it"),
             "{prompt}"
         );
         assert!(
-            !prompt.contains("return {to: \"user\", message: `Could not complete"),
+            prompt.contains("A model boundary is justified only when"),
             "{prompt}"
         );
         assert!(
-            prompt.contains("A defensive one-pass workflow can combine several host APIs"),
+            prompt.contains("`to: \"model\"` is not a progress report"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("discover, classify, act, and verify"),
             "{prompt}"
         );
         assert!(prompt.contains("elapsedMs"), "{prompt}");
-        assert!(!prompt.contains("The one-turn protocol"), "{prompt}");
         assert!(
-            !prompt.contains("Once you have enough evidence"),
+            !prompt.contains("A bounded search keeps the full result inside the current run"),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("A defensive one-pass workflow can combine several host APIs"),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("This is the shortest reliable edit path"),
             "{prompt}"
         );
     }
@@ -1043,6 +1120,23 @@ mod tests {
             Some("你好！请告诉我需要处理的任务。")
         );
         assert_eq!(greeting_response("你好，检查这个项目"), None);
+    }
+
+    #[test]
+    fn final_attempt_transport_failures_are_journaled_as_not_retryable() {
+        // llm marks every transport error retryable; the journal validator rejects a
+        // failed attempt-2 result that still claims retryable, so the ledger writer
+        // must clear the flag on the final attempt.
+        let error = llm::LlmError {
+            kind: "transport",
+            message: "failed to read response".into(),
+            retryable: true,
+        };
+        let first = transport_model_result(7, 1, &error);
+        assert_eq!(first["error"]["retryable"], serde_json::json!(true));
+        let second = transport_model_result(8, 2, &error);
+        assert_eq!(second["error"]["retryable"], serde_json::json!(false));
+        assert_eq!(second["requestSeq"], serde_json::json!(8));
     }
 
     #[test]
@@ -1118,8 +1212,43 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_model_requests_retry_only_the_first_attempt() {
+        for (attempt, retryable) in [(1, true), (2, false)] {
+            let request = Event {
+                kind: "model/request".into(),
+                seq: 7,
+                ts: None,
+                data: serde_json::json!({"step": 3, "attempt": attempt}),
+            };
+            let result = interrupted_model_result(&request);
+            assert_eq!(result["requestSeq"], 7);
+            assert_eq!(result["ok"], false);
+            assert_eq!(result["error"]["kind"], "interrupted");
+            assert_eq!(result["error"]["retryable"], retryable);
+        }
+    }
+
+    #[test]
+    fn model_facts_allow_realistic_code_summaries_but_remain_bounded() {
+        let within_limit = "x".repeat(15 * 1024);
+        assert!(parse_disposition(Some(serde_json::json!({
+            "to": "model",
+            "facts": {"text": within_limit}
+        })))
+        .is_ok());
+
+        let oversized = "x".repeat(16 * 1024 + 1);
+        let error = parse_disposition(Some(serde_json::json!({
+            "to": "model",
+            "facts": {"text": oversized}
+        })))
+        .unwrap_err();
+        assert!(error.contains("16384"), "{error}");
+    }
+
+    #[test]
     fn oversized_model_facts_are_rejected_before_model_projection() {
-        let oversized = "x".repeat(4097);
+        let oversized = "x".repeat(16 * 1024 + 1);
         let error = parse_disposition(Some(serde_json::json!({
             "to": "model",
             "facts": {"text": oversized}
@@ -1131,10 +1260,22 @@ mod tests {
 
     #[test]
     fn model_observation_contains_only_bounded_disposition_facts() {
-        let observation = model_observation(
+        let outcome = Outcome {
+            ok: true,
+            value: None,
+            error: None,
+            termination: crate::Termination::Returned,
+            stdout: String::new(),
+            timed_out: false,
+            elapsed_ms: 1,
+            writes: Vec::new(),
+            writes_truncated: false,
+        };
+        let observation = model_observation_with_writes(
             2,
             5,
             &serde_json::json!({"to":"model","facts":{"path":"/workspace/report.txt"}}),
+            &outcome,
         );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&observation).unwrap(),
@@ -1160,25 +1301,54 @@ mod tests {
             reasoning_effort: None,
         };
         let prompt = system_prompt(&profile, "/tmp", 100, &mounts);
-        assert!(prompt.contains("An error is not automatically a user-facing result"));
+        assert!(prompt.contains("A session is a durable conversation"));
+        assert!(prompt.contains("A turn is one user request and stays open while you work"));
+        assert!(prompt.contains("A step is one model response and its one JavaScript run"));
+        assert!(prompt.contains("`to: \"model\"` ends only the current run"));
+        assert!(prompt.contains("`to: \"user\"` ends the turn"));
+        assert!(prompt.contains("The host owns turn and step coordinates"));
+        assert!(prompt.contains("If the user explicitly requires an order"));
+        assert!(prompt.contains("Information obtainable from the authorized environment"));
+        assert!(prompt.contains("A semantic interpretation required from the model"));
+        assert!(prompt.contains("Input, permission, or a decision required from the user"));
+        assert!(prompt.contains("A run may commit some writes before a later operation fails"));
+        assert!(prompt.contains("Never blindly repeat a program after partial writes"));
         assert!(prompt.contains(
-            "A failure inside one step of a larger plan is a recoverable operation error, not a blocked plan"
+            "permits `{all: true}` only when every exact occurrence in that file should change"
         ));
-        assert!(prompt.contains(
-            "A `catch` block that merely reports an error must not hand off to the user"
-        ));
+        assert!(prompt.contains("No match is not universally success"));
+        assert!(prompt.contains("Deterministic facts include paths, literal matches, counts"));
+        assert!(prompt.contains("Semantic decisions include what the user meant"));
+        assert!(prompt.contains("A model boundary is justified only when"));
+        assert!(prompt.contains("`to: \"model\"` is not a progress report"));
+        assert!(prompt.contains("A caught operation error is evidence, not task completion"));
         assert!(prompt.contains("protocol observation means the host rejected the response format"));
         assert!(
             prompt.contains("Do not wrap the program in an async IIFE"),
             "{prompt}"
         );
-        assert!(
-            prompt.contains("Agent `facts` must serialize to at most 4096 bytes"),
-            "{prompt}"
-        );
+        assert!(prompt.contains("Agent `facts` must serialize to at most 16384 bytes"));
         assert!(prompt.contains("to: \"model\""));
         // walk is the file-level primitive; scan yields must never be counted as files
         assert!(prompt.contains("host.fs.walk"));
-        assert!(prompt.contains("Counting scan yields counts LINES"));
+        assert!(prompt.contains("host.fs.replace(path, oldText, newText[, {all}])"));
+        assert!(prompt.contains("enters the next model context only through"));
+        assert!(prompt.contains("discover, classify, act, and verify"));
+        assert!(prompt.contains("Encode expected result branches before execution"));
+        assert!(prompt.contains("A discovery-only run is justified only when"));
+        assert!(prompt.contains("identify the specific question that requires model judgment"));
+        assert!(
+            prompt.contains("include enough bounded evidence for the next step to decide and act")
+        );
+        assert!(prompt.contains("do not create a separate follow-up step merely to read context"));
+        assert!(prompt.contains("If the facts contain only paths, matches, counts"));
+        assert!(prompt
+            .contains("Do not return complete scan results, whole file contents, large arrays"));
+        assert!(prompt.contains("authorized file"));
+        assert!(prompt.contains("return only its path"));
+        assert!(prompt.contains("host-derived write receipts"));
+        assert!(prompt.contains("stable `N: text` line numbers"));
+        assert!(prompt.contains("Counting scan yields counts lines, not files"));
+        assert!(prompt.contains("For one known file, use `host.fs.read` or `host.fs.text` instead"));
     }
 }

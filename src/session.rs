@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::config::{state_dir, ResolvedProfile};
+use crate::kernel::FACTS_CAP;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -708,7 +709,7 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
                             "timedOut",
                             "elapsedMs",
                         ],
-                        &["answer"],
+                        &["answer", "writes", "writesTruncated"],
                         event.seq,
                         "run outcome",
                     )?;
@@ -719,6 +720,57 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
                     {
                         return Err(format!(
                             "event {} run outcome has invalid field types",
+                            event.seq
+                        ));
+                    }
+                    if let Some(writes) = outcome.get("writes") {
+                        let writes = writes.as_array().ok_or_else(|| {
+                            format!("event {} run outcome.writes must be an array", event.seq)
+                        })?;
+                        if writes.len() > 64 {
+                            return Err(format!(
+                                "event {} run outcome.writes exceeds the 64-receipt limit",
+                                event.seq
+                            ));
+                        }
+                        for receipt in writes {
+                            let receipt = object(receipt, event.seq, "write receipt")?;
+                            exact_keys(
+                                receipt,
+                                &[
+                                    "path",
+                                    "created",
+                                    "changed",
+                                    "bytesBefore",
+                                    "bytesAfter",
+                                    "firstChangedLine",
+                                ],
+                                &[],
+                                event.seq,
+                                "write receipt",
+                            )?;
+                            string_field(receipt, "path", event.seq, "write receipt")?;
+                            if receipt["created"].as_bool().is_none()
+                                || receipt["changed"].as_bool().is_none()
+                                || receipt["bytesAfter"].as_u64().is_none()
+                                || !receipt["bytesBefore"].is_null()
+                                    && receipt["bytesBefore"].as_u64().is_none()
+                                || !receipt["firstChangedLine"].is_null()
+                                    && receipt["firstChangedLine"].as_u64().is_none()
+                            {
+                                return Err(format!(
+                                    "event {} write receipt has invalid field types",
+                                    event.seq
+                                ));
+                            }
+                        }
+                    }
+                    if outcome
+                        .get("writesTruncated")
+                        .is_some_and(|value| value.as_bool().is_none())
+                    {
+                        return Err(format!(
+                            "event {} run outcome.writesTruncated must be a boolean",
                             event.seq
                         ));
                     }
@@ -743,9 +795,9 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
                             let bytes = serde_json::to_vec(&disposition["facts"]).map_err(|e| {
                                 format!("event {} cannot serialize run facts: {e}", event.seq)
                             })?;
-                            if bytes.len() > 4096 {
+                            if bytes.len() > FACTS_CAP {
                                 return Err(format!(
-                                    "event {} run disposition facts exceed the 4096-byte limit",
+                                    "event {} run disposition facts exceed the {FACTS_CAP}-byte limit",
                                     event.seq
                                 ));
                             }
@@ -1017,10 +1069,9 @@ mod tests {
         let legacy: Event =
             serde_json::from_str(r#"{"type":"turn/start","seq":1,"data":{}}"#).unwrap();
         assert!(legacy.ts.is_none());
-        let stamped: Event = serde_json::from_str(
-            r#"{"type":"turn/start","seq":1,"ts":1700000000123,"data":{}}"#,
-        )
-        .unwrap();
+        let stamped: Event =
+            serde_json::from_str(r#"{"type":"turn/start","seq":1,"ts":1700000000123,"data":{}}"#)
+                .unwrap();
         assert_eq!(stamped.ts, Some(1700000000123));
         let bad =
             serde_json::from_str::<Event>(r#"{"type":"turn/start","seq":1,"ts":"x","data":{}}"#);
@@ -1115,7 +1166,7 @@ mod tests {
                     "runSeq":4,
                     "status":"completed",
                     "outcome":{"ok":true,"value":null,"stdout":"","error":null,"termination":"returned","timedOut":false,"elapsedMs":1},
-                    "disposition":{"to":"model","facts":{"text":"x".repeat(4097)}},
+                    "disposition":{"to":"model","facts":{"text":"x".repeat(16 * 1024 + 1)}},
                     "observation":"{}"
                 }),
             )

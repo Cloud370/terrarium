@@ -147,6 +147,8 @@ async fn run_direct(args: &[String]) -> i32 {
             "termination": outcome.termination,
             "timed_out": outcome.timed_out,
             "elapsed_ms": outcome.elapsed_ms,
+            "writes": outcome.writes,
+            "writes_truncated": outcome.writes_truncated,
             "target": format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
             "limits": {"memory":"64MB","stack":"1MB","timeout_ms":timeout_ms},
             "mounts": kernel

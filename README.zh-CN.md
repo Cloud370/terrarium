@@ -60,6 +60,10 @@ return {to: "user", message: "HTTP client 配置位于 src/llm.rs。"};
 
 普通顶层 `return` 会释放本次运行的局部 JavaScript 状态，但不会自行结束轮。格式、解析、遍历、校验、超时及其他可恢复的操作错误，不应自动交还用户；应返回简短 facts 给 `to: "model"`，让下一步修正操作、缩小范围或补充证据。只有结果已经确定，或确实需要用户提供输入、授权或做决定时，才使用 `to: "user"`。只报告错误的 `catch` 块不能结束当前轮。
 
+## 上下文预算
+
+一次运行有两个数据通道。程序主动提供的数据只有通过 `to: "model"` 的 `facts` 才会进入下一轮模型上下文；局部变量、`print` 输出和 `to: "user"` 消息不会成为下一步的模型 facts。宿主可能自动附加有界的状态、错误和写入回执，作为可信证据；不要在 facts 中重复这些宿主事实。facts 只放与决策直接相关的路径、计数、状态和有界样本。不要返回完整 scan 结果、整份文件内容或大数组；大结果如需保留，写入授权文件后只返回路径、数量和简短摘要。24 KiB 结果上限和 16 KiB facts 上限是硬边界，不是目标值。
+
 解析器对每条回复只接受恰好一个完整的 `run` 围栏。缺失、未闭合或出现多个 `run` 围栏都是协议错误——解析器绝不执行第一个块后静默忽略其余块。开栏必须是一行独立的 ```` ```run ````，闭栏必须是一行独立的 ```` ``` ````；行内三反引号既不开栏也不闭栏。围栏外的文字不会执行。没有基于文本的完成标记。
 
 每次运行都按同一种 async function body 语义执行，因此顶层 `return` 和 `await` 在所有程序中都合法。结果保留 JSON 值的结构，不会先格式化成字符串。
@@ -141,11 +145,12 @@ terrarium run [-e SOURCE | FILE] [--read-only | --full-access] [--mount /virtual
 生成的契约（`--contract`）就是实时能力面的完整文档：
 
 - `host.fs.list(dir)` 将一级目录返回为按名称排序的对象数组，字段为 `name`、`type`（`file`、`directory`、`symlink` 或 `other`）和 `size`；普通文件的 `size` 是字节数，其他类型为 `null`。
-- `host.fs.read(path, from, to)` 读取有界行窗口；`to=Infinity` 在窗口预算内读取到 EOF。
-- `host.fs.text(path)` 在不超过 64MB 宿主预算时，把整个文本文件读入程序。
-- `host.fs.scan(path, options)` 从目录树流式读取文本文件行。默认尊重 `.gitignore`、跳过隐藏项、二进制和符号链接，并严格校验选项类型。遍历、打开或解码错误会拒绝 scan，不会静默变成空结果。
+- `host.fs.read(path, from, to)` 读取有界行窗口，返回稳定的 `N: text` 行号和续读提示；`to=Infinity` 在窗口预算内读取到 EOF。
+- `host.fs.text(path)` 将整个文本文件以 LF 规范化字符串交给程序，不带展示行号；它用于程序变换，不用于展示代码。
+- `host.fs.replace(path, oldText, newText[, {all}])` 执行一次精确的定点替换。默认要求恰好一个匹配，未找到或多匹配会明确失败；替换文本按字面量处理，只有明确需要全部替换时才使用 `{all: true}`。旧文本已知时，这是最高效的一次调用编辑路径；未知时先读取或搜索足够上下文。不要只为确认写入而重新读取，run 结果会提供宿主生成的回执。
+- `host.fs.scan(path, options)` 从目录树流式读取文本文件行。可选传入 `contains: "literal"`，让 Rust 在跨入 JavaScript 前丢弃不匹配的行；正则、大小写规则、多条件、跨行状态和自定义限制仍由 JavaScript 做最终判断。不传时保持逐行产出。默认尊重 `.gitignore`、跳过隐藏项、二进制和符号链接，并严格校验选项类型。遍历、打开或解码错误会拒绝 scan，不会静默变成空结果。
 - `host.fs.walk(path, options)` 从目录树流式产出每个普通文件的 `{file, size}`——scan 的文件级孪生：同样的剪枝、同样的选项；文件从不会被打开。数文件、算总大小用 walk；数 scan 的产出数是在数行。
-- `host.fs.write(path, content)` 在声明为 `:rw` 的挂载下原子写入文本，返回字节数。
+- `host.fs.write(path, content)` 在声明为 `:rw` 的挂载下原子写入文本，返回字节数；run 结果还包含有界的宿主写入回执（`path`、`created`、`changed`、`bytesBefore`、`bytesAfter`、`firstChangedLine`）。
 
 Agent 程序使用上文的 tagged return 协议来继续交给模型或交还用户。不存在 `host.agent.answer` API。
 

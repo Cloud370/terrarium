@@ -60,6 +60,10 @@ return {to: "user", message: "The HTTP client is configured in src/llm.rs."};
 
 A normal `return` releases the run's local JavaScript state; it does not by itself finish a turn. A returned error is not automatically a user-facing result: format, parse, traversal, validation, timeout, and other recoverable failures should return short facts to `to: "model"` so the next step can correct the work. Use `to: "user"` only when the result is established or a specific user action, missing input, authorization, or decision is required. A `catch` block that merely reports an error must not end the turn.
 
+## Context budget
+
+A run has two data channels. Program-provided data enters the next model context only through `to: "model"` `facts`; local variables, `print` output, and a `to: "user"` message do not become next-step model facts. The host may add bounded status, errors, and write receipts as trusted evidence. Keep `facts` to decision-relevant paths, counts, statuses, and bounded samples. Do not return complete scan results, whole file contents, or large arrays. If a large result must survive the run, write it to an authorized file and return only its path, count, and short summary. The 24 KiB result limit and 16 KiB facts limit are hard boundaries, not targets.
+
 ## Why programs
 
 - A whole unit of work executes per step; context is spent on findings instead of tool-call bookkeeping.
@@ -137,11 +141,12 @@ The normal command always starts or resumes the model-driven agent. Message argu
 The generated contract (`--contract`) documents the live surface:
 
 - `host.fs.list(dir)` lists one directory level as sorted objects with `name`, `type` (`file`, `directory`, `symlink`, or `other`), and `size` in bytes for regular files (`null` otherwise).
-- `host.fs.read(path, from, to)` reads a bounded line window. `to=Infinity` reads to EOF within the window budget.
-- `host.fs.text(path)` reads a whole text file into the program when it fits the 64 MB host budget.
-- `host.fs.scan(path, options)` streams text-file lines from a directory tree. It respects `.gitignore`, skips hidden entries, binaries, and symlinks by default, and validates option types. Traversal and decoding errors reject the scan rather than becoming an empty result.
+- `host.fs.read(path, from, to)` reads a bounded line window and returns stable `N: text` line numbers plus a continuation footer.
+- `host.fs.text(path)` reads a whole text file into the program as LF-normalized text without display line numbers. Use it for program-side transformations, not for displaying code.
+- `host.fs.replace(path, oldText, newText[, {all}])` performs one exact targeted replacement. It requires one match by default, fails loudly for missing or ambiguous text, treats replacement text literally, and uses `{all: true}` only for intentional all-match replacement. When the old text is already known, this is the efficient one-call edit path; when it is not known, read or scan first for enough context. Do not re-read solely to confirm a write; the run result includes the host-derived receipt.
+- `host.fs.scan(path, options)` streams text-file lines from a directory tree. Pass optional `contains: "literal"` to let Rust discard non-matching lines before they cross into JavaScript; JavaScript remains the final predicate for regexes, case rules, multiple conditions, cross-line state, and custom limits. Without it, every line is yielded as before. It respects `.gitignore`, skips hidden entries, binaries, and symlinks by default, and validates option types. Traversal and decoding errors reject the scan rather than becoming an empty result.
 - `host.fs.walk(path, options)` streams one `{file, size}` per regular file from a directory tree — the file-level twin of `scan`, with the same pruning and the same options; files are never opened. Counting files or summing sizes is a walk; counting `scan` yields counts lines.
-- `host.fs.write(path, content)` atomically writes text under a declared `:rw` mount and returns the byte count.
+- `host.fs.write(path, content)` atomically writes text under a declared `:rw` mount and returns the byte count. The run result also includes bounded host-derived write receipts (`path`, `created`, `changed`, `bytesBefore`, `bytesAfter`, `firstChangedLine`).
 
 Agent programs use the tagged return protocol described above for model continuation or user handoff. There is no `host.agent.answer` API.
 

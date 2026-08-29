@@ -74,7 +74,24 @@ fn kernel_renders_the_current_contract() {
     let contract = kernel.contract();
 
     assert!(contract.contains("host.fs.list(dir)"));
+    assert!(contract.contains("host.fs.read(path, from, to)"));
+    assert!(contract.contains("N: text"));
+    assert!(contract.contains(
+        "host.fs.scan(path, {glob?, contains?, skipDirs?, skipExts?, gitignore?, hidden?})"
+    ));
+    assert!(contract.contains("enters the next model context only through"));
+    assert!(
+        contract.contains("Do not return complete scan results, whole file contents, large arrays")
+    );
+    assert!(contract.contains("authorized file"));
+    assert!(contract.contains("return only its path"));
+    assert!(contract.contains("host-derived write receipts"));
+    assert!(contract.contains("For one known file, use `host.fs.read` or `host.fs.text` instead"));
+    assert!(contract.contains("fails instead of guessing"));
     assert!(contract.contains("to: \"model\""));
     assert!(contract.contains("to: \"user\""));
+    assert!(!contract.contains("A bounded search keeps the full result inside the current run"));
+    assert!(!contract.contains("A defensive one-pass workflow can combine several host APIs"));
+    assert!(!contract.contains("This is the shortest reliable edit path"));
     assert!(!contract.contains("host.agent.answer"));
 }

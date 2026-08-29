@@ -11,6 +11,17 @@ use tokio::sync::watch;
 
 use crate::{fs, llm, registry};
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteSummary {
+    pub path: String,
+    pub created: bool,
+    pub changed: bool,
+    pub bytes_before: Option<u64>,
+    pub bytes_after: u64,
+    pub first_changed_line: Option<usize>,
+}
+
 /// One physics, enforced on both sides of the cage wall: the host refuses reads bigger than the
 /// heap the cage could hold anyway (fs.rs), so "bounded" never depends on which side allocates first.
 pub(crate) const MEM_LIMIT: usize = 64 * 1024 * 1024;
@@ -18,7 +29,8 @@ const STACK_LIMIT: usize = 1024 * 1024;
 const STDOUT_CAP: usize = 16 * 1024;
 const GRACE_MS: u64 = 2000;
 pub(crate) const MAX_TIMEOUT_MS: u64 = 300_000;
-const VALUE_CAP: usize = 12 * 1024;
+pub(crate) const VALUE_CAP: usize = 24 * 1024;
+pub(crate) const FACTS_CAP: usize = 16 * 1024;
 
 const PRELUDE: &str = include_str!("runtime/prelude.js");
 const CONTRACT_TEMPLATE: &str = include_str!("prompts/contract.md");
@@ -64,7 +76,7 @@ pub(crate) fn contract_for(mounts: &[fs::Mount], model: &str) -> String {
     }
     if !rw.is_empty() {
         mounts_line.push_str(&format!(
-            "Writable mounts: {} — `host.fs.write` is allowed here and only here (atomic, auto-creates parent dirs)",
+            "Writable mounts: {} — `host.fs.write` is allowed here and only here (atomic, auto-creates parent dirs; the run result includes host-derived write receipts)",
             rw.join(", ")
         ));
     }
@@ -108,6 +120,8 @@ pub struct Outcome {
     pub stdout: String,
     pub timed_out: bool,
     pub elapsed_ms: u64,
+    pub writes: Vec<WriteSummary>,
+    pub writes_truncated: bool,
 }
 
 fn failure(kind: ErrorKind, msg: impl Into<String>) -> Outcome {
@@ -122,6 +136,8 @@ fn failure(kind: ErrorKind, msg: impl Into<String>) -> Outcome {
         stdout: String::new(),
         timed_out: false,
         elapsed_ms: 0,
+        writes: Vec::new(),
+        writes_truncated: false,
     }
 }
 
@@ -179,6 +195,7 @@ pub(crate) async fn eval_js(
     };
     let logs: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let overflowed: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+    let writes: Rc<RefCell<fs::WriteLog>> = Rc::new(RefCell::new(fs::WriteLog::default()));
 
     let rt = match AsyncRuntime::new() {
         Ok(rt) => rt,
@@ -217,7 +234,7 @@ pub(crate) async fn eval_js(
         ctx.globals().set("__log", log_fn)?;
 
         let host = Object::new(ctx.clone())?;
-        fs::install(&ctx, &host, mounts)?;
+        fs::install(&ctx, &host, mounts, writes.clone())?;
         ctx.globals().set("host", host)?;
         ctx.eval::<Value, _>(PRELUDE)?;
 
@@ -229,6 +246,8 @@ pub(crate) async fn eval_js(
             stdout: String::new(),
             timed_out: false,
             elapsed_ms: 0,
+            writes: Vec::new(),
+            writes_truncated: false,
         };
         let source = format!("(async () => {{\n{code}\n}})()");
         let result = match ctx.eval::<Value, _>(source.as_str()).catch(&ctx) {
@@ -348,6 +367,11 @@ pub(crate) async fn eval_js(
         joined.push_str("\n…[truncated]");
     }
     out.stdout = truncate_utf8(&joined, STDOUT_CAP);
+    {
+        let mut write_log = writes.borrow_mut();
+        out.writes = std::mem::take(&mut write_log.items);
+        out.writes_truncated = write_log.truncated;
+    }
     out
 }
 
@@ -465,6 +489,19 @@ mod tests {
             Some(serde_json::json!({"to": "model", "facts": {"value": 42}}))
         );
         assert_eq!(out.termination, Termination::Returned);
+    }
+
+    #[tokio::test]
+    async fn returned_json_allows_realistic_results_but_remains_bounded() {
+        let (tx, _rx) = watch::channel(false);
+        let within_limit = eval_js("return 'x'.repeat(23 * 1024)", 5_000, &[], tx).await;
+        assert!(within_limit.ok, "error: {:?}", within_limit.error);
+
+        let (tx, _rx) = watch::channel(false);
+        let oversized = eval_js("return 'x'.repeat(24 * 1024 + 1)", 5_000, &[], tx).await;
+        assert!(!oversized.ok);
+        let message = oversized.error.expect("result size error").message;
+        assert!(message.contains("24576"), "{message}");
     }
 
     #[tokio::test]

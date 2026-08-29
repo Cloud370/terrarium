@@ -11,8 +11,33 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::kernel::WriteSummary;
 use rquickjs::function::Opt;
 use rquickjs::{Ctx, Function, Object, Value};
+
+const WRITE_SUMMARY_CAP: usize = 64;
+const WRITE_SUMMARY_BYTES_CAP: usize = 8 * 1024;
+
+#[derive(Default)]
+pub(crate) struct WriteLog {
+    pub(crate) items: Vec<WriteSummary>,
+    pub(crate) truncated: bool,
+    bytes: usize,
+}
+
+impl WriteLog {
+    fn record(&mut self, summary: WriteSummary) {
+        let bytes = summary.path.len() + 96;
+        if self.items.len() < WRITE_SUMMARY_CAP
+            && self.bytes.saturating_add(bytes) <= WRITE_SUMMARY_BYTES_CAP
+        {
+            self.bytes += bytes;
+            self.items.push(summary);
+        } else {
+            self.truncated = true;
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Mount {
@@ -78,6 +103,7 @@ struct ScanOpts {
     skip_dirs: Vec<String>,
     skip_exts: Vec<String>,
     glob: Option<String>,
+    contains: Option<String>,
     gitignore: bool,
     skip_hidden: bool,
 }
@@ -88,6 +114,7 @@ impl Default for ScanOpts {
             skip_dirs: Vec::new(),
             skip_exts: Vec::new(),
             glob: None,
+            contains: None,
             gitignore: true,
             skip_hidden: true,
         }
@@ -687,7 +714,12 @@ fn walk_one_dir(st: &mut ScanState) -> Result<(), String> {
             // size from the directory entry itself — walk never opens the file
             let size = ent
                 .metadata()
-                .map_err(|e| format!("{label} {}: cannot inspect file: {e}", scan_virtual_path(st, &p)))?
+                .map_err(|e| {
+                    format!(
+                        "{label} {}: cannot inspect file: {e}",
+                        scan_virtual_path(st, &p)
+                    )
+                })?
                 .len();
             found.push(ScanFile {
                 real: p,
@@ -703,11 +735,40 @@ fn walk_one_dir(st: &mut ScanState) -> Result<(), String> {
     Ok(())
 }
 
-/// Next chunk of lines; an EMPTY chunk is the exhaustion signal (a non-final chunk always carries lines).
+#[derive(Debug)]
+struct ScanBatch {
+    items: Vec<ScanLine>,
+    done: bool,
+}
+
+impl<'js> rquickjs::IntoJs<'js> for ScanBatch {
+    fn into_js(self, ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Value<'js>> {
+        let obj = Object::new(ctx.clone())?;
+        obj.set("items", self.items)?;
+        obj.set("done", self.done)?;
+        Ok(obj.into_value())
+    }
+}
+
+fn scan_is_done(st: &ScanState) -> bool {
+    st.done && st.files.is_empty() && st.cur.is_none()
+}
+
+fn scan_next_batch(st: &mut ScanState) -> Result<ScanBatch, String> {
+    let items = scan_next_chunk(st)?;
+    Ok(ScanBatch {
+        items,
+        done: scan_is_done(st),
+    })
+}
+
+/// Next bounded batch of scan input. With a literal prefilter, an empty batch may be non-final;
+/// callers must use `ScanBatch.done` rather than treating an empty `items` array as EOF.
 fn scan_next_chunk(st: &mut ScanState) -> Result<Vec<ScanLine>, String> {
     let mut lines = Vec::new();
     let mut bytes = 0usize;
-    while lines.len() < SCAN_CHUNK && bytes < SCAN_CHUNK_BYTES {
+    let mut scanned_bytes = 0usize;
+    while lines.len() < SCAN_CHUNK && bytes < SCAN_CHUNK_BYTES && scanned_bytes < SCAN_CHUNK_BYTES {
         if st.cur.is_none() {
             while st.files.is_empty() && !st.done {
                 walk_one_dir(st)?;
@@ -736,6 +797,7 @@ fn scan_next_chunk(st: &mut ScanState) -> Result<Vec<ScanLine>, String> {
             st.lineno = 0;
             st.cur = Some((r, v));
         }
+        let contains = st.opts.contains.clone();
         let mut rotate = false;
         if let Some((r, vpath)) = st.cur.as_mut() {
             let vpath = vpath.clone();
@@ -782,6 +844,15 @@ fn scan_next_chunk(st: &mut ScanState) -> Result<Vec<ScanLine>, String> {
                                 raw.pop();
                             }
                         }
+                        scanned_bytes += raw.len();
+                        if let Some(contains) = &contains {
+                            if !raw.contains(contains) {
+                                if scanned_bytes >= SCAN_CHUNK_BYTES {
+                                    break;
+                                }
+                                continue;
+                            }
+                        }
                         bytes += raw.len();
                         lines.push(ScanLine {
                             file: vpath.clone(),
@@ -790,7 +861,7 @@ fn scan_next_chunk(st: &mut ScanState) -> Result<Vec<ScanLine>, String> {
                         });
                         // the byte budget must bind where the allocations happen: this inner loop
                         // could otherwise stack 1000 × 8MB monster lines before the outer check
-                        if bytes >= SCAN_CHUNK_BYTES {
+                        if bytes >= SCAN_CHUNK_BYTES || scanned_bytes >= SCAN_CHUNK_BYTES {
                             break;
                         }
                     }
@@ -860,9 +931,62 @@ fn detect_shape(target: &Path) -> (bool, bool) {
     (bom, crlf > lf)
 }
 
-/// Atomic write into a :rw mount: lexical `..` guard → mkdir parents → canonicalize + prefix check → temp+rename.
-/// Preserves an existing target's BOM and line-ending style; returns bytes written (the receipt — no read-back needed).
+#[cfg(test)]
 fn write_file(mounts: &[Mount], js_path: &str, content: &str) -> Result<usize, String> {
+    write_file_with_log(mounts, js_path, content, &mut WriteLog::default())
+}
+
+struct BeforeFileSummary {
+    bytes: u64,
+    changed: bool,
+    first_changed_line: Option<usize>,
+}
+
+fn inspect_before(target: &Path, after: &[u8]) -> Result<Option<BeforeFileSummary>, String> {
+    let metadata = match std::fs::metadata(target) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut file = std::fs::File::open(target).map_err(|error| error.to_string())?;
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut offset = 0usize;
+    let mut line = 1usize;
+    let mut first_changed_line = None;
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        for &byte in &buffer[..read] {
+            if first_changed_line.is_none() && after.get(offset) != Some(&byte) {
+                first_changed_line = Some(line);
+            }
+            if byte == b'\n' {
+                line += 1;
+            }
+            offset += 1;
+        }
+    }
+    if first_changed_line.is_none() && offset != after.len() {
+        first_changed_line = Some(line);
+    }
+    Ok(Some(BeforeFileSummary {
+        bytes: metadata.len(),
+        changed: first_changed_line.is_some(),
+        first_changed_line,
+    }))
+}
+
+/// Atomic write into a :rw mount: lexical `..` guard → mkdir parents → canonicalize + prefix check → temp+rename.
+/// Preserves an existing target's BOM and line-ending style; returns bytes written and records a bounded receipt.
+fn write_file_with_log(
+    mounts: &[Mount],
+    js_path: &str,
+    content: &str,
+    writes: &mut WriteLog,
+) -> Result<usize, String> {
     let (m, rel) = strip_mount(mounts, js_path)?;
     let virt = m.virt.trim_end_matches('/');
     if !m.rw {
@@ -909,9 +1033,13 @@ fn write_file(mounts: &[Mount], js_path: &str, content: &str) -> Result<usize, S
         return Err(format!("path escapes mount root, rejected: {js_path}"));
     }
     let target = canon_parent.join(joined.file_name().unwrap_or_default());
+    let target_meta = std::fs::symlink_metadata(&target);
+    let created = target_meta
+        .as_ref()
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
     // rename replaces a symlink rather than following it; the link itself carries no shape, and
     // sniffing through it would read an out-of-mount file. New/regular targets keep their shape.
-    let (bom, crlf) = match std::fs::symlink_metadata(&target) {
+    let (bom, crlf) = match &target_meta {
         Ok(md) if md.file_type().is_symlink() => (false, false),
         _ => detect_shape(&target),
     };
@@ -924,6 +1052,21 @@ fn write_file(mounts: &[Mount], js_path: &str, content: &str) -> Result<usize, S
         out.push('\u{feff}');
     }
     out.push_str(&body);
+    let before = match &target_meta {
+        Ok(md) if md.file_type().is_symlink() => None,
+        Ok(_) => match inspect_before(&target, out.as_bytes()) {
+            Ok(summary) => summary,
+            Err(_) => Some(BeforeFileSummary {
+                bytes: std::fs::metadata(&target)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0),
+                changed: true,
+                first_changed_line: Some(1),
+            }),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("{js_path}: {error}")),
+    };
     let tmp = canon_parent.join(format!(
         ".terrarium-{}-{}",
         std::process::id(),
@@ -958,6 +1101,17 @@ fn write_file(mounts: &[Mount], js_path: &str, content: &str) -> Result<usize, S
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("{js_path}: {e} (after 3 attempts — a lingering editor/antivirus handle is the usual culprit)"));
     }
+    writes.record(WriteSummary {
+        path: js_path.to_string(),
+        created,
+        changed: before.as_ref().is_none_or(|before| before.changed),
+        bytes_before: before.as_ref().map(|before| before.bytes),
+        bytes_after: out.len() as u64,
+        first_changed_line: before
+            .as_ref()
+            .and_then(|before| before.first_changed_line)
+            .or_else(|| before.is_none().then_some(1)),
+    });
     Ok(out.len())
 }
 
@@ -971,8 +1125,23 @@ fn js_err(msg: String) -> rquickjs::Error {
 
 /// Shared option parsing for scan and walk — the options are traversal-level, so the two
 /// APIs accept the exact same set (defaults follow ripgrep).
-fn parse_tree_opts(o: &Object<'_>) -> rquickjs::Result<ScanOpts> {
+fn parse_tree_opts(o: &Object<'_>, allow_contains: bool) -> rquickjs::Result<ScanOpts> {
     let mut so = ScanOpts::default(); // ripgrep defaults: gitignore respected, dot-entries skipped
+    if let Some(value) = o
+        .get::<_, Option<String>>("contains")
+        .map_err(|e| js_err(format!("contains must be a string: {e}")))?
+    {
+        if value.is_empty() {
+            return Err(js_err("contains must not be empty".to_string()));
+        }
+        if !allow_contains {
+            return Err(js_err(
+                "contains is only supported by host.fs.scan; host.fs.walk never opens files"
+                    .to_string(),
+            ));
+        }
+        so.contains = Some(value);
+    }
     so.skip_dirs = o
         .get::<_, Option<Vec<String>>>("skipDirs")
         .map_err(|e| js_err(format!("skipDirs must be an array of strings: {e}")))?
@@ -1011,7 +1180,12 @@ fn parse_tree_opts(o: &Object<'_>) -> rquickjs::Result<ScanOpts> {
 }
 
 /// Registers the host.fs namespace
-pub fn install<'js>(ctx: &Ctx<'js>, host: &Object<'js>, mounts: &[Mount]) -> rquickjs::Result<()> {
+pub fn install<'js>(
+    ctx: &Ctx<'js>,
+    host: &Object<'js>,
+    mounts: &[Mount],
+    writes: Rc<RefCell<WriteLog>>,
+) -> rquickjs::Result<()> {
     let fsobj = Object::new(ctx.clone())?;
     let mounts: Vec<Mount> = mounts.to_vec();
 
@@ -1047,7 +1221,7 @@ pub fn install<'js>(ctx: &Ctx<'js>, host: &Object<'js>, mounts: &[Mount]) -> rqu
         ctx.clone(),
         move |ctx: Ctx<'js>, path: String, opts: Opt<Object>| -> rquickjs::Result<Object> {
             let so = match opts.0 {
-                Some(o) => parse_tree_opts(&o)?,
+                Some(o) => parse_tree_opts(&o, true)?,
                 None => ScanOpts::default(),
             };
             let st = scan_open(&m, &path, so).map_err(js_err)?;
@@ -1056,7 +1230,7 @@ pub fn install<'js>(ctx: &Ctx<'js>, host: &Object<'js>, mounts: &[Mount]) -> rqu
                 ctx.clone(),
                 rquickjs::function::Async(move || {
                     let rc = rc.clone(); // clone per call: the closure must stay Fn
-                    async move { scan_next_chunk(&mut rc.borrow_mut()).map_err(js_err) }
+                    async move { scan_next_batch(&mut rc.borrow_mut()).map_err(js_err) }
                 }),
             )?;
             let it = Object::new(ctx.clone())?;
@@ -1071,7 +1245,7 @@ pub fn install<'js>(ctx: &Ctx<'js>, host: &Object<'js>, mounts: &[Mount]) -> rqu
         ctx.clone(),
         move |ctx: Ctx<'js>, path: String, opts: Opt<Object>| -> rquickjs::Result<Object> {
             let so = match opts.0 {
-                Some(o) => parse_tree_opts(&o)?,
+                Some(o) => parse_tree_opts(&o, false)?,
                 None => ScanOpts::default(),
             };
             let st = walk_open(&m, &path, so).map_err(js_err)?;
@@ -1096,9 +1270,10 @@ pub fn install<'js>(ctx: &Ctx<'js>, host: &Object<'js>, mounts: &[Mount]) -> rqu
     })?;
     fsobj.set("text", text_fn)?;
 
-    let m = mounts;
+    let m = mounts.clone();
+    let write_log = writes.clone();
     let write_fn = Function::new(ctx.clone(), move |path: String, content: String| {
-        write_file(&m, &path, &content).map_err(js_err)
+        write_file_with_log(&m, &path, &content, &mut write_log.borrow_mut()).map_err(js_err)
     })?;
     fsobj.set("write", write_fn)?;
 
@@ -1202,6 +1377,63 @@ mod tests {
         let inner = Mount::from_canonical("/a/b", root, true).unwrap();
         assert!(outer.overlaps(&inner));
         assert!(inner.overlaps(&outer));
+    }
+
+    #[tokio::test]
+    async fn scan_contains_filters_lines_before_the_js_boundary() {
+        let root = tmp_root("scan-contains");
+        std::fs::write(root.join("a.txt"), "keep one\nskip\nkeep two\n").unwrap();
+        std::fs::write(root.join("b.txt"), "skip\n").unwrap();
+        let mounts = mounts_at(&root, false);
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let out = crate::kernel::eval_js(
+            "const lines = []; for await (const line of host.fs.scan('/t', {contains: 'keep'})) lines.push({file: line.file, no: line.no, text: line.text}); return lines;",
+            5_000,
+            &mounts,
+            tx,
+        )
+        .await;
+        assert!(out.ok, "error: {:?}", out.error);
+        assert_eq!(
+            out.value,
+            Some(serde_json::json!([
+                {"file":"/t/a.txt","no":1,"text":"keep one"},
+                {"file":"/t/a.txt","no":3,"text":"keep two"}
+            ]))
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_contains_continues_after_an_empty_nonfinal_batch() {
+        let root = tmp_root("scan-contains-empty-batch");
+        let content = format!("{}\nneedle\n", "x".repeat(SCAN_CHUNK_BYTES + 1));
+        std::fs::write(root.join("a.txt"), content).unwrap();
+        let mounts = mounts_at(&root, false);
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let out = crate::kernel::eval_js(
+            "const lines = []; for await (const line of host.fs.scan('/t', {contains: 'needle'})) lines.push(line.text); return lines;",
+            5_000,
+            &mounts,
+            tx,
+        )
+        .await;
+        assert!(out.ok, "error: {:?}", out.error);
+        assert_eq!(out.value, Some(serde_json::json!(["needle"])));
+    }
+
+    #[tokio::test]
+    async fn walk_rejects_scan_only_contains_filter() {
+        let root = tmp_root("walk-contains");
+        std::fs::write(root.join("a.txt"), "keep\n").unwrap();
+        let mounts = mounts_at(&root, false);
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let out =
+            crate::kernel::eval_js("host.fs.walk('/t', {contains: 'keep'})", 5_000, &mounts, tx)
+                .await;
+        assert!(!out.ok);
+        let message = out.error.expect("walk option error").message;
+        assert!(message.contains("contains"), "{message}");
+        assert!(message.contains("scan"), "{message}");
     }
 
     #[tokio::test]
@@ -1345,10 +1577,11 @@ mod tests {
         };
 
         // defaults: same file set as scan, in the same deterministic order, with sizes
-        let walked: Vec<(String, u64)> = drain_walk(walk_open(&ms, "/t/x", ScanOpts::default()).unwrap())
-            .into_iter()
-            .map(|e| (e.file, e.size))
-            .collect();
+        let walked: Vec<(String, u64)> =
+            drain_walk(walk_open(&ms, "/t/x", ScanOpts::default()).unwrap())
+                .into_iter()
+                .map(|e| (e.file, e.size))
+                .collect();
         assert_eq!(
             walked,
             vec![
@@ -1365,16 +1598,33 @@ mod tests {
         );
 
         // glob filters host-side: non-matching files are never touched
-        let rs: Vec<String> =
-            drain_walk(walk_open(&ms, "/t/x", ScanOpts { glob: Some("*.rs".into()), ..ScanOpts::default() }).unwrap())
-                .into_iter()
-                .map(|e| e.file)
-                .collect();
+        let rs: Vec<String> = drain_walk(
+            walk_open(
+                &ms,
+                "/t/x",
+                ScanOpts {
+                    glob: Some("*.rs".into()),
+                    ..ScanOpts::default()
+                },
+            )
+            .unwrap(),
+        )
+        .into_iter()
+        .map(|e| e.file)
+        .collect();
         assert_eq!(rs, ["/t/x/a.rs".to_string(), "/t/x/y/b.rs".to_string()]);
 
         // {hidden: true} surfaces dot-entries (rg --hidden polarity), parity with scan
         let with_hidden = drain_walk(
-            walk_open(&ms, "/t/x", ScanOpts { skip_hidden: false, ..ScanOpts::default() }).unwrap(),
+            walk_open(
+                &ms,
+                "/t/x",
+                ScanOpts {
+                    skip_hidden: false,
+                    ..ScanOpts::default()
+                },
+            )
+            .unwrap(),
         );
         assert!(with_hidden.iter().any(|e| e.file.ends_with(".git/config")));
 
@@ -1382,7 +1632,15 @@ mod tests {
         std::fs::create_dir_all(root.join("x/vendor")).unwrap();
         std::fs::write(root.join("x/vendor/v.rs"), "vend\n").unwrap();
         let pruned = drain_walk(
-            walk_open(&ms, "/t/x", ScanOpts { skip_dirs: vec!["vendor".into()], ..ScanOpts::default() }).unwrap(),
+            walk_open(
+                &ms,
+                "/t/x",
+                ScanOpts {
+                    skip_dirs: vec!["vendor".into()],
+                    ..ScanOpts::default()
+                },
+            )
+            .unwrap(),
         );
         assert!(!pruned.iter().any(|e| e.file.contains("vendor")));
 
@@ -1583,8 +1841,16 @@ mod tests {
     fn write_is_atomic_creates_parents_and_round_trips() {
         let root = tmp_root("rw");
         let ms = mounts_at(&root, true);
-        let n = write_file(&ms, "/t/a/b/c.txt", "hello\nworld").unwrap();
+        let mut writes = WriteLog::default();
+        let n = write_file_with_log(&ms, "/t/a/b/c.txt", "hello\nworld", &mut writes).unwrap();
         assert_eq!(n, 11);
+        assert_eq!(writes.items.len(), 1);
+        assert_eq!(writes.items[0].path, "/t/a/b/c.txt");
+        assert!(writes.items[0].created);
+        assert!(writes.items[0].changed);
+        assert_eq!(writes.items[0].bytes_before, None);
+        assert_eq!(writes.items[0].bytes_after, 11);
+        assert_eq!(writes.items[0].first_changed_line, Some(1));
         assert_eq!(
             std::fs::read_to_string(root.join("a/b/c.txt")).unwrap(),
             "hello\nworld"
@@ -1596,7 +1862,19 @@ mod tests {
             .to_string_lossy()
             .starts_with(".terrarium-")));
         // overwrite is a rename, not a truncate-in-place
-        write_file(&ms, "/t/a/b/c.txt", "x").unwrap();
+        write_file_with_log(&ms, "/t/a/b/c.txt", "x", &mut writes).unwrap();
+        assert_eq!(writes.items.len(), 2);
+        assert!(!writes.items[1].created);
+        assert_eq!(writes.items[1].bytes_before, Some(11));
+        assert_eq!(writes.items[1].bytes_after, 1);
+        assert_eq!(writes.items[1].first_changed_line, Some(1));
+        write_file_with_log(&ms, "/t/a/b/c.txt", "x", &mut writes).unwrap();
+        assert_eq!(writes.items.len(), 3);
+        assert!(!writes.items[2].created);
+        assert!(!writes.items[2].changed);
+        assert_eq!(writes.items[2].bytes_before, Some(1));
+        assert_eq!(writes.items[2].bytes_after, 1);
+        assert_eq!(writes.items[2].first_changed_line, None);
         assert_eq!(
             std::fs::read_to_string(root.join("a/b/c.txt")).unwrap(),
             "x"
@@ -1682,6 +1960,137 @@ mod tests {
         let edited = read_text(&ms, "/t/c.txt").unwrap().replace("b", "B");
         write_file(&ms, "/t/c.txt", &edited).unwrap();
         assert_eq!(std::fs::read(root.join("c.txt")).unwrap(), b"a\r\nB\r\nc");
+    }
+
+    #[tokio::test]
+    async fn host_fs_replace_makes_one_exact_change_and_returns_a_small_receipt() {
+        let root = tmp_root("edit-replace");
+        std::fs::write(root.join("file.txt"), "one\ntwo\nthree\n").unwrap();
+        let mounts = mounts_at(&root, true);
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let out = crate::kernel::eval_js(
+            "return host.fs.replace('/t/file.txt', 'two', 'TWO')",
+            5_000,
+            &mounts,
+            tx,
+        )
+        .await;
+        assert!(out.ok, "error: {:?}", out.error);
+        assert_eq!(
+            out.value,
+            Some(serde_json::json!({
+                "path": "/t/file.txt",
+                "replacements": 1,
+                "bytes": 14
+            }))
+        );
+        assert_eq!(out.writes.len(), 1);
+        assert_eq!(out.writes[0].path, "/t/file.txt");
+        assert!(!out.writes[0].created);
+        assert!(out.writes[0].changed);
+        assert_eq!(out.writes[0].bytes_before, Some(14));
+        assert_eq!(out.writes[0].bytes_after, 14);
+        assert_eq!(out.writes[0].first_changed_line, Some(2));
+        assert_eq!(
+            std::fs::read_to_string(root.join("file.txt")).unwrap(),
+            "one\nTWO\nthree\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_receipt_survives_a_later_program_failure() {
+        let root = tmp_root("write-failure");
+        let mounts = mounts_at(&root, true);
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let out = crate::kernel::eval_js(
+            "host.fs.write('/t/file.txt', 'written'); throw new Error('after write')",
+            5_000,
+            &mounts,
+            tx,
+        )
+        .await;
+        assert!(!out.ok);
+        assert_eq!(out.writes.len(), 1);
+        assert!(out.writes[0].created);
+        assert_eq!(out.writes[0].bytes_after, 7);
+        assert_eq!(
+            std::fs::read_to_string(root.join("file.txt")).unwrap(),
+            "written"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_fs_replace_rejects_missing_ambiguous_and_noop_edits_without_writing() {
+        let root = tmp_root("edit-reject");
+        let original = "same\nmiddle\nsame\n";
+        std::fs::write(root.join("file.txt"), original).unwrap();
+        let mounts = mounts_at(&root, true);
+
+        for (source, expected) in [
+            (
+                "return host.fs.replace('/t/file.txt', 'missing', 'new')",
+                "not found",
+            ),
+            (
+                "return host.fs.replace('/t/file.txt', 'same', 'new')",
+                "matched 2 times",
+            ),
+            (
+                "return host.fs.replace('/t/file.txt', 'middle', 'middle')",
+                "identical",
+            ),
+        ] {
+            let (tx, _rx) = tokio::sync::watch::channel(false);
+            let out = crate::kernel::eval_js(source, 5_000, &mounts, tx).await;
+            assert!(!out.ok, "source unexpectedly succeeded: {source}");
+            let message = out.error.expect("edit error").message;
+            assert!(message.contains(expected), "{message}");
+            assert_eq!(
+                std::fs::read_to_string(root.join("file.txt")).unwrap(),
+                original
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn host_fs_replace_treats_replacement_text_literally() {
+        let root = tmp_root("edit-literal");
+        std::fs::write(root.join("file.txt"), "const marker = OLD;\n").unwrap();
+        let mounts = mounts_at(&root, true);
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let out = crate::kernel::eval_js(
+            "return host.fs.replace('/t/file.txt', 'OLD', '$&')",
+            5_000,
+            &mounts,
+            tx,
+        )
+        .await;
+        assert!(out.ok, "error: {:?}", out.error);
+        assert_eq!(
+            std::fs::read_to_string(root.join("file.txt")).unwrap(),
+            "const marker = $&;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_fs_replace_all_is_explicit() {
+        let root = tmp_root("edit-all");
+        std::fs::write(root.join("file.txt"), "x x x").unwrap();
+        let mounts = mounts_at(&root, true);
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let out = crate::kernel::eval_js(
+            "return host.fs.replace('/t/file.txt', 'x', 'y', {all: true})",
+            5_000,
+            &mounts,
+            tx,
+        )
+        .await;
+        assert!(out.ok, "error: {:?}", out.error);
+        assert_eq!(out.value.as_ref().unwrap()["replacements"], 3);
+        assert_eq!(
+            std::fs::read_to_string(root.join("file.txt")).unwrap(),
+            "y y y"
+        );
     }
 
     #[test]

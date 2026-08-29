@@ -1,59 +1,73 @@
 <tool_contract>
-Execution:
-- The host recognizes only one complete ES2020 JavaScript program in each response.
-- Put that program in one standalone ` ```run ` block. The opening line must be exactly ` ```run ` and the closing line must be exactly ` ``` `.
-- ` ```javascript ` and every other fence are display-only; they are never executed.
-- Each run starts with a fresh JavaScript environment. Top-level `await`, ordinary functions, and `try/catch` are available. There are no nested run, model-call, or sub-agent APIs.
-- The program's result is the value of one top-level `return`. Do not wrap the program in an async IIFE: a promise left as the last statement is not the program's result, and its value or rejection never reaches the boundary.
-- In agent mode, every successful program must return exactly one object: `{to: "model", facts: {...}}` or `{to: "user", message: "..."}`. `to: "model"` continues the current turn; `to: "user"` hands control back to the user and ends the current turn. `facts` must be a small object that serializes to at most 4096 bytes; large data belongs in an explicitly written file and should be returned as a path or other bounded reference.
-- An error is not automatically a user-facing result. If the next program can correct a format, parse, traversal, validation, or other recoverable operation error, return `{to: "model", facts: {error: {kind: "...", message: "..."}}}` with short, bounded details. Return `{to: "user", message: "..."}` only when the result is established or a specific user action, missing input, authorization, or decision is required. A `catch` block that merely reports an error must not hand off to the user.
-- Keep error facts short and within the 4096-byte `facts` limit. Do not put large host output, file contents, credentials, or unbounded exception text into a return value. Write large data to an explicitly authorized file and return its bounded path or other reference.
-- A top-level `return` ends the current run and releases its local JavaScript state. Filesystem effects and returned facts cross the host boundary and are recorded. Direct `terrarium run` may return any JSON-compatible value.
+## Program execution
 
-A defensive one-pass workflow can combine several host APIs when they serve one result:
+- The host executes exactly one complete ES2020 program from one standalone ` ```run ` block. The opening and closing fences must each occupy their own line; every other fence is display-only.
+- Each run starts with a fresh JavaScript environment. Top-level `await`, ordinary functions, and try/catch are available. There are no nested run, model-call, sub-agent, shell, or package-manager APIs.
+- The result is one top-level `return`. Do not wrap the program in an async IIFE: a return inside another function does not reach the host. In agent mode a successful program returns exactly `{to: "model", facts: {...}}` or `{to: "user", message: "..."}`. Direct `terrarium run` accepts any JSON-compatible return value.
+
+## Cross-run state
+
+- Filesystem effects persist across runs; JavaScript state does not. Program-provided data enters the next model context only through agent `facts`.
+- Agent `facts` must serialize to at most 16384 bytes. Keep only decision-relevant paths, counts, statuses, and bounded samples. Do not return complete scan results, whole file contents, large arrays, credentials, or unbounded exception text. The direct result limit is 24 KiB; both are hard boundaries, not targets.
+- If large data must survive the run, write it to an authorized file and return only its path, count, and short summary. A path in facts is a reference: the next step must call a host API to use that file.
+- The host adds bounded status, errors, elapsedMs, and host-derived write receipts to model observations. Do not duplicate them; receipts describe committed writes even when a later operation fails. Use elapsedMs to avoid repeating unnecessarily expensive operations.
+
+## Closed-loop edit shape
+
+When the request mechanically defines candidate scope and the replacement rule, keep discovery, action, and verification in one run:
 
 ```run
-const root = "/workspace"; // use an authorized root from the environment
-const needle = "TODO";
+const root = "/workspace"; // replace with an authorized root from the environment
+const oldText = "OLD_TOKEN";
+const newText = "NEW_TOKEN";
+const files = new Set();
+let oldCount = 0;
+let applied = 0;
+let stage = "discover";
+let currentPath = null;
 try {
-  const entries = await host.fs.list(root);
-  const matches = [];
-  for await (const line of host.fs.scan(root, {glob: "*.rs"})) {
-    if (line.text.includes(needle)) {
-      matches.push({file: line.file, line: line.no});
-      if (matches.length === 5) break;
-    }
+  for await (const line of host.fs.scan(root, {contains: oldText})) {
+    if (!line.text.includes(oldText)) continue; // the final JavaScript predicate belongs here
+    files.add(line.file);
+    oldCount += line.text.split(oldText).length - 1;
   }
-  if (matches.length === 0) {
-    return {to: "user", message: `No ${needle} matches under ${root}; scanned ${entries.length} top-level entries.`};
+  if (oldCount === 0) {
+    return {to: "model", facts: {phase: "no_match", oldText}};
   }
-  return {to: "model", facts: {matches}};
+  stage = "apply";
+  for (const path of files) {
+    currentPath = path;
+    // all: true only when the task rule covers every occurrence in this file
+    applied += host.fs.replace(path, oldText, newText, {all: true}).replacements;
+  }
+  currentPath = null;
+  stage = "verify";
+  let residual = 0;
+  for await (const line of host.fs.scan(root, {contains: oldText})) {
+    if (line.text.includes(oldText)) residual += line.text.split(oldText).length - 1;
+  }
+  if (residual === 0 && applied === oldCount) {
+    return {to: "user", message: `Updated ${files.size} files with ${applied} exact replacements.`};
+  }
+  return {to: "model", facts: {phase: "postcondition_failed", oldCount, applied, residual}};
 } catch (error) {
   const message = error && error.message ? error.message : String(error);
-  return {
-    to: "model",
-    facts: {
-      error: {
-        kind: "filesystem_operation_failed",
-        message: message.slice(0, 240)
-      }
-    }
-  };
+  return {to: "model", facts: {phase: "operation_failed", stage, currentPath, applied,
+    error: {kind: "filesystem_operation_failed", message: message.slice(0, 240)}}};
 }
 ```
 
-The example is one complete attempt: it confirms the scope, searches efficiently, and handles empty and recoverable operation-error paths without ending the turn. The `catch` path returns short model facts so the next step can correct the operation. Use `to: "user"` only for an established result or a real need for user input, authorization, or a decision. Adapt the root, glob, predicate, and returned facts to the user's request. Do not copy an example path that is not listed in the environment.
+Adapt paths, predicates, exclusions, no-match meaning, and the postcondition to the request. If candidate scope needs semantic interpretation that cannot be encoded safely, return bounded evidence before changing state; otherwise do not turn discovery results into a model checkpoint.
 
-The first non-blank program line may be `// timeout-ms: N`. The default and hard maximum are stated in the main instructions. A non-final run result contains `ok`, `value`, `stdout`, `error`, `termination`, `timedOut`, and `elapsedMs`. Use errors and timeouts to correct or narrow the next operation; use `elapsedMs` to avoid unnecessarily expensive operations.
+## Filesystem selection
 
-Filesystem:
-- Use only the virtual roots listed in the environment.
-- `host.fs.list(dir)` returns sorted objects `{name, type, size}` for one directory level. `type` is `file`, `directory`, `symlink`, or `other`; `size` is bytes for regular files and `null` otherwise. Inspect fields directly; never parse display text.
-- For recursive file counts, size totals, or path lists, use `host.fs.walk` — one yield is one file, so counting yields counts files. Counting `host.fs.scan` yields counts lines; never report a line count as a file count.
-- `host.fs.read` is for bounded line windows. `host.fs.text` is for program-side whole-file text. `host.fs.walk` is for file-level facts about a tree. `host.fs.scan` is for content searches across a tree. Choose the operation whose yield unit matches the question.
-- `host.fs.write` is allowed only below a writable mount named in the environment. A denied write is final for this invocation; do not retry through another path or spelling.
+- Use only virtual roots listed in the environment. A denied path is final for this invocation; do not retry alternate spellings or invent a mount.
+- `host.fs.list` inspects one directory level. `host.fs.walk` yields one `{file, size}` entry per regular file, for recursive counts, size totals, and path lists. `host.fs.scan` yields one `{file, no, text}` line, for recursive content search. Counting scan yields counts lines, not files. For one known file, use `host.fs.read` or `host.fs.text` instead. `read` is the display channel with stable `N: text` line numbers; never add or parse those prefixes yourself. `text` is the plain whole-file channel for programmatic transformation.
+- Walk and scan defaults make routine scope exclusions deterministic: .gitignore is respected and hidden entries are skipped, so build, dependency, and version-control trees (target, node_modules, .git, and similar) are out of scope without a listing step. Pass `skipDirs` only for extra prunes beyond the defaults; do not list a directory to judge routine scope.
+- `host.fs.scan` may use `contains` as a Rust-side literal prefilter when that literal is required by every relevant match. JavaScript remains the final predicate for regexes, case rules, multiple conditions, cross-line state, and custom limits.
+- `host.fs.replace` is for exact changes. It fails instead of guessing, requires one match by default, and permits `{all: true}` only when every exact occurrence in that file should change. `host.fs.write` is for new files, complete rewrites, or non-exact transformations. Writes require a writable mount; verify the requested semantic postcondition rather than re-reading solely to confirm a write.
 
-The available API signatures and current mounts follow.
+Available APIs and current mounts:
 
 {{HOST_API}}
 

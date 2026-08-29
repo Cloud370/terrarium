@@ -31,6 +31,33 @@ const __nsProxy = (obj, path) => new Proxy(obj, {
 });
 globalThis.host = __nsProxy(host, 'host');
 
+host.fs.replace = (path, oldText, newText, options = {}) => {
+  if (typeof path !== 'string' || typeof oldText !== 'string' || typeof newText !== 'string') {
+    throw new Error('host.fs.replace(path, oldText, newText[, {all}]) requires string path and text arguments');
+  }
+  if (!oldText.length) throw new Error('host.fs.replace old text must not be empty');
+  if (oldText === newText) throw new Error('host.fs.replace produced identical content; no changes made');
+  if (options === null || typeof options !== 'object' || Array.isArray(options) ||
+      (options.all !== undefined && typeof options.all !== 'boolean')) {
+    throw new Error('host.fs.replace options must be {all: boolean}');
+  }
+  const content = host.fs.text(path);
+  let count = 0;
+  for (let at = 0; (at = content.indexOf(oldText, at)) !== -1; at += oldText.length) count++;
+  if (!count) throw new Error(`host.fs.replace old text was not found in ${path}`);
+  if (count > 1 && !options.all) {
+    throw new Error(`host.fs.replace old text matched ${count} times in ${path}; provide more context or use {all: true}`);
+  }
+  let updated;
+  if (options.all) {
+    updated = content.split(oldText).join(newText);
+  } else {
+    const at = content.indexOf(oldText);
+    updated = content.slice(0, at) + newText + content.slice(at + oldText.length);
+  }
+  return {path, replacements: options.all ? count : 1, bytes: host.fs.write(path, updated)};
+};
+
 // scan()/walk(): flatten host chunks into per-item async iterators — for-await over scan
 // yields {file, no, text} lines, over walk yields {file, size} entries, one by one.
 {
@@ -41,8 +68,12 @@ globalThis.host = __nsProxy(host, 'host');
     return {
       [Symbol.asyncIterator]: async function* () {
         while (true) {
-          const items = await raw.next();
-          if (!items.length) return;
+          const batch = await raw.next();
+          const items = Array.isArray(batch) ? batch : batch.items;
+          if (!items.length) {
+            if (Array.isArray(batch) || batch.done) return;
+            continue;
+          }
           for (const it of items) yield it;
         }
       },

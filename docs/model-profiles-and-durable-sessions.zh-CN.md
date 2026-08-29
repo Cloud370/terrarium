@@ -753,7 +753,7 @@ terrarium run [-e SOURCE | FILE] [--read-only | --full-access] [--mount /virtual
 - 一次成功的模型结果恰好包含一个 action；
 - 一个运行 action 至多一个 `run/start`；
 - 一次运行至多一个结果；
-- 成功的 `to: "model"` 运行带有模型观察，且 facts 序列化后不超过 4096 字节；
+- 成功的 `to: "model"` 运行带有模型观察，且 facts 序列化后不超过 16384 字节；
 - `handed_off` 的轮引用一个带有 user disposition 的已完成运行；
 - 在下一个 `turn/start` 之前，`turn/end` 之后没有事件。
 

@@ -78,7 +78,7 @@ fn http_client() -> &'static reqwest::Client {
     static C: OnceLock<reqwest::Client> = OnceLock::new();
     C.get_or_init(|| {
         reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(300))
             .build()
             .expect("http client")
     })

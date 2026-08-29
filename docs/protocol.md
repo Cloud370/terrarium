@@ -20,10 +20,14 @@ A reply must contain exactly one closed `run` block. A missing block, an unclose
 
 In agent mode, a successful program must return exactly one tagged disposition:
 
-- `{to: "model", facts: {...}}` ends the current JavaScript run and continues the same user turn. `facts` is a small, bounded object that serializes to at most 4096 bytes for the next model step.
+- `{to: "model", facts: {...}}` ends the current JavaScript run and continues the same user turn. `facts` is a bounded object that serializes to at most 16384 bytes for the next model step.
 - `{to: "user", message: "..."}` ends the current turn and prints the message to the user. Use this only when the result is established or a specific user action, missing input, authorization, or decision is required.
 
 A normal top-level `return` releases the run's local JavaScript state; it does not by itself finish a turn. A format, parse, traversal, validation, timeout, or other recoverable operation error is model feedback, not an automatic user handoff. The next step should correct the operation, narrow the scope, or gather the missing evidence. A `catch` block that merely reports an error must return short facts to `to: "model"`, not hand control to the user. Only a real need for user input, authorization, or a decision belongs in `to: "user"`.
+
+## Context budget
+
+A run has two data channels. Program-provided data enters the next model context only through `to: "model"` `facts`; local variables, `print` output, and a `to: "user"` message do not become next-step model facts. The host may add bounded status, errors, and write receipts as trusted evidence. Keep `facts` to decision-relevant paths, counts, statuses, and bounded samples. Do not return complete scan results, whole file contents, or large arrays. If a large result must survive the run, write it to an authorized file and return only its path, count, and short summary. The 24 KiB result limit and 16 KiB facts limit are hard boundaries, not targets.
 
 ## Run semantics
 
@@ -43,7 +47,9 @@ Single-run mode writes one JSON object. The reusable library returns the same fi
   "error": null,
   "termination": "returned",
   "timed_out": false,
-  "elapsed_ms": 6
+  "elapsed_ms": 6,
+  "writes": [],
+  "writes_truncated": false
 }
 ```
 
@@ -51,6 +57,7 @@ Single-run mode writes one JSON object. The reusable library returns the same fi
 - `error` is either `null` or `{kind, message}`.
 - `termination` is `returned`, `failed`, `timed_out`, `cancelled`, or `fatal`.
 - `timed_out` is a compatibility convenience and is true only for a timed-out run.
+- `writes` contains at most 64 host-derived receipts for committed writes. Each receipt has `path`, `created`, `changed`, `bytesBefore`, `bytesAfter`, and `firstChangedLine`; `firstChangedLine` is `null` for a byte-identical rewrite. `writes_truncated` reports omitted receipts.
 
 The direct `terrarium run` command accepts any JSON-compatible return value. Agent mode validates the returned value at the host boundary as one of the two tagged dispositions and records the normalized disposition in `run/result`.
 
@@ -58,7 +65,7 @@ The direct `terrarium run` command accepts any JSON-compatible return value. Age
 
 Host calls reject with a useful error instead of silently producing an empty result. In particular, scan traversal, file opening, and UTF-8 decoding failures carry the virtual path. Scan option fields reject when their types are wrong. Hidden entries, symlinks, binary files, and `.gitignore` matches are intentional scan exclusions, not errors. `walk` shares scan's traversal engine and option set; it yields `{file, size}` entries and reports traversal failures only, since it never opens files.
 
-A failed JavaScript run produces a compact model observation containing turn and step coordinates, status, termination, timeout, elapsed time, and a bounded error classification. It does not automatically copy the returned value or stdout into model context. A successful `to: "model"` disposition produces an observation containing the same coordinates and its bounded facts. A successful `to: "user"` disposition produces no model observation; the outer loop appends `turn/end` with `reason: "handed_off"` and prints the message.
+A failed JavaScript run produces a compact model observation containing turn and step coordinates, status, termination, timeout, elapsed time, a bounded error classification, and any write receipts committed before the failure. It does not automatically copy the returned value or stdout into model context. A successful `to: "model"` disposition produces an observation containing the same coordinates, its bounded facts, and any write receipts. A successful `to: "user"` disposition produces no model observation; the outer loop appends `turn/end` with `reason: "handed_off"` and prints the message.
 
 ## LLM payload scope
 

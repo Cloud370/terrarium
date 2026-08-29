@@ -53,7 +53,10 @@ A fresh runtime per run keeps a failed or timed-out program from poisoning the n
 
 The registry is the single source for the generated contract. The current surface is intentionally small:
 
-- `host.fs.list`, `read`, `text`, `scan`, `walk`, and `write`. `scan` and `walk` share one traversal engine: scan streams a tree's lines, walk streams its file entries.
+- `host.fs.list`, `read`, `text`, `scan`, `walk`, and `write`. `read` is the display channel with bounded windows and line numbers; `text` is the program channel for whole-file transformations. `scan` and `walk` share one traversal engine: scan streams a tree's lines, optionally applies a host-side literal `contains` prefilter before handing matching lines to JavaScript, and walk streams its file entries.
+- `host.fs.replace(path, oldText, newText[, {all}])` is the standard exact replacement idiom injected into each program. It fails on missing or ambiguous matches instead of guessing; `{all: true}` is explicit.
+- Every run exposes bounded host-derived write receipts in its `Outcome`; the host owns these facts rather than trusting program-reported counts.
+- Context is an explicit boundary: program data crosses to the next model only through bounded `to: "model"` facts (up to 16 KiB), while large intermediate results stay local or are written to an authorized file and referenced by path. A direct run result is capped at 24 KiB. Host status, errors, and receipts are bounded trusted evidence.
 - The tagged agent return protocol: `to: "model"` for same-turn continuation and `to: "user"` for an explicit user handoff. The main model request is performed by the trusted outer loop; JavaScript has no nested model-call primitive.
 
 Mounts are the authorization boundary. The operator declares `/virtual=real` for read-only access or `/virtual=real:rw` for writes. The default model-driven agent binds its session to the current working root; `terrarium run` uses the current directory transiently. Agent invocations select `workspace` by default, or `--read-only` or `--full-access` for that invocation only. Explicit `--mount` entries apply to every run in that invocation. `--full-access` maps `/` to the real filesystem view of the current operating-system user. These modes and mounts are never stored in the journal.
