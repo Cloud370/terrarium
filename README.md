@@ -20,21 +20,19 @@ Every new capability starts with first principles, not with an API shape or an i
 6. Which data belongs in model context, which belongs in durable state, and which must remain outside both?
 7. Can the existing boundaries express the workflow? If so, prefer composing them over adding a new abstraction.
 
-Keep control flow separate from data flow: a result should say who acts next, while large or sensitive data should cross boundaries by an explicit, bounded reference. Facts owned by the host must be derived by the host, not reported by the model. Optimize for the fewest steps that establish correctness, never for spending or exposing a step budget. Do not introduce a lifecycle, storage layer, routing mechanism, or capability without a concrete consumer and a complete contract for its limits and recovery.
+Keep control flow separate from data flow: a result should say who acts next, while large or sensitive data should cross boundaries by an explicit, bounded reference. Facts owned by the host must be derived by the host, not reported by the model. Optimize for the fewest steps that establish correctness, never for spending or exposing a step budget. Do not introduce a lifecycle, storage layer, routing mechanism, or capability without a concrete consumer and a complete contract for its limits and recovery, and keep speculative features out of the public contract.
 
 The design is good when its behavior can be reconstructed from its boundaries: a user, a model, or a future maintainer should be able to tell what persists, what is released, who acts next, and how uncertainty is handled without reading hidden implementation details.
 
 Invariants:
 
-- Model actions are programs — one complete `run` block per turn, and nothing outside that block executes.
-- Capabilities stay explicit, minimal, typed, bounded, and observable; errors surface at the boundary instead of falling back silently.
+- Model actions are programs — exactly one complete `run` fence per model response, and nothing outside that fence executes.
+- Each run executes in a fresh cage; no mutable state crosses runs, and credentials never enter the cage.
 - Security lives in the host — mount scoping, `:rw` writes, resource limits, cancellation. Prompts describe behavior; they never provide the boundary.
-- No mutable state crosses runs, and credentials never enter the cage.
-- Core behavior is host code with no platform-specific external commands.
-- `host.fs.walk` and `host.fs.scan` share one traversal engine — walk streams a tree's file entries, scan streams its lines — so host-side pruning plus ordinary JavaScript filtering remains the only search mechanism.
-- Sessions are durable append-only JSONL files. Model requests and JavaScript runs cross a durable boundary before dispatch; uncertain runs are never replayed.
-
-Before adding any capability, answer: which real workflow needs it; what are its limits, cancellation, failure states, and permissions; does it work the same on Linux, macOS, and Windows; and can an existing capability express it? Prefer the smallest boundary, and keep speculative features out of the public contract.
+- Capabilities stay explicit, minimal, typed, bounded, and observable; errors surface at the boundary instead of falling back silently.
+- Search stays composed: the host prunes (gitignore, glob, literal `contains`) and JavaScript applies the final predicate — there is deliberately no host grep or regex capability.
+- Sessions are durable append-only JSONL files. Model requests and runs are journaled before dispatch; a run whose outcome is unknown is marked, never replayed.
+- Core behavior is portable host code with no platform-specific external commands, so Linux, macOS, and Windows behave the same.
 
 ## The protocol
 
@@ -54,11 +52,15 @@ return {to: "model", facts: {matches}};
 
 ````text
 ```run
-return {to: "user", message: "The HTTP client is configured in src/llm.rs."};
+return {to: "user", message: "The HTTP client is configured in src/llm/."};
 ```
 ````
 
 A normal `return` releases the run's local JavaScript state; it does not by itself finish a turn. A returned error is not automatically a user-facing result: format, parse, traversal, validation, timeout, and other recoverable failures should return short facts to `to: "model"` so the next step can correct the work. Use `to: "user"` only when the result is established or a specific user action, missing input, authorization, or decision is required. A `catch` block that merely reports an error must not end the turn.
+
+The parser accepts exactly one complete `run` fence per reply. A missing, unclosed, or duplicated fence is a protocol error — the parser never runs the first block and silently ignores the rest. The opening fence is a standalone ```` ```run ```` line, the closing fence a standalone ```` ``` ```` line; inline triple backticks neither open nor close a block. Text outside the fence does not execute, and there is no text-based completion marker.
+
+Every run executes as the same kind of async function body, so top-level `return` and `await` are legal in every program. A returned value keeps its JSON structure instead of being flattened to a string.
 
 ## Context budget
 
@@ -148,16 +150,11 @@ The generated contract (`--contract`) documents the live surface:
 - `host.fs.walk(path, options)` streams one `{file, size}` per regular file from a directory tree — the file-level twin of `scan`, with the same pruning and the same options; files are never opened. Counting files or summing sizes is a walk; counting `scan` yields counts lines.
 - `host.fs.write(path, content)` atomically writes text under a declared `:rw` mount and returns the byte count. The run result also includes bounded host-derived write receipts (`path`, `created`, `changed`, `bytesBefore`, `bytesAfter`, `firstChangedLine`).
 
-Agent programs use the tagged return protocol described above for model continuation or user handoff. There is no `host.agent.answer` API.
+Agent programs use the tagged return protocol described above for model continuation or user handoff.
 
-The JavaScript host surface does not include `host.llm.call`; model requests belong to the trusted outer agent loop and are recorded in the session journal.
+Model requests belong to the trusted outer agent loop and are journaled in the session; the JavaScript host surface is the filesystem capability set above.
 
-The current model examples declare these capabilities:
-
-- `deepseek-v4-flash`: text input and text output; it does not accept image input.
-- `deepseek-v4-flash-vision-exp`: text or image input and text output.
-
-This phase only declares these model capabilities. The outer model request payload is text-only; image file reading, encoding, and artifact transport are not implemented.
+The contract opens with the configured model's declared capabilities (text-only versus text-and-image input; a model without a local declaration is labeled undeclared). The request payload stays text-only regardless — image file reading, encoding, and artifact transport are not implemented.
 
 ## Configuration
 
@@ -172,6 +169,7 @@ If no TOML file is selected, the legacy `TERRARIUM_LLM_API_KEY`, `TERRARIUM_LLM_
 - `src/lib.rs`, `src/kernel.rs` — reusable kernel boundary and one fresh cage per run
 - `src/main.rs`, `src/cli.rs` — process and terminal adapters
 - `src/agent.rs` — outer agent loop and run-fence parser
+- `src/session.rs` — durable append-only session journal
 - `src/fs.rs`, `src/llm/`, `src/registry.rs` — host capabilities, streaming three-protocol model transport, and the live API registry
 - `src/prompts/`, `src/runtime/` — embedded model prompt and JavaScript runtime assets
 - `docs/` — maintained design, protocol, configuration, security, and integration notes
@@ -184,6 +182,7 @@ The library exposes `Kernel` and validated `Mount` for non-CLI callers. A future
 - [Current protocol](docs/protocol.md)
 - [Configuration](docs/configuration.md)
 - [Security boundary](docs/security.md)
+- [Model profiles and durable sessions](docs/model-profiles-and-durable-sessions.md)
 - [Web UI integration boundary](docs/web-ui.md)
 
 ## License

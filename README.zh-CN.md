@@ -20,21 +20,19 @@ Terrarium 是一个有边界的程序运行时：模型输出程序，宿主提�
 6. 哪些数据属于模型上下文，哪些属于持久状态，哪些必须留在两者之外？
 7. 现有边界能否组合表达这个工作流？如果可以，优先组合，而不是增加新的抽象。
 
-让控制流与数据流分离：结果应说明接下来由谁行动；大数据或敏感数据应通过显式且有界的引用跨越边界。由宿主拥有的事实必须由宿主推导，不能由模型自行报告。以建立正确性所需的最少步数为目标，不要为了消耗或暴露步数上限而优化。没有具体消费者和完整的限额、失败及恢复契约时，不引入新的生命周期、存储层、路由机制或能力。
+让控制流与数据流分离：结果应说明接下来由谁行动；大数据或敏感数据应通过显式且有界的引用跨越边界。由宿主拥有的事实必须由宿主推导，不能由模型自行报告。以建立正确性所需的最少步数为目标，不要为了消耗或暴露步数上限而优化。没有具体消费者和完整的限额、失败及恢复契约时，不引入新的生命周期、存储层、路由机制或能力；投机性功能不进入公开契约。
 
 当一个用户、模型或未来维护者无需阅读隐藏的实现细节，只根据边界就能判断什么会持久化、什么会释放、接下来谁行动以及不确定性如何处理时，这个设计才是好的。
 
 不变量：
 
-- 模型动作是程序——每轮恰好一个完整的 `run` 块，块外内容一律不执行。
-- 能力保持显式、最小、有类型、有边界、可观察；错误在边界处暴露，不做静默回退。
+- 模型动作是程序——每次模型回复恰好一个完整的 `run` 围栏，围栏之外的文字一律不执行。
+- 每次运行在全新笼子中执行；可变状态不跨运行传递，凭据永不进入笼子。
 - 安全由宿主承担——挂载范围、`:rw` 写入、资源限额、取消。Prompt 描述行为，永远不构成安全边界。
-- 可变状态不跨运行传递，凭据永不进入笼子。
-- 核心行为是宿主代码，不依赖平台特定的外部命令。
-- `host.fs.walk` 与 `host.fs.scan` 共享同一个遍历引擎——walk 流式产出一棵树的文件条目，scan 流式产出它的行——宿主侧剪枝加普通 JavaScript 过滤仍是唯一的搜索机制。
-- 会话是持久化的仅追加 JSONL 文件。模型请求和 JavaScript 运行在派发或执行之前跨越持久化边界；结果不确定的运行绝不重放。
-
-新增任何能力之前先回答：哪个真实工作流需要它；它的限额、取消、失败状态和权限是什么；在 Linux、macOS、Windows 上行为是否一致；现有能力能否表达它？优先选择最小的边界，投机性功能不进入公开契约。
+- 能力保持显式、最小、有类型、有边界、可观察；错误在边界处暴露，不做静默回退。
+- 搜索由组合完成：宿主负责剪枝（gitignore、glob、字面量 `contains`），JavaScript 做最终判断——刻意不提供宿主侧 grep 或正则能力。
+- 会话是持久化的仅追加 JSONL 文件。模型请求和运行在派发前先写入日志；结果未知的运行会被标记，绝不重放。
+- 核心行为是可移植的宿主代码，不依赖平台特定的外部命令，Linux、macOS 和 Windows 行为一致。
 
 ## 协议
 
@@ -54,19 +52,19 @@ return {to: "model", facts: {matches}};
 
 ````text
 ```run
-return {to: "user", message: "HTTP client 配置位于 src/llm.rs。"};
+return {to: "user", message: "HTTP client 配置位于 src/llm/。"};
 ```
 ````
 
 普通顶层 `return` 会释放本次运行的局部 JavaScript 状态，但不会自行结束轮。格式、解析、遍历、校验、超时及其他可恢复的操作错误，不应自动交还用户；应返回简短 facts 给 `to: "model"`，让下一步修正操作、缩小范围或补充证据。只有结果已经确定，或确实需要用户提供输入、授权或做决定时，才使用 `to: "user"`。只报告错误的 `catch` 块不能结束当前轮。
 
-## 上下文预算
-
-一次运行有两个数据通道。程序主动提供的数据只有通过 `to: "model"` 的 `facts` 才会进入下一轮模型上下文；局部变量、`print` 输出和 `to: "user"` 消息不会成为下一步的模型 facts。宿主可能自动附加有界的状态、错误和写入回执，作为可信证据；不要在 facts 中重复这些宿主事实。facts 只放与决策直接相关的路径、计数、状态和有界样本。不要返回完整 scan 结果、整份文件内容或大数组；大结果如需保留，写入授权文件后只返回路径、数量和简短摘要。24 KiB 结果上限和 16 KiB facts 上限是硬边界，不是目标值。
-
 解析器对每条回复只接受恰好一个完整的 `run` 围栏。缺失、未闭合或出现多个 `run` 围栏都是协议错误——解析器绝不执行第一个块后静默忽略其余块。开栏必须是一行独立的 ```` ```run ````，闭栏必须是一行独立的 ```` ``` ````；行内三反引号既不开栏也不闭栏。围栏外的文字不会执行。没有基于文本的完成标记。
 
 每次运行都按同一种 async function body 语义执行，因此顶层 `return` 和 `await` 在所有程序中都合法。结果保留 JSON 值的结构，不会先格式化成字符串。
+
+## 上下文预算
+
+一次运行有两个数据通道。程序主动提供的数据只有通过 `to: "model"` 的 `facts` 才会进入下一轮模型上下文；局部变量、`print` 输出和 `to: "user"` 消息不会成为下一步的模型 facts。宿主可能自动附加有界的状态、错误和写入回执，作为可信证据；不要在 facts 中重复这些宿主事实。facts 只放与决策直接相关的路径、计数、状态和有界样本。不要返回完整 scan 结果、整份文件内容或大数组；大结果如需保留，写入授权文件后只返回路径、数量和简短摘要。24 KiB 结果上限和 16 KiB facts 上限是硬边界，不是目标值。
 
 ## 为什么是程序
 
@@ -152,20 +150,17 @@ terrarium run [-e SOURCE | FILE] [--read-only | --full-access] [--mount /virtual
 - `host.fs.walk(path, options)` 从目录树流式产出每个普通文件的 `{file, size}`——scan 的文件级孪生：同样的剪枝、同样的选项；文件从不会被打开。数文件、算总大小用 walk；数 scan 的产出数是在数行。
 - `host.fs.write(path, content)` 在声明为 `:rw` 的挂载下原子写入文本，返回字节数；run 结果还包含有界的宿主写入回执（`path`、`created`、`changed`、`bytesBefore`、`bytesAfter`、`firstChangedLine`）。
 
-Agent 程序使用上文的 tagged return 协议来继续交给模型或交还用户。不存在 `host.agent.answer` API。
+Agent 程序使用上文的 tagged return 协议来继续交给模型或交还用户。
 
-JavaScript 宿主能力面不包含 `host.llm.call`；模型请求属于可信的外层 agent 循环，并记录在会话日志中。
+模型请求属于可信的外层 agent 循环并写入会话日志；JavaScript 宿主能力面只有上述文件系统能力。
 
-当前模型示例声明以下能力：
-
-- `deepseek-v4-flash`：文本输入、文本输出，不支持图像输入。
-- `deepseek-v4-flash-vision-exp`：文本或图像输入、文本输出。
-
-本阶段只声明这些模型能力。外层模型请求仍是文本 payload；图像读取、编码和 artifact 传输尚未实现。
+契约首行声明所配置模型的能力（纯文本输入，或文本加图像输入；本地未声明的模型会标注为未声明）。无论声明如何，请求 payload 始终是纯文本——图像读取、编码和 artifact 传输尚未实现。
 
 ## 配置
 
 推荐使用严格 TOML 配置文件：`$XDG_CONFIG_HOME/terrarium/config.toml`；在 Unix 且未设置 `XDG_CONFIG_HOME` 时使用 `~/.config/terrarium/config.toml`。可用 `--config PATH` 指定其他文件。凭据只通过环境变量名引用，永远不会存入会话。
+
+配置档从三种线上协议中选择一种——`openai-chat-completions`、`openai-responses` 或 `anthropic-messages`（DeepSeek 的 Anthropic 兼容端点通过 `base_url = "https://api.deepseek.com/anthropic"` 使用）。每次调用都以 server-sent events 流式传输，受单次尝试总超时和块间空闲超时约束，两者都可按配置档设置。助手推理随每次结果写入日志，并按各自协议的原生形状在后续请求中回放（Chat Completions 的助手 `reasoning_content`、Responses 的加密推理条目、Anthropic 的签名思考块）。每次请求的 token 用量——净输入、输出、缓存读写——会写入日志，并对照配置档声明的 `context_window` 输出一行上下文预算。
 
 没有选中 TOML 文件时，仍兼容遗留的 `TERRARIUM_LLM_API_KEY`、`TERRARIUM_LLM_BASE_URL` 和 `TERRARIUM_LLM_MODEL` 环境变量。二进制不会加载 `.env` 文件。
 
@@ -174,7 +169,8 @@ JavaScript 宿主能力面不包含 `host.llm.call`；模型请求属于可信�
 - `src/lib.rs`、`src/kernel.rs` —— 可复用 kernel 边界，每次运行一个全新笼子
 - `src/main.rs`、`src/cli.rs` —— 进程和终端适配层
 - `src/agent.rs` —— 外层 agent 循环和 run 围栏解析器
-- `src/fs.rs`、`src/llm.rs`、`src/registry.rs` —— 宿主能力及实时 API 注册表
+- `src/session.rs` —— 持久化仅追加会话日志
+- `src/fs.rs`、`src/llm/`、`src/registry.rs` —— 宿主能力、三协议流式模型传输和实时 API 注册表
 - `src/prompts/`、`src/runtime/` —— 编译进二进制的模型 prompt 和 JavaScript runtime 资产
 - `docs/` —— 设计、协议、配置、安全和集成说明
 
@@ -186,6 +182,7 @@ JavaScript 宿主能力面不包含 `host.llm.call`；模型请求属于可信�
 - [当前协议](docs/protocol.md)
 - [配置](docs/configuration.md)
 - [安全边界](docs/security.md)
+- [模型配置档与持久会话](docs/model-profiles-and-durable-sessions.md)
 - [Web UI 集成边界](docs/web-ui.md)
 
 ## 许可证
