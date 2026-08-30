@@ -16,12 +16,14 @@ cargo clippy --all-targets -- -D warnings              # lint (CI enforces; zero
 - Windows cross-compile from Linux: `cargo build --release --target x86_64-pc-windows-gnu` (mingw-w64 linker configured in `.cargo/config.toml`).
 - `cargo check` gives a fast typecheck; `clippy` is the enforced gate.
 
-## Efficiency
+## Efficiency hints
 
-- Locate first, read a window. Grep a symbol to get its line, then read only the surrounding range (offset/limit or `sed -n 'A,Bp'`). The head of a file carries doc comments and structure, the tail carries tests — often only one of the two is needed. Reserve whole-file reads for small files or a first structural survey.
-- Batch independent work. Issue parallel tool calls in one message (reads, greps, independent shell steps) and group related edits into a single message instead of paying a round trip per change.
-- Do not run `cargo fmt` mid-task. Formatting shifts line numbers, which invalidates every location already read and makes the next edit miss its anchor — forcing re-reads of files you had in hand. Write idiomatically formatted code as you go and format once at the end.
-- Verify once at the end: `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` — not after every change.
+Hints, not requirements — apply whichever fit the tools you actually have.
+
+- Locate, don't load. Use whatever content search is available — a search tool, shell `grep`, an editor jump — to find the region that matters, then read just that region. File heads carry doc comments and structure, tails carry tests; often one of the two is enough. Whole-file reads are worth it only for small files or a first structural survey.
+- Batch independent actions when your environment allows it: multiple tool calls in one turn, or shell steps chained into one invocation, beat paying a round trip per action.
+- Keep reformatting for the end. A formatter rewrites line numbers; run it mid-task and every location already read goes stale, so later edits miss their anchor and force re-reads. Write normally as you go and format once before finishing.
+- Verify once at the end — `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` — not after every change.
 
 ## Architecture
 
