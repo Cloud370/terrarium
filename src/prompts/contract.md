@@ -17,7 +17,7 @@
 When the request mechanically defines candidate scope and the replacement rule, keep discovery, action, and verification in one run:
 
 ```run
-const root = "/workspace"; // replace with an authorized root from the environment
+const root = "/path/from-the-environment"; // replace with an authorized root from the environment
 const oldText = "OLD_TOKEN";
 const newText = "NEW_TOKEN";
 const files = new Set();
@@ -61,7 +61,7 @@ Adapt paths, predicates, exclusions, no-match meaning, and the postcondition to 
 
 ## Filesystem selection
 
-- Use only virtual roots listed in the environment. A denied path is final for this invocation; do not retry alternate spellings or invent a mount.
+- Use only authorized roots listed in the environment. A denied path is final for this invocation; do not retry alternate spellings or invent a mount.
 - `host.fs.list` inspects one directory level. `host.fs.walk` yields one `{file, size}` entry per regular file, for recursive counts, size totals, and path lists. `host.fs.scan` yields one `{file, no, text}` line, for recursive content search. Counting scan yields counts lines, not files. For one known file, use `host.fs.read` or `host.fs.text` instead. `read` is the display channel with stable `N: text` line numbers; never add or parse those prefixes yourself. `text` is the plain whole-file channel for programmatic transformation.
 - Walk and scan defaults make routine scope exclusions deterministic: .gitignore is respected and hidden entries are skipped, so build, dependency, and version-control trees (target, node_modules, .git, and similar) are out of scope without a listing step. Pass `skipDirs` only for extra prunes beyond the defaults; do not list a directory to judge routine scope.
 - `host.fs.scan` may use `contains` as a Rust-side literal prefilter when that literal is required by every relevant match. JavaScript remains the final predicate for regexes, case rules, multiple conditions, cross-line state, and custom limits.

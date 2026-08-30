@@ -118,7 +118,7 @@ terrarium --read-only \
   "read landscape-monitor"
 ```
 
-`--full-access` maps `/` to the current user's filesystem view; it does not bypass operating-system permissions. In restricted modes, the agent uses `/workspace` plus any explicit virtual mounts. JavaScript does not expand `~`; the prompt identifies the available roots and tells the model how to handle a denied path.
+`--full-access` maps `/` to the current user's filesystem view; it does not bypass operating-system permissions. In restricted modes, the agent uses the current working directory's absolute path plus any explicit mount paths. JavaScript does not expand `~`; the prompt identifies the available roots and tells the model how to handle a denied path.
 
 For direct JavaScript execution, use the separate `run` command:
 

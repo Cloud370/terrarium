@@ -118,7 +118,7 @@ terrarium --read-only \
   "读取 landscape-monitor"
 ```
 
-`--full-access` 将 `/` 映射到当前操作系统用户可见的文件系统，但不会绕过操作系统权限。受限模式下 agent 使用 `/workspace` 以及显式虚拟挂载。JavaScript 不会展开 `~`；prompt 会列出可用根目录，并说明如何处理被拒绝的路径。
+`--full-access` 将 `/` 映射到当前操作系统用户可见的文件系统，但不会绕过操作系统权限。受限模式下 agent 直接使用当前工作目录的绝对路径，以及显式挂载的路径。JavaScript 不会展开 `~`；prompt 会列出可用根目录，并说明如何处理被拒绝的路径。
 
 直接执行 JavaScript 使用独立的 `run` 命令：
 

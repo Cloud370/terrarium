@@ -90,7 +90,14 @@ async fn run_direct(args: &[String]) -> i32 {
     let root = if parsed.full_access {
         Mount::new("/", "/", true)
     } else {
-        Mount::new("/workspace", ".", writable)
+        let cwd = match std::env::current_dir() {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("terrarium: cannot determine working root: {error}");
+                return 2;
+            }
+        };
+        Mount::new(cwd.to_string_lossy().into_owned(), cwd, writable)
     };
     let root = match root {
         Ok(mount) => mount,

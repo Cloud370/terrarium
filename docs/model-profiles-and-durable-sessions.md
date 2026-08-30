@@ -36,7 +36,7 @@ Providers and protocols remain host configuration details. There is no hidden ta
 Direct JavaScript execution is a distinct development and integration entry point:
 
 ```sh
-terrarium run -e 'return await host.fs.text("Cargo.toml")'
+terrarium run -e 'return await host.fs.text("/work/project/Cargo.toml")'
 ```
 
 The main command is not overloaded by guessing whether its argument is a task, a task file, or JavaScript source.
@@ -110,11 +110,11 @@ A new local session binds its working root to the process working directory from
 - a user-facing absolute path used in prompts, observations, and answers;
 - a canonical host path used only for containment and authority checks.
 
-Relative program paths resolve from the user-facing working root. The model and user therefore speak about the same paths, while the host may still canonicalize symlinks and platform aliases internally. Resuming from another shell directory never changes the stored working root.
+The default filesystem mount uses the user-facing absolute path as its path prefix. The model and user therefore speak about the same paths, while the host may still canonicalize symlinks and platform aliases internally. Resuming from another shell directory never changes the stored working root.
 
 The session working root is one stable resource identity for the life of the session. Version 1 does not persist attachment registries, dynamic mount sets, virtual path aliases, or per-directory ACLs. A task that fundamentally belongs to another root starts another session.
 
-An invocation may add explicit mounts with `--mount /virtual=real[:rw]`; these mounts are selected by the trusted host and remain available to every run in that invocation, but are not stored in the journal. `--full-access` installs `/ -> /`, allowing real absolute paths visible to the current operating-system user, including paths outside the session working root. JavaScript does not expand `~`; the prompt names the available virtual roots. A denied path is an authorization result, not a cue to guess alternate paths or invent mounts.
+An invocation may add explicit mounts with `--mount /virtual=real[:rw]`; these mounts are selected by the trusted host and remain available to every run in that invocation, but are not stored in the journal. The default mount uses the session working root's own absolute path, so user messages and model programs use the same path. `--full-access` installs `/ -> /`, allowing real absolute paths visible to the current operating-system user, including paths outside the session working root. JavaScript does not expand `~`; the prompt names the available roots. A denied path is an authorization result, not a cue to guess alternate paths or invent mounts.
 
 Direct `terrarium run` execution creates no session. Its transient working root is the process working directory for that invocation and is never persisted.
 
@@ -158,7 +158,7 @@ The generated host contract exposes `host.fs.list(dir)` as sorted objects with `
 
 **Run** is one fenced Terrarium JavaScript program selected by a successful model response.
 
-**Working root** is the root used to resolve relative program paths. An agent session binds it when the session is created: its user-facing path is shared by the model and user, while its canonical host path is used for containment checks. A direct `terrarium run` invocation uses its current process directory transiently.
+**Working root** is the root used by the default filesystem mount and to resolve relative program paths. An agent session binds it when the session is created: its user-facing absolute path is shared by the model and user, while its canonical host path is used for containment checks. A direct `terrarium run` invocation uses its current process directory transiently.
 
 **Access mode** is the invocation-wide `read_only`, `workspace`, or `full` host policy. It constrains the complete host capability set, not only filesystem calls, and is never restored from session data.
 
@@ -387,9 +387,9 @@ The resolved profile is intentionally repeated in each turn. Sessions have few t
 When a completed session receives another user message:
 
 - with `--profile NAME`, Terrarium loads current config, resolves the named profile, renders the system prompt from current prompt assets, and stores the new snapshot;
-- without `--profile`, Terrarium copies the previous turn's selected and resolved profile and turn limits, then renders the new turn's prompt with the current invocation's authorized virtual roots; it does not read config;
+- without `--profile`, Terrarium copies the previous turn's selected and resolved profile and turn limits, then renders the new turn's prompt with the current invocation's authorized roots; it does not read config;
 
-The system prompt describes the stable program contract, working root, and the authorized virtual roots for the current invocation. It does not grant authority: access checks remain host policy, and the prompt is refreshed for a new turn when the invocation's mount set changes. Access denials are observable host results, not prompt policy. This keeps adoption of current model configuration and prompt assets explicit while allowing every invocation to enforce its own access mode.
+The system prompt describes the stable program contract, working root, and the authorized roots for the current invocation. It does not grant authority: access checks remain host policy, and the prompt is refreshed for a new turn when the invocation's mount set changes. Access denials are observable host results, not prompt policy. This keeps adoption of current model configuration and prompt assets explicit while allowing every invocation to enforce its own access mode.
 
 On resume, `--config` is valid only together with `--profile` while starting a new turn. `--read-only` and `--full-access` select the current invocation policy whether Terrarium continues an open turn or starts a new one; they never mutate journal state. Other invalid combinations are usage errors.
 
@@ -538,10 +538,10 @@ For a valid run:
   "data": {
     "requestSeq": 2,
     "ok": true,
-    "content": "```run\nreturn await host.fs.text('Cargo.toml')\n```",
+    "content": "```run\nreturn await host.fs.text('/work/project/Cargo.toml')\n```",
     "action": {
       "kind": "run",
-      "source": "return await host.fs.text('Cargo.toml')\n",
+      "source": "return await host.fs.text('/work/project/Cargo.toml')\n",
       "timeoutMs": 10000
     }
   }
@@ -630,9 +630,9 @@ A normal result stores the full kernel outcome and the normalized agent disposit
     },
     "disposition": {
       "to": "model",
-      "facts": {"matches": [{"file": "/workspace/src/llm.rs", "line": 12}]}
+      "facts": {"matches": [{"file": "/work/project/src/llm.rs", "line": 12}]}
     },
-    "observation": "{\"turn\":1,\"step\":1,\"to\":\"model\",\"facts\":{\"matches\":[{\"file\":\"/workspace/src/llm.rs\",\"line\":12}]}}"
+    "observation": "{\"turn\":1,\"step\":1,\"to\":\"model\",\"facts\":{\"matches\":[{\"file\":\"/work/project/src/llm.rs\",\"line\":12}]}}"
   }
 }
 ```
@@ -872,7 +872,7 @@ All acceptance tests use a local mock HTTP server. No real third-party model ser
 
 - A new local session stores the absolute display path and canonical path of its creation directory as one working root.
 - Resume from another process directory keeps the stored root and never silently retargets it.
-- Model programs accept working-root-relative paths, and user-facing observations and answers do not introduce an unrelated virtual namespace.
+- Model programs use the same absolute working-root paths shown to the user, and user-facing observations and answers do not introduce an unrelated virtual namespace.
 - `workspace` is the default independently on every agent or direct-run invocation.
 - `--read-only` and `--full-access` are mutually exclusive and never appear in the session header, turn data, or events.
 - Editing a journal cannot select `read_only`, `workspace`, or `full`; the live host policy decides every operation.

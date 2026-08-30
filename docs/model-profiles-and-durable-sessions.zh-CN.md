@@ -34,7 +34,7 @@ terrarium --profile main "review this project"
 直接执行 JavaScript 是独立的开发与集成入口：
 
 ```sh
-terrarium run -e 'return await host.fs.text("Cargo.toml")'
+terrarium run -e 'return await host.fs.text("/work/project/Cargo.toml")'
 ```
 
 供应商和协议始终是宿主配置层面的细节。调用点不存在隐藏的任务分类器、自动模型路由器、回退链，也不存在供应商专属的选项包。
@@ -56,7 +56,7 @@ terrarium run -e 'return await host.fs.text("Cargo.toml")'
 
 会话工作根目录是会话生命周期内稳定的资源身份。版本 1 不持久化附件注册表、动态挂载集合、虚拟路径别名或目录级 ACL。根本属于另一个目录的任务应启动另一个会话。
 
-一次调用可以使用 `--mount /virtual=real[:rw]` 添加显式挂载；这些挂载由可信宿主选择，并在本次调用的每一次运行中持续有效，但不会写入日志。`--full-access` 安装 `/ -> /`，允许模型使用当前操作系统用户可见的真实绝对路径，包括会话工作根之外的路径。JavaScript 不会展开 `~`；prompt 会列出可用的虚拟根。路径被拒绝时应将其视为授权结果，不得猜测其他路径或虚构挂载。
+一次调用可以使用 `--mount /virtual=real[:rw]` 添加显式挂载；这些挂载由可信宿主选择，并在本次调用的每一次运行中持续有效，但不会写入日志。默认挂载直接使用会话工作根的绝对路径，因此用户消息和模型程序使用相同的路径。`--full-access` 安装 `/ -> /`，允许模型使用当前操作系统用户可见的真实绝对路径，包括会话工作根之外的路径。JavaScript 不会展开 `~`；prompt 会列出可用的授权根路径。路径被拒绝时应将其视为授权结果，不得猜测其他路径或虚构挂载。
 
 生成的主机契约将 `host.fs.list(dir)` 暴露为按名称排序的对象数组，字段为 `name`、`type` 和 `size`。`type` 可以是 `file`、`directory`、`symlink` 或 `other`；普通文件的 `size` 是字节数，其他类型为 `null`。程序应直接检查这些字段，不要解析展示字符串。递归统计时一次列出一个目录；仅对 `type` 为 `directory` 的条目继续递归，并且只累加 `type` 为 `file` 的 `size`。应记录遍历错误；如果任何必要目录无法列出，就必须报告结果不完整，不得提交确定的完整总数。
 
@@ -331,7 +331,7 @@ reasoning_effort | 可缺省
 当一个已完成的会话收到新的用户消息时：
 
 - 带 `--profile NAME`：Terrarium 加载当前配置，解析该配置档，从当前提示词资产渲染系统提示词，并存储新快照；
-- 不带 `--profile`：复制上一轮选中的与已解析的配置档和轮限制，并使用当前调用授权的虚拟根重新渲染新轮 prompt；不读取配置文件；
+- 不带 `--profile`：复制上一轮选中的与已解析的配置档和轮限制，并使用当前调用授权的根路径重新渲染新轮 prompt；不读取配置文件；
 
 这使"采用当前配置与提示词资产"成为显式行为。编辑配置或升级提示词文本绝不会重写历史，也不会悄悄改变一个延续中的会话。
 
@@ -577,9 +577,9 @@ turn/end
     },
     "disposition": {
       "to": "model",
-      "facts": {"matches": [{"file": "/workspace/src/llm.rs", "line": 12}]}
+      "facts": {"matches": [{"file": "/work/project/src/llm.rs", "line": 12}]}
     },
-    "observation": "{\"turn\":1,\"step\":1,\"to\":\"model\",\"facts\":{\"matches\":[{\"file\":\"/workspace/src/llm.rs\",\"line\":12}]}}"
+    "observation": "{\"turn\":1,\"step\":1,\"to\":\"model\",\"facts\":{\"matches\":[{\"file\":\"/work/project/src/llm.rs\",\"line\":12}]}}"
   }
 }
 ```

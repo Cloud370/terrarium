@@ -4,7 +4,7 @@ use tokio::sync::watch;
 
 use crate::{
     add_mount, config, eval_js,
-    fs::Mount,
+    fs::{normalize_path, Mount},
     kernel::FACTS_CAP,
     llm,
     session::{project, turn_data, Event, Journal},
@@ -266,6 +266,7 @@ fn system_prompt(
         .replace("{{RUN_DEFAULT_MS}}", &timeout.to_string())
         .replace("{{RUN_CAP_MS}}", &MAX_TIMEOUT_MS.to_string())
         .replace("{{MODEL}}", &profile.model);
+    let root = normalize_path(root);
     format!(
         "{}\n\n<environment>\nWorking root: {}\n\n{}\n</environment>\n\n{}\n\n{}",
         role,
@@ -280,12 +281,12 @@ fn access_guidance(mounts: &[Mount]) -> String {
     if mounts.iter().any(|mount| mount.virtual_path() == "/") {
         let home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(|path| path.to_string_lossy().into_owned());
+            .map(|path| normalize_path(&path.to_string_lossy()));
         let home_note = home
             .map(|path| format!(" The current user's home directory is `{path}`."))
             .unwrap_or_default();
         format!(
-            "Filesystem root `/` is accessible. Use real absolute paths, including paths under the current user's home directory.{home_note} `~` is not expanded by JavaScript. If a path is denied, report the denial and do not retry the same path or invent another mount."
+            "Filesystem root `/` is accessible. Use real absolute paths, including paths under the current user's home directory.{home_note} Relative paths such as `Cargo.toml` are not valid host paths. `~` is not expanded by JavaScript. If a path is denied, report the denial and do not retry the same path or invent another mount."
         )
     } else {
         let roots = mounts
@@ -294,7 +295,7 @@ fn access_guidance(mounts: &[Mount]) -> String {
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "Accessible virtual roots: {roots}. The session working root is `/workspace`; use these virtual paths exactly. `~` is not expanded by JavaScript. If a requested path is outside these roots, report that it is not authorized and do not retry alternate spellings or invent another mount. The operator must authorize another location with `--mount` or `--full-access`."
+            "Accessible roots: {roots}. The session working root is the absolute path shown above; use these absolute paths exactly. Relative paths such as `Cargo.toml` are not valid host paths. `~` is not expanded by JavaScript. If a requested path is outside these roots, report that it is not authorized and do not retry alternate spellings or invent another mount. The operator must authorize another location with `--mount` or `--full-access`."
         )
     }
 }
@@ -307,11 +308,7 @@ fn invocation_mounts(
     let mut mounts = if access == AccessMode::Full {
         vec![Mount::new("/", "/", true)?]
     } else {
-        vec![Mount::new(
-            "/workspace",
-            root,
-            access == AccessMode::Workspace,
-        )?]
+        vec![Mount::new(root, root, access == AccessMode::Workspace)?]
     };
     for mount in explicit {
         if mounts.iter().any(|existing| existing.overlaps(&mount)) {
@@ -1212,11 +1209,20 @@ mod tests {
     fn restricted_access_keeps_explicit_mounts_for_the_invocation() {
         let workdir = std::env::temp_dir();
         let root_display = workdir.to_string_lossy().into_owned();
-        let extra = Mount::from_canonical("/outside", workdir, false).unwrap();
+        let extra = Mount::from_canonical("/outside", workdir.clone(), false).unwrap();
         let mounts = invocation_mounts(AccessMode::ReadOnly, &root_display, vec![extra]).unwrap();
+        let expected_root = Mount::new(&root_display, &workdir, false)
+            .unwrap()
+            .virtual_path()
+            .to_string();
+        let paths = mounts.iter().map(Mount::virtual_path).collect::<Vec<_>>();
+        assert!(paths.contains(&expected_root.as_str()), "{paths:?}");
+        assert!(paths.contains(&"/outside/"), "{paths:?}");
+        let absolute_file = format!("{root_display}/report.txt");
+        let canonical_workdir = workdir.canonicalize().unwrap();
         assert_eq!(
-            mounts.iter().map(Mount::virtual_path).collect::<Vec<_>>(),
-            ["/workspace/", "/outside/"]
+            crate::fs::resolve_mount(&mounts, &absolute_file).unwrap(),
+            canonical_workdir.join("report.txt")
         );
         let profile = llm::test_profile(
             "openai-chat-completions",
@@ -1224,7 +1230,10 @@ mod tests {
             "test-model",
         );
         let prompt = system_prompt(&profile, &root_display, 100, &mounts);
-        assert!(prompt.contains("/workspace, /outside"), "{prompt}");
+        let prompt_root = normalize_path(&root_display);
+        assert!(prompt.contains(&prompt_root), "{prompt}");
+        assert!(prompt.contains("/outside"), "{prompt}");
+        assert!(prompt.contains("Accessible roots"), "{prompt}");
         assert!(prompt.contains("--mount"), "{prompt}");
     }
 
@@ -1331,7 +1340,7 @@ mod tests {
         let observation = model_observation_with_writes(
             2,
             5,
-            &serde_json::json!({"to":"model","facts":{"path":"/workspace/report.txt"}}),
+            &serde_json::json!({"to":"model","facts":{"path":"/work/project/report.txt"}}),
             &outcome,
         );
         assert_eq!(
@@ -1340,7 +1349,7 @@ mod tests {
                 "turn": 2,
                 "step": 5,
                 "to": "model",
-                "facts": {"path": "/workspace/report.txt"}
+                "facts": {"path": "/work/project/report.txt"}
             })
         );
     }
@@ -1362,6 +1371,7 @@ mod tests {
         assert!(prompt.contains("The host owns turn and step coordinates"));
         assert!(prompt.contains("If the user explicitly requires an order"));
         assert!(prompt.contains("Information obtainable from the authorized environment"));
+        assert!(prompt.contains("Relative paths such as `Cargo.toml` are not valid host paths"));
         assert!(prompt.contains("A semantic interpretation required from the model"));
         assert!(prompt.contains("Input, permission, or a decision required from the user"));
         assert!(prompt.contains("A run may commit some writes before a later operation fails"));

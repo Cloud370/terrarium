@@ -46,6 +46,17 @@ pub struct Mount {
     pub(crate) rw: bool,
 }
 
+pub(crate) fn normalize_path(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        path.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string()
+    }
+}
+
 impl Mount {
     pub fn new(virt: impl Into<String>, root: impl AsRef<Path>, rw: bool) -> Result<Self, String> {
         let root = root
@@ -56,14 +67,24 @@ impl Mount {
     }
 
     pub(crate) fn from_canonical(virt: &str, root: PathBuf, rw: bool) -> Result<Self, String> {
-        if (virt != "/" && virt.len() < 2) || !virt.starts_with('/') || virt.contains("//") {
+        let virt = normalize_path(virt);
+        let virt = if virt == "/" {
+            "/".to_string()
+        } else {
+            virt.trim_end_matches('/').to_string()
+        };
+        let is_absolute = virt.starts_with('/') || Path::new(&virt).is_absolute();
+        if (virt != "/" && virt.len() < 2)
+            || !is_absolute
+            || (virt.contains("//") && !virt.starts_with("//"))
+        {
             return Err(format!(
-                "invalid mount virtual prefix {virt:?} (expected /name=…)"
+                "invalid mount path {virt:?} (expected an absolute path such as /name)"
             ));
         }
         if virt != "/" && virt.split('/').any(|part| part == "." || part == "..") {
             return Err(format!(
-                "invalid mount virtual prefix {virt:?} (dot segments are not allowed)"
+                "invalid mount path {virt:?} (dot segments are not allowed)"
             ));
         }
         Ok(Self {
@@ -124,12 +145,70 @@ impl Default for ScanOpts {
 const LINE_READ_CAP: usize = 2000; // read: per-line character cap — a minified file must not blow context
 static TMP_CTR: AtomicU64 = AtomicU64::new(0);
 
-/// Virtual path → (mount, relative remainder). Shared by every fs operation.
+fn absolute_mount_remainder(mount: &Mount, js_path: &str) -> Option<String> {
+    let mount_path = Path::new(mount.virt.trim_end_matches('/'));
+    if !mount_path.is_absolute() || mount_path.canonicalize().ok()?.as_path() != mount.root {
+        return None;
+    }
+    let path = Path::new(js_path);
+    if !path.is_absolute()
+        || (js_path.starts_with("///") || js_path[1..].contains("//"))
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return None;
+    }
+    if let Ok(canonical) = path.canonicalize() {
+        if !canonical.starts_with(&mount.root) {
+            return None;
+        }
+        let relative = canonical
+            .strip_prefix(&mount.root)
+            .ok()?
+            .to_string_lossy()
+            .into_owned();
+        return Some(normalize_path(&relative));
+    }
+    let parent = path.parent()?;
+    let tail = path.file_name()?;
+    let canonical_parent = parent.canonicalize().ok()?;
+    if !canonical_parent.starts_with(&mount.root) {
+        return None;
+    }
+    let relative = canonical_parent
+        .strip_prefix(&mount.root)
+        .ok()?
+        .join(tail)
+        .to_string_lossy()
+        .into_owned();
+    Some(normalize_path(&relative))
+}
+
+/// Configured path → (mount, relative remainder). Shared by every fs operation.
 /// Component-wise: mount /t owns "/t" and "/t/…" but never "/tmp2" — a textual prefix would
 /// silently misfile neighboring paths (and make /a vs /ab registration-order dependent).
 fn strip_mount<'a>(mounts: &'a [Mount], js_path: &str) -> Result<(&'a Mount, String), String> {
+    let js_path = normalize_path(js_path);
     for m in mounts {
         let virt = m.virt.trim_end_matches('/');
+        #[cfg(windows)]
+        if m.virt == "/" && Path::new(&js_path).is_absolute() && !js_path.starts_with('/') {
+            if js_path.contains("//")
+                || Path::new(&js_path).components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::CurDir | std::path::Component::ParentDir
+                    )
+                })
+            {
+                return Err(format!("invalid virtual path: {js_path}"));
+            }
+            return Ok((m, js_path.clone()));
+        }
         if js_path == virt || js_path == format!("{virt}/") {
             return Ok((m, String::new()));
         }
@@ -148,6 +227,9 @@ fn strip_mount<'a>(mounts: &'a [Mount], js_path: &str) -> Result<(&'a Mount, Str
             }
             return Ok((m, rel.to_string()));
         }
+        if let Some(rel) = absolute_mount_remainder(m, &js_path) {
+            return Ok((m, rel));
+        }
     }
     let avail: Vec<String> = mounts.iter().map(|m| m.virt.clone()).collect();
     Err(format!(
@@ -156,7 +238,7 @@ fn strip_mount<'a>(mounts: &'a [Mount], js_path: &str) -> Result<(&'a Mount, Str
     ))
 }
 
-/// Virtual path → real path; escapes (including .. chains, symlinks) are always rejected
+/// Configured path → real path; escapes (including .. chains, symlinks) are always rejected
 pub fn resolve_mount(mounts: &[Mount], js_path: &str) -> Result<PathBuf, String> {
     let (m, rel) = strip_mount(mounts, js_path)?;
     if rel.is_empty() {
@@ -561,7 +643,7 @@ impl<'js> rquickjs::IntoJs<'js> for ScanLine {
     }
 }
 
-/// One candidate file from the walker: real path to open, virtual path to report, size in bytes.
+/// One candidate file from the walker: real path to open, configured path to report, size in bytes.
 /// walk yields these as-is; scan opens `.real` and streams `.virt`'s lines.
 #[derive(Debug)]
 struct ScanFile {
@@ -593,7 +675,8 @@ fn open_tree(
     opts: ScanOpts,
     label: &'static str,
 ) -> Result<ScanState, String> {
-    let real = resolve_mount(mounts, js_path)?;
+    let js_path = normalize_path(js_path);
+    let real = resolve_mount(mounts, &js_path)?;
     let meta = std::fs::metadata(&real).map_err(|e| format!("{js_path}: {e}"))?;
     if !meta.is_dir() {
         return Err(format!(
@@ -878,7 +961,7 @@ fn scan_next_chunk(st: &mut ScanState) -> Result<Vec<ScanLine>, String> {
     Ok(lines)
 }
 
-/// One yielded file entry for walk: the virtual path and its size in bytes.
+/// One yielded file entry for walk: the configured path and its size in bytes.
 /// Deliberately not list-shaped — every entry IS a regular file, so a constant
 /// `type` field would be noise; counting yields counts files, by construction.
 #[derive(Debug)]
@@ -2106,6 +2189,48 @@ mod tests {
     }
 
     #[test]
+    fn absolute_mount_prefix_keeps_path_boundary() {
+        let root = tmp_root("absolute-prefix");
+        let prefix = root.to_string_lossy().into_owned();
+        let canonical_root = root.canonicalize().unwrap();
+        let mount = Mount::new(&prefix, &root, false).unwrap();
+        let mounts = [mount];
+        assert_eq!(
+            resolve_mount(&mounts, &format!("{prefix}/file.txt")).unwrap(),
+            canonical_root.join("file.txt")
+        );
+        assert!(resolve_mount(&mounts, &format!("{prefix}/../outside.txt")).is_err());
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn absolute_mount_accepts_case_spelling_used_by_the_filesystem() {
+        let root = tmp_root("case-spelling");
+        let prefix = root.to_string_lossy().into_owned();
+        let alternate: String = prefix
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_lowercase() {
+                    ch.to_ascii_uppercase()
+                } else if ch.is_ascii_uppercase() {
+                    ch.to_ascii_lowercase()
+                } else {
+                    ch
+                }
+            })
+            .collect();
+        if alternate == prefix || std::path::Path::new(&alternate).canonicalize().is_err() {
+            return;
+        }
+        std::fs::write(root.join("file.txt"), "case-insensitive").unwrap();
+        let mount = Mount::new(&prefix, &root, false).unwrap();
+        assert_eq!(
+            read_text(&[mount], &format!("{alternate}/file.txt")).unwrap(),
+            "case-insensitive"
+        );
+    }
+
+    #[test]
     fn strip_mount_is_component_wise() {
         let root = tmp_root("prefix");
         let ms = mounts_at(&root, false);
@@ -2159,6 +2284,17 @@ mod tests {
         assert!(err.contains("escapes mount root"), "{err}");
         assert!(read_window(&ms, "/t/leak.txt", 1, 5).is_err());
         assert_eq!(read_text(&ms, "/t/alias.txt").unwrap(), "top secret");
+        let prefix = root.to_string_lossy().into_owned();
+        let absolute_ms = [Mount::new(&prefix, &root, false).unwrap()];
+        let absolute_err = read_text(&absolute_ms, &format!("{prefix}/leak.txt")).unwrap_err();
+        assert!(
+            absolute_err.contains("escapes mount root"),
+            "{absolute_err}"
+        );
+        assert_eq!(
+            read_text(&absolute_ms, &format!("{prefix}/alias.txt")).unwrap(),
+            "top secret"
+        );
         // scan never follows symlinks (rg default without -L): outward or inward, links are skipped
         std::os::unix::fs::symlink(&outside, root.join("sub/evil")).unwrap();
         let mut st = scan_open(&ms, "/t", ScanOpts::default()).unwrap();

@@ -59,7 +59,7 @@ terrarium --resume SESSION_ID [--read-only | --full-access] [--mount /virtual=re
 terrarium run [-e SOURCE | FILE] [--read-only | --full-access] [--mount /virtual=real[:rw]] [--timeout-ms N]
 ```
 
-`workspace` is the default. `--read-only` and `--full-access` are mutually exclusive and apply only to the current invocation; they are never written to the session journal or restored from it. An explicit mount applies to the complete invocation, including every model-selected run and recovery. `--mount /virtual=real` is read-only; append `:rw` to authorize writes. In `--full-access`, `/` maps to the current user's real filesystem view. `terrarium run` is the direct JavaScript entry point and uses the same invocation-only access flags.
+`workspace` is the default. In this mode the current working root is mounted at its same absolute path. `--read-only` and `--full-access` are mutually exclusive and apply only to the current invocation; they are never written to the session journal or restored from it. An explicit mount applies to the complete invocation, including every model-selected run and recovery. `--mount /virtual=real` is read-only; append `:rw` to authorize writes. In `--full-access`, `/` maps to the current user's real filesystem view. `terrarium run` is the direct JavaScript entry point and uses the same invocation-only access flags.
 
 ## Declared model capabilities
 

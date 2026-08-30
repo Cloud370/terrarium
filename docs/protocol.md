@@ -33,7 +33,7 @@ A run has two data channels. Program-provided data enters the next model context
 
 Every program is wrapped and evaluated as one async function body. Top-level `return` and `await` are therefore legal in every run. The kernel does not infer execution mode from source shape and does not use an implicit last-expression result.
 
-Each run uses a fresh QuickJS runtime with a 64 MiB heap, 1 MiB stack, bounded stdout, bounded host reads, and a validated deadline. Filesystem capabilities are available only under mounts supplied by the operator. The agent invocation installs `/workspace` for the working root, or `/` for `--full-access`, plus any explicit `--mount` entries; that mount set is reused for every run in the invocation.
+Each run uses a fresh QuickJS runtime with a 64 MiB heap, 1 MiB stack, bounded stdout, bounded host reads, and a validated deadline. Filesystem capabilities are available only under mounts supplied by the operator. The agent invocation mounts its working root at the same absolute path, or installs `/` for `--full-access`, plus any explicit `--mount` entries; that mount set is reused for every run in the invocation.
 
 ## Run result
 
@@ -63,7 +63,7 @@ The direct `terrarium run` command accepts any JSON-compatible return value. Age
 
 ## Host error behavior
 
-Host calls reject with a useful error instead of silently producing an empty result. In particular, scan traversal, file opening, and UTF-8 decoding failures carry the virtual path. Scan option fields reject when their types are wrong. Hidden entries, symlinks, binary files, and `.gitignore` matches are intentional scan exclusions, not errors. `walk` shares scan's traversal engine and option set; it yields `{file, size}` entries and reports traversal failures only, since it never opens files.
+Host calls reject with a useful error instead of silently producing an empty result. In particular, scan traversal, file opening, and UTF-8 decoding failures carry the requested path. Scan option fields reject when their types are wrong. Hidden entries, symlinks, binary files, and `.gitignore` matches are intentional scan exclusions, not errors. `walk` shares scan's traversal engine and option set; it yields `{file, size}` entries and reports traversal failures only, since it never opens files.
 
 A failed JavaScript run produces a compact model observation containing turn and step coordinates, status, termination, timeout, elapsed time, a bounded error classification, and any write receipts committed before the failure. It does not automatically copy the returned value or stdout into model context. A successful `to: "model"` disposition produces an observation containing the same coordinates, its bounded facts, and any write receipts. A successful `to: "user"` disposition produces no model observation; the outer loop appends `turn/end` with `reason: "handed_off"` and prints the message.
 
