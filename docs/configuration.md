@@ -18,9 +18,20 @@ protocol = "openai-chat-completions"
 model = "anthropic/claude-sonnet-4"
 max_output_tokens = 32000
 reasoning_effort = "high"
+
+# DeepSeek's Anthropic-compatible endpoint works the same way:
+#
+# [providers.deepseek-anthropic]
+# base_url = "https://api.deepseek.com/anthropic"
+# api_key_env = "DEEPSEEK_API_KEY"
+#
+# [profiles.claude]
+# provider = "deepseek-anthropic"
+# protocol = "anthropic-messages"
+# model = "deepseek-v4-flash"
 ```
 
-Provider and profile names must match `[A-Za-z0-9][A-Za-z0-9._-]*`. Provider URLs must be HTTP or HTTPS and contain no credentials, query, or fragment; trailing slashes are normalized away. Unknown fields are errors. API key values are never accepted in configuration: `api_key_env` names the environment variable read only when a request is sent.
+`protocol` is one of `openai-chat-completions`, `openai-responses`, or `anthropic-messages`; each appends its own request path and auth headers to the provider `base_url`. Profiles may also set `request_timeout_ms` (whole-attempt budget, default 300000), `idle_timeout_ms` (longest gap between stream chunks, default 120000), and `context_window` (declared window in tokens, used for budget reporting). Provider and profile names must match `[A-Za-z0-9][A-Za-z0-9._-]*`. Provider URLs must be HTTP or HTTPS and contain no credentials, query, or fragment; trailing slashes are normalized away. Unknown fields are errors. API key values are never accepted in configuration: `api_key_env` names the environment variable read only when a request is sent.
 
 A new turn uses `--profile NAME` when supplied, otherwise the configured `default_profile`. A later turn without `--profile` copies the previous turn's frozen resolved profile, prompt, and limits. The profile is not changed while a turn is open.
 
@@ -35,6 +46,8 @@ When no TOML file is selected, these legacy variables remain supported:
 | `TERRARIUM_LLM_MODEL` | Exact model ID; defaults to `deepseek-v4-flash` |
 
 The binary does not load `.env` files. Credentials must already be present in the process environment or be supplied by an external secret manager. Keep secret files outside mounted directories.
+
+One diagnostic variable is supported across both configuration paths: setting `TERRARIUM_LLM_DEBUG` to any value other than `0` dumps every request body and each decoded SSE event to stderr. The dump shows no credential values — headers stay out of the log — but it does contain the full prompt and reasoning payloads, so it is a local debugging tool, not something to leave on or paste into shared logs.
 
 ## Access modes
 

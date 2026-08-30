@@ -491,11 +491,11 @@ fn process_model_result(
     request_seq: u64,
     turn: u64,
     step: u64,
-    content: String,
+    reply: llm::ModelReply,
     default_timeout: u64,
     max_timeout: u64,
 ) -> Result<(), String> {
-    let extracted = extract(&content);
+    let extracted = extract(&reply.content);
     let action = if let Some(message) = observation_for_extract(turn, step, &extracted) {
         serde_json::json!({"kind":"observation","message":message})
     } else if let Extracted::Run(program) = extracted {
@@ -507,11 +507,73 @@ fn process_model_result(
     } else {
         unreachable!()
     };
-    journal.append(
-        "model/result",
-        serde_json::json!({"requestSeq":request_seq,"ok":true,"content":content,"action":action}),
-    )?;
+    let mut data = serde_json::json!({
+        "requestSeq": request_seq,
+        "ok": true,
+        "content": reply.content,
+        "action": action,
+    });
+    data["usage"] = serde_json::to_value(reply.usage).expect("usage serializes");
+    if let Some(value) = reply.reasoning.as_ref().and_then(reasoning_json) {
+        data["reasoning"] = value;
+    }
+    journal.append("model/result", data)?;
     Ok(())
+}
+
+/// Journals reasoning within the schema caps. A blob whose text exceeds the
+/// cap is dropped whole rather than truncated: a mid-character byte cut would
+/// panic, a truncation marker would push the text past the journal's own
+/// limit, and a shortened Anthropic thinking text would no longer match its
+/// stored signature. An oversized replay payload alone is nulled — the text
+/// stays for forensics and the next turn simply replays nothing.
+fn reasoning_json(reasoning: &llm::ReasoningBlob) -> Option<serde_json::Value> {
+    if reasoning.text.len() > llm::REASONING_TEXT_CAP {
+        return None;
+    }
+    let replay = match serde_json::to_vec(&reasoning.replay) {
+        Ok(bytes) if bytes.len() <= llm::REASONING_REPLAY_CAP => reasoning.replay.clone(),
+        _ => serde_json::Value::Null,
+    };
+    Some(serde_json::json!({ "text": reasoning.text, "replay": replay }))
+}
+
+/// Streams deltas to stderr as a live operator preview. Thinking arrives
+/// dimmed so it reads as background; text is passed through raw.
+fn delta_preview(event: llm::DeltaEvent<'_>) {
+    use std::io::Write;
+    let mut stderr = std::io::stderr();
+    match event {
+        llm::DeltaEvent::Thinking(text) => {
+            let _ = write!(stderr, "\x1b[2m{text}\x1b[0m");
+        }
+        llm::DeltaEvent::Text(text) => {
+            let _ = write!(stderr, "{text}");
+        }
+    }
+    let _ = stderr.flush();
+}
+
+/// One operator-facing line per model call: token accounting plus the
+/// projected context footprint against the profile's declared window.
+fn report_usage(step: u64, usage: &llm::Usage, profile: &config::ResolvedProfile) {
+    let context = usage.context_tokens();
+    let budget = match profile.context_window {
+        Some(window) if window > 0 => {
+            let pct = (context as f64 / window as f64 * 100.0).round() as u64;
+            let flag = if pct >= 85 { " ⚠ near limit" } else { "" };
+            format!(" · context {context}/{window} tok ({pct}%){flag}")
+        }
+        _ => format!(" · context {context} tok"),
+    };
+    eprintln!(
+        "⟡ step {step} · in {} tok (cache read {}, write {}) · out {} tok{}",
+        usage.input_tokens,
+        usage.cache_read_tokens,
+        usage.cache_write_tokens,
+        usage.output_tokens,
+        budget
+    );
 }
 
 fn turn_timeouts(turn: &Event) -> (u64, u64) {
@@ -537,8 +599,10 @@ async fn model_attempt(
     )?;
     let messages = project(&journal.events, request_seq);
     let profile = profile_from_turn(turn);
-    match llm::complete(&profile, messages).await {
-        Ok(content) => {
+    match llm::stream(&profile, messages, &mut delta_preview).await {
+        Ok(reply) => {
+            eprintln!();
+            report_usage(step, &reply.usage, &profile);
             let limits = turn_timeouts(turn);
             let turn_number = journal
                 .events
@@ -550,13 +614,16 @@ async fn model_attempt(
                 request_seq,
                 turn_number,
                 step,
-                content,
+                reply,
                 limits.0,
                 limits.1,
             )
         }
         Err(error) => {
-            journal.append("model/result", transport_model_result(request_seq, attempt, &error))?;
+            journal.append(
+                "model/result",
+                transport_model_result(request_seq, attempt, &error),
+            )?;
             Ok(())
         }
     }
@@ -1027,15 +1094,11 @@ mod tests {
         let mounts = invocation_mounts(AccessMode::Full, "/tmp", Vec::new()).unwrap();
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].virtual_path(), "/");
-        let profile = config::ResolvedProfile {
-            name: "test".into(),
-            protocol: "openai-chat-completions".into(),
-            base_url: "https://example.test".into(),
-            api_key_env: None,
-            model: "test-model".into(),
-            max_output_tokens: None,
-            reasoning_effort: None,
-        };
+        let profile = llm::test_profile(
+            "openai-chat-completions",
+            "https://example.test",
+            "test-model",
+        );
         let prompt = system_prompt(&profile, "/tmp", 100, &mounts);
         assert!(prompt.contains("Filesystem root"), "{prompt}");
         assert!(prompt.contains("do not retry"), "{prompt}");
@@ -1044,15 +1107,11 @@ mod tests {
     #[test]
     fn prompt_starts_with_main_instructions_and_uses_ai_identity() {
         let mounts = invocation_mounts(AccessMode::Full, "/tmp", Vec::new()).unwrap();
-        let profile = config::ResolvedProfile {
-            name: "test".into(),
-            protocol: "openai-chat-completions".into(),
-            base_url: "https://example.test".into(),
-            api_key_env: None,
-            model: "deepseek-v4-flash".into(),
-            max_output_tokens: None,
-            reasoning_effort: None,
-        };
+        let profile = llm::test_profile(
+            "openai-chat-completions",
+            "https://example.test",
+            "deepseek-v4-flash",
+        );
         let prompt = system_prompt(&profile, "/tmp", 100, &mounts);
         assert!(prompt.starts_with("<main_instructions>"), "{prompt}");
         assert!(prompt.contains("You are an AI assistant."), "{prompt}");
@@ -1157,15 +1216,11 @@ mod tests {
             mounts.iter().map(Mount::virtual_path).collect::<Vec<_>>(),
             ["/workspace/", "/outside/"]
         );
-        let profile = config::ResolvedProfile {
-            name: "test".into(),
-            protocol: "openai-chat-completions".into(),
-            base_url: "https://example.test".into(),
-            api_key_env: None,
-            model: "test-model".into(),
-            max_output_tokens: None,
-            reasoning_effort: None,
-        };
+        let profile = llm::test_profile(
+            "openai-chat-completions",
+            "https://example.test",
+            "test-model",
+        );
         let prompt = system_prompt(&profile, "/tmp", 100, &mounts);
         assert!(prompt.contains("/workspace, /outside"), "{prompt}");
         assert!(prompt.contains("--mount"), "{prompt}");
@@ -1291,15 +1346,11 @@ mod tests {
     #[test]
     fn prompt_distinguishes_recoverable_errors_from_user_handoff() {
         let mounts = invocation_mounts(AccessMode::Full, "/tmp", Vec::new()).unwrap();
-        let profile = config::ResolvedProfile {
-            name: "test".into(),
-            protocol: "openai-chat-completions".into(),
-            base_url: "https://example.test".into(),
-            api_key_env: None,
-            model: "test-model".into(),
-            max_output_tokens: None,
-            reasoning_effort: None,
-        };
+        let profile = llm::test_profile(
+            "openai-chat-completions",
+            "https://example.test",
+            "test-model",
+        );
         let prompt = system_prompt(&profile, "/tmp", 100, &mounts);
         assert!(prompt.contains("A session is a durable conversation"));
         assert!(prompt.contains("A turn is one user request and stays open while you work"));

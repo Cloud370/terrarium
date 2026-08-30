@@ -29,6 +29,9 @@ pub struct ProfileConfig {
     pub model: String,
     pub max_output_tokens: Option<u64>,
     pub reasoning_effort: Option<String>,
+    pub request_timeout_ms: Option<u64>,
+    pub idle_timeout_ms: Option<u64>,
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -45,6 +48,12 @@ pub struct ResolvedProfile {
     pub max_output_tokens: Option<u64>,
     #[serde(rename = "reasoningEffort", skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    #[serde(rename = "requestTimeoutMs", skip_serializing_if = "Option::is_none")]
+    pub request_timeout_ms: Option<u64>,
+    #[serde(rename = "idleTimeoutMs", skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_ms: Option<u64>,
+    #[serde(rename = "contextWindow", skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 impl Config {
@@ -93,7 +102,7 @@ impl Config {
                     profile.provider
                 ));
             }
-            if profile.protocol != "openai-chat-completions" {
+            if !crate::llm::protocol_supported(&profile.protocol) {
                 return Err(format!(
                     "profiles.{name}.protocol is unsupported: {:?}",
                     profile.protocol
@@ -112,6 +121,15 @@ impl Config {
                     return Err(format!(
                         "profiles.{name}.reasoning_effort must be low, medium, or high"
                     ));
+                }
+            }
+            for (field, value) in [
+                ("request_timeout_ms", profile.request_timeout_ms),
+                ("idle_timeout_ms", profile.idle_timeout_ms),
+                ("context_window", profile.context_window),
+            ] {
+                if value == Some(0) {
+                    return Err(format!("profiles.{name}.{field} must be positive"));
                 }
             }
         }
@@ -135,6 +153,9 @@ impl Config {
             model: profile.model.clone(),
             max_output_tokens: profile.max_output_tokens,
             reasoning_effort: profile.reasoning_effort.clone(),
+            request_timeout_ms: profile.request_timeout_ms,
+            idle_timeout_ms: profile.idle_timeout_ms,
+            context_window: profile.context_window,
         })
     }
 }
@@ -235,6 +256,9 @@ pub fn load(explicit: Option<&Path>) -> Result<Config, String> {
             model,
             max_output_tokens: None,
             reasoning_effort: None,
+            request_timeout_ms: None,
+            idle_timeout_ms: None,
+            context_window: None,
         },
     );
     let config = Config {
@@ -280,5 +304,40 @@ reasoning_effort = "high"
             "https://example.test/v1"
         );
         assert!(Config::parse("version=1\ndefault_profile=\"x\"\n[providers.p]\nbase_url=\"https://x.test\"\n[profiles.x]\nprovider=\"p\"\nprotocol=\"openai-chat-completions\"\nmodel=\"m\"\nunknown=1").is_err());
+    }
+
+    #[test]
+    fn accepts_all_three_protocols_and_transport_knobs() {
+        for protocol in ["openai-responses", "anthropic-messages"] {
+            let c = Config::parse(&format!(
+                r#"
+version = 1
+default_profile = "main"
+[providers.p]
+base_url = "https://example.test"
+[profiles.main]
+provider = "p"
+protocol = "{protocol}"
+model = "m"
+request_timeout_ms = 60000
+idle_timeout_ms = 5000
+context_window = 131072
+"#
+            ))
+            .unwrap();
+            let resolved = c.resolve("main").unwrap();
+            assert_eq!(resolved.protocol, protocol);
+            assert_eq!(resolved.request_timeout_ms, Some(60_000));
+            assert_eq!(resolved.idle_timeout_ms, Some(5_000));
+            assert_eq!(resolved.context_window, Some(131_072));
+        }
+        assert!(Config::parse(
+            "version=1\ndefault_profile=\"x\"\n[providers.p]\nbase_url=\"https://x.test\"\n[profiles.x]\nprovider=\"p\"\nprotocol=\"grpc\"\nmodel=\"m\""
+        )
+        .is_err());
+        assert!(Config::parse(
+            "version=1\ndefault_profile=\"x\"\n[providers.p]\nbase_url=\"https://x.test\"\n[profiles.x]\nprovider=\"p\"\nprotocol=\"openai-responses\"\nmodel=\"m\"\nrequest_timeout_ms=0"
+        )
+        .is_err());
     }
 }

@@ -163,6 +163,8 @@ This phase only declares these model capabilities. The outer model request paylo
 
 The preferred configuration is a strict TOML file at `$XDG_CONFIG_HOME/terrarium/config.toml`, or `~/.config/terrarium/config.toml` on Unix when `XDG_CONFIG_HOME` is unset. Pass another file with `--config PATH`. Credentials are referenced by environment-variable name and are never stored in the session.
 
+Profiles select one of three wire protocols — `openai-chat-completions`, `openai-responses`, or `anthropic-messages` (DeepSeek's Anthropic-compatible endpoint works via `base_url = "https://api.deepseek.com/anthropic"`). Every call streams over server-sent events under a per-attempt total timeout and an inter-chunk idle timeout, both configurable per profile. Assistant reasoning is journaled with each result and replayed on later requests in the protocol's own shape (assistant `reasoning_content` for Chat Completions, encrypted reasoning items for Responses, signed thinking blocks for Anthropic). Per-request token usage — net input, output, cache read/write — is journaled and reported as a context-budget line against the profile's declared `context_window`.
+
 If no TOML file is selected, the legacy `TERRARIUM_LLM_API_KEY`, `TERRARIUM_LLM_BASE_URL`, and `TERRARIUM_LLM_MODEL` variables remain supported as a compatibility fallback. The binary does not load `.env` files.
 
 ## Repository layout
@@ -170,7 +172,7 @@ If no TOML file is selected, the legacy `TERRARIUM_LLM_API_KEY`, `TERRARIUM_LLM_
 - `src/lib.rs`, `src/kernel.rs` — reusable kernel boundary and one fresh cage per run
 - `src/main.rs`, `src/cli.rs` — process and terminal adapters
 - `src/agent.rs` — outer agent loop and run-fence parser
-- `src/fs.rs`, `src/llm.rs`, `src/registry.rs` — host capabilities and live API registry
+- `src/fs.rs`, `src/llm/`, `src/registry.rs` — host capabilities, streaming three-protocol model transport, and the live API registry
 - `src/prompts/`, `src/runtime/` — embedded model prompt and JavaScript runtime assets
 - `docs/` — maintained design, protocol, configuration, security, and integration notes
 

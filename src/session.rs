@@ -282,13 +282,23 @@ fn validate_profile(value: &Value, seq: u64) -> Result<(), String> {
     exact_keys(
         profile,
         &["name", "protocol", "baseUrl", "model"],
-        &["apiKeyEnv", "maxOutputTokens", "reasoningEffort"],
+        &[
+            "apiKeyEnv",
+            "maxOutputTokens",
+            "reasoningEffort",
+            "requestTimeoutMs",
+            "idleTimeoutMs",
+            "contextWindow",
+        ],
         seq,
         "profile",
     )?;
     string_field(profile, "name", seq, "profile")?;
-    if string_field(profile, "protocol", seq, "profile")? != "openai-chat-completions" {
-        return Err(format!("event {seq} profile.protocol is unsupported"));
+    let protocol = string_field(profile, "protocol", seq, "profile")?;
+    if !crate::llm::protocol_supported(protocol) {
+        return Err(format!(
+            "event {seq} profile.protocol is unsupported: {protocol:?}"
+        ));
     }
     string_field(profile, "baseUrl", seq, "profile")?;
     string_field(profile, "model", seq, "profile")?;
@@ -298,13 +308,18 @@ fn validate_profile(value: &Value, seq: u64) -> Result<(), String> {
             return Err(format!("event {seq} profile.apiKeyEnv must not be empty"));
         }
     }
-    if profile
-        .get("maxOutputTokens")
-        .is_some_and(|value| value.as_u64().is_none_or(|number| number == 0))
-    {
-        return Err(format!(
-            "event {seq} profile.maxOutputTokens must be positive"
-        ));
+    for field in [
+        "maxOutputTokens",
+        "requestTimeoutMs",
+        "idleTimeoutMs",
+        "contextWindow",
+    ] {
+        if profile
+            .get(field)
+            .is_some_and(|value| value.as_u64().is_none_or(|number| number == 0))
+        {
+            return Err(format!("event {seq} profile.{field} must be positive"));
+        }
     }
     if let Some(effort) = profile.get("reasoningEffort") {
         if !matches!(effort.as_str(), Some("low" | "medium" | "high")) {
@@ -335,6 +350,64 @@ fn validate_disposition(value: &Value, seq: u64) -> Result<(), String> {
                 "event {seq} has unsupported run disposition target {to:?}"
             ))
         }
+    }
+    Ok(())
+}
+
+fn validate_usage(value: &Value, seq: u64) -> Result<(), String> {
+    const KEYS: &[&str] = &[
+        "inputTokens",
+        "outputTokens",
+        "cacheReadTokens",
+        "cacheWriteTokens",
+        "reasoningTokens",
+    ];
+    let usage = object(value, seq, "model/result usage")?;
+    exact_keys(usage, KEYS, &[], seq, "model/result usage")?;
+    for &key in KEYS {
+        if usage.get(key).and_then(Value::as_u64).is_none() {
+            return Err(format!(
+                "event {seq} model/result usage.{key} must be a non-negative integer"
+            ));
+        }
+    }
+    Ok(())
+}
+
+// Derived from the transport's caps so the writer and the validator can
+// never disagree: the journal rejects exactly what the transport refuses
+// to emit.
+const REASONING_TEXT_LIMIT: usize = crate::llm::REASONING_TEXT_CAP;
+const REASONING_REPLAY_LIMIT: usize = crate::llm::REASONING_REPLAY_CAP;
+
+fn validate_reasoning(value: &Value, seq: u64) -> Result<(), String> {
+    let reasoning = object(value, seq, "model/result reasoning")?;
+    exact_keys(
+        reasoning,
+        &["text", "replay"],
+        &[],
+        seq,
+        "model/result reasoning",
+    )?;
+    let text = string_field(reasoning, "text", seq, "model/result reasoning")?;
+    if text.len() > REASONING_TEXT_LIMIT {
+        return Err(format!(
+            "event {seq} model/result reasoning.text exceeds the {REASONING_TEXT_LIMIT}-byte limit"
+        ));
+    }
+    let replay = reasoning.get("replay").expect("validated key");
+    if !replay.is_null() && !replay.is_object() {
+        return Err(format!(
+            "event {seq} model/result reasoning.replay must be an object or null"
+        ));
+    }
+    if serde_json::to_vec(replay)
+        .map(|bytes| bytes.len() > REASONING_REPLAY_LIMIT)
+        .unwrap_or(true)
+    {
+        return Err(format!(
+            "event {seq} model/result reasoning.replay exceeds the {REASONING_REPLAY_LIMIT}-byte limit"
+        ));
     }
     Ok(())
 }
@@ -484,7 +557,7 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
             exact_keys(
                 data,
                 &["requestSeq", "ok"],
-                &["content", "action", "error"],
+                &["content", "action", "error", "usage", "reasoning"],
                 event.seq,
                 "model/result data",
             )?;
@@ -527,7 +600,7 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
                 exact_keys(
                     data,
                     &["requestSeq", "ok", "content", "action"],
-                    &[],
+                    &["usage", "reasoning"],
                     event.seq,
                     "model/result data",
                 )?;
@@ -567,6 +640,12 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
                         ))
                     }
                 }
+                if let Some(usage) = data.get("usage") {
+                    validate_usage(usage, event.seq)?;
+                }
+                if let Some(reasoning) = data.get("reasoning") {
+                    validate_reasoning(reasoning, event.seq)?;
+                }
             } else {
                 exact_keys(
                     data,
@@ -590,6 +669,7 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
                         | "transport"
                         | "http"
                         | "protocol"
+                        | "timeout"
                         | "cancelled"
                         | "interrupted"
                 ) {
@@ -959,32 +1039,61 @@ pub fn turn_data(
     })
 }
 
-pub fn project(events: &[Event], before_seq: u64) -> Vec<Value> {
+/// Projects the journaled conversation into protocol-neutral messages. Failed
+/// attempts are excluded so a retry rebuilds byte-identical input. Assistant
+/// reasoning captured by the transport is restored here so the active protocol
+/// codec can replay it in whatever shape it requires.
+pub fn project(events: &[Event], before_seq: u64) -> Vec<crate::llm::NeutralMessage> {
+    use crate::llm::{NeutralMessage, ReasoningBlob, Role};
     let start = events
         .iter()
         .rfind(|event| event.kind == "turn/start" && event.seq < before_seq)
         .expect("turn start before request");
-    let mut messages = vec![serde_json::json!({
-        "role": "system",
-        "content": start.data["systemPrompt"]
-    })];
+    let mut messages = vec![NeutralMessage {
+        role: Role::System,
+        content: start.data["systemPrompt"]
+            .as_str()
+            .unwrap_or_default()
+            .into(),
+        reasoning: None,
+    }];
+    let reasoning_of = |event: &Event| {
+        let data = &event.data["reasoning"];
+        (!data.is_null()).then(|| ReasoningBlob {
+            text: data["text"].as_str().unwrap_or_default().into(),
+            replay: data["replay"].clone(),
+        })
+    };
     for event in events.iter().filter(|event| event.seq < before_seq) {
         match event.kind.as_str() {
-            "turn/start" => messages.push(serde_json::json!({
-                "role": "user",
-                "content": event.data["message"]
-            })),
+            "turn/start" => messages.push(NeutralMessage {
+                role: Role::User,
+                content: event.data["message"].as_str().unwrap_or_default().into(),
+                reasoning: None,
+            }),
             "model/result" if event.data["ok"].as_bool() == Some(true) => {
                 if let Some(content) = event.data["content"].as_str() {
-                    messages.push(serde_json::json!({"role":"assistant", "content": content}));
+                    messages.push(NeutralMessage {
+                        role: Role::Assistant,
+                        content: content.into(),
+                        reasoning: reasoning_of(event),
+                    });
                 }
                 if let Some(message) = event.data["action"]["message"].as_str() {
-                    messages.push(serde_json::json!({"role":"user", "content": message}));
+                    messages.push(NeutralMessage {
+                        role: Role::User,
+                        content: message.into(),
+                        reasoning: None,
+                    });
                 }
             }
             "run/result" => {
                 if let Some(observation) = event.data["observation"].as_str() {
-                    messages.push(serde_json::json!({"role":"user", "content": observation}));
+                    messages.push(NeutralMessage {
+                        role: Role::User,
+                        content: observation.into(),
+                        reasoning: None,
+                    });
                 }
             }
             _ => {}
@@ -1005,15 +1114,7 @@ mod tests {
     static STATE_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_profile() -> ResolvedProfile {
-        ResolvedProfile {
-            name: "test".into(),
-            protocol: "openai-chat-completions".into(),
-            base_url: "https://example.test".into(),
-            api_key_env: None,
-            model: "test-model".into(),
-            max_output_tokens: None,
-            reasoning_effort: None,
-        }
+        crate::llm::test_profile("openai-chat-completions", "https://example.test", "test-model")
     }
 
     fn test_state_home() -> std::path::PathBuf {
@@ -1107,11 +1208,14 @@ mod tests {
             },
         ];
         let projection = project(&events, 5);
-        assert!(projection.iter().any(|message| message["content"].as_str()
-            == Some("{\"turn\":1,\"step\":1,\"to\":\"model\",\"facts\":{\"count\":2}}")));
+        assert!(projection
+            .iter()
+            .any(|message| message.role == crate::llm::Role::User
+                && message.content
+                    == "{\"turn\":1,\"step\":1,\"to\":\"model\",\"facts\":{\"count\":2}}"));
         assert!(!projection
             .iter()
-            .any(|message| message["content"] == "private handoff"));
+            .any(|message| message.content == "private handoff"));
     }
 
     #[test]
@@ -1218,8 +1322,105 @@ mod tests {
             },
         ];
         let projection = project(&events, 6);
-        assert_eq!(projection[0]["content"], "new-system");
+        assert_eq!(projection[0].content, "new-system");
         assert_eq!(projection.len(), 3);
+    }
+
+    #[test]
+    fn successful_results_may_carry_usage_and_reasoning() {
+        let _guard = STATE_LOCK.lock().unwrap();
+        let (mut journal, state) = test_journal();
+        start(&mut journal);
+        journal
+            .append("model/request", serde_json::json!({"step":1,"attempt":1}))
+            .unwrap();
+        journal
+            .append(
+                "model/result",
+                serde_json::json!({
+                    "requestSeq": 2,
+                    "ok": true,
+                    "content": "```run\nreturn {}\n```",
+                    "action": {"kind":"run","source":"return {}\n","timeoutMs":1},
+                    "usage": {"inputTokens":10,"outputTokens":5,"cacheReadTokens":4,"cacheWriteTokens":0,"reasoningTokens":2},
+                    "reasoning": {"text":"pondered","replay":{"protocol":"openai-chat-completions","field":"reasoning_content"}}
+                }),
+            )
+            .unwrap();
+        journal
+            .append("model/request", serde_json::json!({"step":2,"attempt":1}))
+            .unwrap();
+        let projection = project(&journal.events, 5);
+        let assistant = projection
+            .iter()
+            .find(|message| message.role == crate::llm::Role::Assistant)
+            .expect("assistant message");
+        let reasoning = assistant.reasoning.as_ref().expect("reasoning restored");
+        assert_eq!(reasoning.text, "pondered");
+        assert_eq!(
+            reasoning.replay,
+            serde_json::json!({"protocol":"openai-chat-completions","field":"reasoning_content"})
+        );
+        drop(journal);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn malformed_usage_and_reasoning_are_rejected() {
+        let _guard = STATE_LOCK.lock().unwrap();
+        let (mut journal, state) = test_journal();
+        start(&mut journal);
+        journal
+            .append("model/request", serde_json::json!({"step":1,"attempt":1}))
+            .unwrap();
+        for data in [
+            serde_json::json!({
+                "requestSeq": 2, "ok": true, "content": "hi",
+                "action": {"kind":"observation","message":"m"},
+                "usage": {"inputTokens":1}
+            }),
+            serde_json::json!({
+                "requestSeq": 2, "ok": true, "content": "hi",
+                "action": {"kind":"observation","message":"m"},
+                "reasoning": {"text":"t"}
+            }),
+            serde_json::json!({
+                "requestSeq": 2, "ok": true, "content": "hi",
+                "action": {"kind":"observation","message":"m"},
+                "reasoning": {"text":"t","replay":"not-an-object"}
+            }),
+        ] {
+            let result = validate_event(
+                &Event {
+                    kind: "model/result".into(),
+                    seq: 3,
+                    ts: None,
+                    data,
+                },
+                &journal.events,
+            );
+            assert!(result.is_err());
+        }
+        // The timeout kind itself is legal; only the duplicate-result rule
+        // rejects the loop above because they share requestSeq.
+        journal
+            .append("model/request", serde_json::json!({"step":2,"attempt":1}))
+            .unwrap();
+        assert!(validate_event(
+            &Event {
+                kind: "model/result".into(),
+                seq: 5,
+                ts: None,
+                data: serde_json::json!({
+                    "requestSeq": 3, "ok": false,
+                    "error": {"kind":"timeout","message":"request exceeded the budget","retryable":true}
+                }),
+            },
+            &journal.events,
+        )
+        .is_ok());
+        drop(journal);
+        fs::remove_dir_all(state).unwrap();
     }
 
     #[test]

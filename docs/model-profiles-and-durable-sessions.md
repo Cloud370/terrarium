@@ -170,7 +170,7 @@ Version 1 includes:
 
 - one versioned TOML configuration file;
 - named providers and profiles;
-- one built-in OpenAI Chat Completions protocol;
+- three built-in wire protocols: OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages;
 - text input and text output only;
 - optional `low`, `medium`, or `high` reasoning effort;
 - deterministic profile resolution when a turn begins;
@@ -262,6 +262,9 @@ Profile fields are:
 | `model` | yes | Exact upstream model ID |
 | `max_output_tokens` | no | Positive requested output-token limit |
 | `reasoning_effort` | no | `low`, `medium`, or `high` |
+| `request_timeout_ms` | no | Positive whole-attempt budget for one model call (default 300000) |
+| `idle_timeout_ms` | no | Positive gap allowed between stream chunks before the attempt fails (default 120000) |
+| `context_window` | no | Positive declared context window in tokens, used for budget reporting only |
 
 Provider and profile names must match:
 
@@ -285,13 +288,15 @@ The core uses provider-neutral values equivalent to:
 
 ```text
 ModelRequest
-|-- messages: ordered text role/content messages
+|-- messages: ordered text role/content messages, each optionally carrying reasoning
 |-- model
 |-- max_output_tokens | absent
 `-- reasoning_effort | absent
 
 ModelResponse
-`-- content: text
+|-- content: text
+|-- reasoning | absent  (text plus a protocol-tagged opaque replay payload)
+`-- usage: input, output, cache-read, cache-write, and reasoning token counts
 ```
 
 A protocol owns:
@@ -305,25 +310,27 @@ A protocol owns:
 The shared transport owns:
 
 - the HTTP client;
-- one-attempt timeout;
-- concurrency limits;
+- the per-attempt total timeout and the inter-chunk idle timeout;
+- SSE byte decoding;
 - response body limits;
 - credential lookup;
 - bounded error presentation.
 
 One transport call attempts at most one network dispatch and never retries. A failure before dispatch and a failure after dispatch both belong to the same durable attempt. After a crash, Terrarium does not claim it can distinguish them.
 
-The initial protocol identifier is `openai-chat-completions`. It sends requests to:
+All three protocols stream over server-sent events. Each request is encoded from the neutral projection, and each stream is decoded into text deltas, reasoning deltas, and a final usage snapshot:
 
-```text
-{normalized base_url}/chat/completions
-```
+| Protocol | Path | Auth | Reasoning replay | Reasoning enablement |
+|---|---|---|---|---|
+| `openai-chat-completions` | `{base}/chat/completions` | bearer | assistant `reasoning_content` field (DeepSeek style; the emitting field name is remembered) | `reasoning_effort` when configured |
+| `openai-responses` | `{base}/responses` | bearer | stored reasoning items replayed verbatim into `input`, with `store: false` and `include: ["reasoning.encrypted_content"]` | `reasoning: {effort, summary}` when configured |
+| `anthropic-messages` | `{base}/v1/messages` | `x-api-key` + `anthropic-version` | `{type: "thinking", thinking, signature}` blocks; `redacted_thinking` replays its opaque data; unsigned thinking is dropped rather than leaked as text | `thinking: {type: "enabled", budget_tokens}` when configured (low/medium/high map to 2048/8192/16384) |
 
-It uses bearer authentication only when `api_key_env` is present, sends non-streaming text messages, sends the configured model ID unchanged, maps an optional `max_output_tokens` to `max_tokens`, and sends `reasoning_effort` only when configured.
+Chat Completions maps `max_output_tokens` to `max_tokens`, Responses to `max_output_tokens`, and Anthropic requires `max_tokens` (defaulting to 8192 when unset). Chat Completions requests `stream_options: {include_usage: true}`.
 
-It reads string content from the first assistant choice. Tool calls, streaming, provider-managed conversation state, multimodal content, and private chain-of-thought fields are unsupported.
+Reasoning replay payloads are tagged with the protocol that produced them. A session resumed under a different protocol or model skips foreign payloads instead of corrupting the request. Provider usage objects are normalized to net input tokens (cache shares subtracted), cache-read and cache-write tokens, output tokens, and reasoning tokens.
 
-An explicit reasoning effort must either be encoded by the selected protocol or make the profile invalid. It is never silently dropped.
+Tool calls, provider-managed conversation state, and multimodal content are unsupported. An explicit reasoning effort must either be encoded by the selected protocol or make the profile invalid. It is never silently dropped.
 
 ## 7. Profile selection and turn snapshots
 
@@ -366,6 +373,9 @@ api_key_env | absent
 model
 max_output_tokens | absent
 reasoning_effort | absent
+request_timeout_ms | absent
+idle_timeout_ms | absent
+context_window | absent
 ```
 
 The provider name has already served its configuration purpose and is not repeated. The API key value is never stored.
@@ -538,6 +548,8 @@ For a valid run:
 }
 ```
 
+A successful result also carries the transport's accounting: a `usage` object (`inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `reasoningTokens`, all net of cache double counting) and, when the provider emitted reasoning, a `reasoning` object with the thinking `text` and the protocol-tagged opaque `replay` payload. Both are optional so pre-existing journals remain valid.
+
 For an invalid run fence, the action stores the exact observation that will be shown to the model:
 
 ```json
@@ -576,7 +588,7 @@ Parsing and observation formatting occur before writing the result because they 
 }
 ```
 
-Stable error kinds are `configuration`, `transport`, `http`, `protocol`, `cancelled`, and `interrupted`.
+Stable error kinds are `configuration`, `transport`, `http`, `protocol`, `timeout`, `cancelled`, and `interrupted`. `timeout` covers both the whole-attempt budget and the inter-chunk idle deadline; both are retryable on attempt 1.
 
 A retryable failure on attempt 1 permits attempt 2 for the same step. Attempt 2 is final even when its error remains retryable.
 
@@ -698,7 +710,7 @@ Reasons are:
 Only events before the request are considered. Projection starts with the current turn's exact stored `systemPrompt`, then traverses prior events in `seq` order and emits:
 
 - each `turn/start.data.message` as a user message;
-- each successful `model/result.data.content` as an assistant message;
+- each successful `model/result.data.content` as an assistant message, restoring its stored `reasoning` so the active protocol replays it in its own shape;
 - each `model/result.data.action.message` as a protocol observation;
 - each `run/result.data.observation` as a run or recovery observation.
 
@@ -711,7 +723,7 @@ Projection excludes:
 
 Because a failed attempt contributes no conversation message and no other conversation event may occur between attempts, attempt 2 reconstructs the exact input used by attempt 1 without storing a second message copy or context identifier.
 
-Version 1 does not truncate, summarize, or compact history. If a provider rejects an oversized request, Terrarium reports the error. A future compaction feature must add explicit state rather than rewrite history.
+Version 1 does not truncate, summarize, or compact history. Each model call reports the projected context footprint (input plus cache plus output tokens against the profile's declared `context_window`) to the operator and journals the per-request usage, but takes no automatic action. If a provider rejects an oversized request, Terrarium reports the error. A future compaction feature must add explicit state rather than rewrite history.
 
 ## 11. Step execution and retry
 
@@ -923,9 +935,8 @@ Version 1 does not include:
 - provider/model catalogs compiled into Terrarium;
 - profile inheritance, merging, includes, or overlays;
 - arbitrary provider headers or raw vendor JSON;
-- context-window metadata or automatic context management;
+- automatic context management or compaction;
 - image, video, audio, or artifact transport;
-- streaming responses or token events;
 - changing the profile inside an open turn;
 - persisting, inferring, or restoring an access mode from session data;
 - replaying JavaScript with an unknown outcome;

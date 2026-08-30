@@ -71,7 +71,9 @@ A failed JavaScript run produces a compact model observation containing turn and
 
 The main model request is owned by the trusted outer agent loop. Each request uses the current turn's frozen resolved profile and is persisted as `model/request` before one network dispatch; a retryable attempt-1 failure may create exactly one attempt 2. Failed model results are not projected into later model-visible history.
 
-JavaScript has no `host.llm.call` or other in-program model-call primitive. The host surface is filesystem capabilities plus the tagged return protocol for continuing or handing off a turn. The configured model ID is sent unchanged to the OpenAI-compatible endpoint.
+Requests stream over server-sent events under three wire protocols — `openai-chat-completions`, `openai-responses`, and `anthropic-messages` — with a per-attempt total timeout and an inter-chunk idle timeout. Assistant reasoning (DeepSeek-style `reasoning_content`, Responses encrypted reasoning items, or Anthropic signed thinking blocks) is journaled with each successful `model/result` and replayed on every later request in the shape its protocol requires; foreign payloads are skipped when a session resumes under a different protocol. Per-request token usage (net input, output, cache read, cache write, reasoning) is journaled alongside it and reported as a context-budget line against the profile's declared `context_window`.
+
+JavaScript has no `host.llm.call` or other in-program model-call primitive. The host surface is filesystem capabilities plus the tagged return protocol for continuing or handing off a turn. The configured model ID is sent unchanged to the provider endpoint.
 
 The built-in capability declaration says `deepseek-v4-flash` accepts text input only, while `deepseek-v4-flash-vision-exp` declares text and image input. The latter declaration does not enable image payloads yet.
 
