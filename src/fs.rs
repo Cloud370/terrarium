@@ -1356,11 +1356,13 @@ mod tests {
     fn filesystem_root_mount_accepts_absolute_paths() {
         let mount = Mount::from_canonical("/", PathBuf::from("/"), true).unwrap();
         assert_eq!(mount.virtual_path(), "/");
-        assert_eq!(
-            resolve_mount(std::slice::from_ref(&mount), "/"),
-            Ok(PathBuf::from("/"))
-        );
-        assert_eq!(resolve_mount(&[mount], "/tmp"), Ok(PathBuf::from("/tmp")));
+        // The resolved root is canonical (\\?\D:\ on Windows) and an existing tail is
+        // canonicalized too (/tmp → /private/tmp on macOS) while a missing one passes
+        // through, so containment is the property stable on every platform.
+        let root = resolve_mount(std::slice::from_ref(&mount), "/").unwrap();
+        assert!(root.is_absolute(), "{root:?}");
+        let resolved = resolve_mount(&[mount], "/tmp").unwrap();
+        assert!(resolved.starts_with(&root), "{resolved:?} escapes {root:?}");
     }
     #[test]
     fn mount_paths_reject_ambiguous_components() {

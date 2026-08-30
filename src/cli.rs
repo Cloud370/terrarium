@@ -189,10 +189,11 @@ mod tests {
         assert!(parse_run_args(&["-e".into(), "return 1".into(), "file.js".into()]).is_err());
         assert!(parse_run_args(&["--timeout-ms".into()]).is_err());
         assert!(parse_run_args(&["--read-only".into(), "--full-access".into()]).is_err());
+        let mount_spec = format!("/data={}", std::env::temp_dir().display());
         let parsed = parse_run_args(&[
             "--read-only".into(),
             "--mount".into(),
-            "/data=/tmp".into(),
+            mount_spec,
             "-e".into(),
             "return 1".into(),
         ])

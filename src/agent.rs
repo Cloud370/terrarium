@@ -1210,8 +1210,10 @@ mod tests {
 
     #[test]
     fn restricted_access_keeps_explicit_mounts_for_the_invocation() {
-        let extra = Mount::from_canonical("/outside", std::env::temp_dir(), false).unwrap();
-        let mounts = invocation_mounts(AccessMode::ReadOnly, "/tmp", vec![extra]).unwrap();
+        let workdir = std::env::temp_dir();
+        let root_display = workdir.to_string_lossy().into_owned();
+        let extra = Mount::from_canonical("/outside", workdir, false).unwrap();
+        let mounts = invocation_mounts(AccessMode::ReadOnly, &root_display, vec![extra]).unwrap();
         assert_eq!(
             mounts.iter().map(Mount::virtual_path).collect::<Vec<_>>(),
             ["/workspace/", "/outside/"]
@@ -1221,7 +1223,7 @@ mod tests {
             "https://example.test",
             "test-model",
         );
-        let prompt = system_prompt(&profile, "/tmp", 100, &mounts);
+        let prompt = system_prompt(&profile, &root_display, 100, &mounts);
         assert!(prompt.contains("/workspace, /outside"), "{prompt}");
         assert!(prompt.contains("--mount"), "{prompt}");
     }

@@ -1440,9 +1440,11 @@ mod tests {
         drop(file);
         let reopened = Journal::open(&id).unwrap();
         assert_eq!(reopened.events.len(), 1);
+        // Windows range locks are mandatory: the journal must be dropped before
+        // another handle may read the file.
+        drop(reopened);
         let bytes = fs::read(&path).unwrap();
         assert!(bytes.ends_with(b"\n"));
-        drop(reopened);
         fs::remove_dir_all(state).unwrap();
     }
 
