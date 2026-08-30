@@ -1218,7 +1218,10 @@ mod tests {
         let paths = mounts.iter().map(Mount::virtual_path).collect::<Vec<_>>();
         assert!(paths.contains(&expected_root.as_str()), "{paths:?}");
         assert!(paths.contains(&"/outside/"), "{paths:?}");
-        let absolute_file = format!("{root_display}/report.txt");
+        let absolute_file = format!(
+            "{}/report.txt",
+            normalize_path(&root_display).trim_end_matches('/')
+        );
         let canonical_workdir = workdir.canonicalize().unwrap();
         assert_eq!(
             crate::fs::resolve_mount(&mounts, &absolute_file).unwrap(),
