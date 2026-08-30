@@ -127,13 +127,12 @@ impl ThinkingBlock {
     /// would reject (unsigned or empty thinking, empty redactions).
     fn to_wire(&self) -> Option<Value> {
         match self {
-            ThinkingBlock::Thinking { text, signature } => {
-                (!text.is_empty() && !signature.trim().is_empty()).then(|| {
-                    json!({ "type": "thinking", "thinking": text, "signature": signature })
-                })
+            ThinkingBlock::Thinking { text, signature } => (!text.is_empty()
+                && !signature.trim().is_empty())
+            .then(|| json!({ "type": "thinking", "thinking": text, "signature": signature })),
+            ThinkingBlock::Redacted { data } => {
+                (!data.is_empty()).then(|| json!({ "type": "redacted_thinking", "data": data }))
             }
-            ThinkingBlock::Redacted { data } => (!data.is_empty())
-                .then(|| json!({ "type": "redacted_thinking", "data": data })),
         }
     }
 }
@@ -621,7 +620,7 @@ mod tests {
                 content: "unstamped".into(),
                 reasoning: Some(ReasoningBlob {
                     text: "old shape".into(),
-                    replay: json!({"protocol":"anthropic-messages","signature":"OLD=="})
+                    replay: json!({"protocol":"anthropic-messages","signature":"OLD=="}),
                 }),
             },
             NeutralMessage {

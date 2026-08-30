@@ -1114,7 +1114,11 @@ mod tests {
     static STATE_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_profile() -> ResolvedProfile {
-        crate::llm::test_profile("openai-chat-completions", "https://example.test", "test-model")
+        crate::llm::test_profile(
+            "openai-chat-completions",
+            "https://example.test",
+            "test-model",
+        )
     }
 
     fn test_state_home() -> std::path::PathBuf {
