@@ -45,31 +45,26 @@ When no TOML file is selected, these legacy variables remain supported:
 | `TERRARIUM_LLM_BASE_URL` | OpenAI-compatible service root or legacy `/chat/completions` endpoint |
 | `TERRARIUM_LLM_MODEL` | Exact model ID; defaults to `deepseek-v4-flash` |
 
-The binary does not load `.env` files. Credentials must already be present in the process environment or be supplied by an external secret manager. Keep secret files outside mounted directories.
+The binary does not load `.env` files. Credentials must already be present in the process environment or be supplied by an external secret manager. Reads use the operating-system user's view, so keep secret files outside directories the model is asked to work in.
 
 One diagnostic variable is supported across both configuration paths: setting `TERRARIUM_LLM_DEBUG` to any value other than `0` dumps every request body and each decoded SSE event to stderr. The dump shows no credential values — headers stay out of the log — but it does contain the full prompt and reasoning payloads, so it is a local debugging tool, not something to leave on or paste into shared logs.
 
-## Access modes
+## Filesystem modes
 
 The model-driven agent is the default command:
 
 ```sh
-terrarium [--config PATH] [--profile NAME] [--read-only | --full-access] [--mount /virtual=real[:rw]] [message...]
-terrarium --resume SESSION_ID [--read-only | --full-access] [--mount /virtual=real[:rw]] [message...]
-terrarium run [-e SOURCE | FILE] [--read-only | --full-access] [--mount /virtual=real[:rw]] [--timeout-ms N]
+terrarium [--config PATH] [--profile NAME] [--read-only | --full-access | --allow-write DIR|FILE]... [--max-steps N] [--run-timeout-ms N] [message...]
+terrarium --resume SESSION_ID [--read-only | --full-access | --allow-write DIR|FILE]... [message...]
+terrarium run [-e SOURCE | FILE] [--read-only | --full-access | --allow-write DIR|FILE]... [--timeout-ms N]
 ```
 
-`workspace` is the default. In this mode the current working root is mounted at its same absolute path. `--read-only` and `--full-access` are mutually exclusive and apply only to the current invocation; they are never written to the session journal or restored from it. An explicit mount applies to the complete invocation, including every model-selected run and recovery. `--mount /virtual=real` is read-only; append `:rw` to authorize writes. In `--full-access`, `/` maps to the current user's real filesystem view. `terrarium run` is the direct JavaScript entry point and uses the same invocation-only access flags.
+`planned-write` is the agent default: each run's writes require preauthorization through the `access` block (see [protocol.md](protocol.md)), with targets already covered by an `--allow-write` scope never prompting. `--read-only` denies every write. `--full-access` removes the scope check, keeping only path validation and the current operating-system user's own permissions — it is the explicit trusted path for debugging, not a privilege escalation; it does not bypass OS permissions. `--allow-write` may be repeated and accepts one existing absolute directory (recursive prefix) or file (exact target) per flag; it cannot be combined with `--read-only` or `--full-access`, and combining those two is itself an error. Mode and write scopes apply only to the current invocation; they are never written to the session journal or restored from it.
 
-## Declared model capabilities
+Direct `terrarium run` defaults to `read-only`: `--full-access` is the explicit trusted path, and `--allow-write DIR|FILE` scopes switch the invocation to `planned-write` with writes confined to those scopes — there is no model access block in direct mode.
 
-The runtime keeps a small built-in capability declaration for the current examples:
+## Request payload
 
-| Model | Input | Output | Implemented request payload |
-|---|---|---|---|
-| `deepseek-v4-flash` | text | text | text |
-| `deepseek-v4-flash-vision-exp` | text, image | text | text |
-
-The second model's image capability is intentionally only a declaration in this phase. Image reading, base64/data URLs, artifact storage, and multimodal request parts are not implemented.
+Requests are text-only; image file reading, base64/data URLs, artifact storage, and multimodal content parts are not implemented.
 
 Provider responses are bounded at 4 MiB before JSON parsing. The transport performs no hidden retry; the agent journal authorizes at most one retry for a model step.

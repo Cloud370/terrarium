@@ -110,27 +110,27 @@ A new local session binds its working root to the process working directory from
 - a user-facing absolute path used in prompts, observations, and answers;
 - a canonical host path used only for containment and authority checks.
 
-The default filesystem mount uses the user-facing absolute path as its path prefix. The model and user therefore speak about the same paths, while the host may still canonicalize symlinks and platform aliases internally. Resuming from another shell directory never changes the stored working root.
+There is no virtual path namespace: programs use the operating-system user's absolute paths directly, and the runtime-state block names the session working root so the model and user speak about the same paths. The host canonicalizes symlinks and platform aliases internally for identity checks. Resuming from another shell directory never changes the stored working root.
 
-The session working root is one stable resource identity for the life of the session. Version 1 does not persist attachment registries, dynamic mount sets, virtual path aliases, or per-directory ACLs. A task that fundamentally belongs to another root starts another session.
+The session working root is one stable resource identity for the life of the session. Version 1 does not persist attachment registries, write scopes, virtual path aliases, or per-directory ACLs. A task that fundamentally belongs to another root starts another session.
 
-An invocation may add explicit mounts with `--mount /virtual=real[:rw]`; these mounts are selected by the trusted host and remain available to every run in that invocation, but are not stored in the journal. The default mount uses the session working root's own absolute path, so user messages and model programs use the same path. `--full-access` installs `/ -> /`, allowing real absolute paths visible to the current operating-system user, including paths outside the session working root. JavaScript does not expand `~`; the prompt names the available roots. A denied path is an authorization result, not a cue to guess alternate paths or invent mounts.
+Each invocation selects one filesystem mode — `read-only`, `planned-write` (the agent default), or `full-access` — plus optional operator `--allow-write DIR|FILE` scopes in `planned-write`. These are selected by the trusted host and remain fixed for that invocation, but are not stored in the journal. In `planned-write`, a run's writes are preauthorized through the `access` block; see `filesystem-authorization.md`. `--full-access` allows real absolute paths visible to the current operating-system user, including paths outside the session working root. JavaScript does not expand `~`; the runtime-state block names the working root. A denied path is an authorization result, not a cue to guess alternate paths or invent scopes.
 
 Direct `terrarium run` execution creates no session. Its transient working root is the process working directory for that invocation and is never persisted.
 
 ### 2.10 Keep invocation access coarse and honest
 
-Each process invocation selects one access mode:
+Each process invocation selects one filesystem mode (the normative contract is `filesystem-authorization.md`):
 
-| Mode | Filesystem authority | Other host capabilities |
+| Mode | Reads | Writes |
 |---|---|---|
-| `read_only` | Read below the invocation working root | Operations must preserve the read-only claim |
-| `workspace` | Read and write below the invocation working root | Operations must be genuinely constrained to that boundary |
-| `full` | Files available to the current operating-system user | Operations that require unrestricted host access may proceed |
+| `read-only` | OS-readable absolute paths | every write denied |
+| `planned-write` (agent default) | OS-readable absolute paths | per-run preauthorized exact files plus operator `--allow-write` scopes |
+| `full-access` | OS-readable absolute paths | any valid path, subject to OS permissions |
 
-`workspace` is the default for every invocation. `--read-only` selects `read_only`; `--full-access` selects `full`; the flags are mutually exclusive. The mode belongs to the trusted host invocation, not to the session, turn, journal, prompt, or model. Resuming a session does not restore or imply a previous invocation's authority.
+The mode belongs to the trusted host invocation, not to the session, turn, journal, prompt, or model. Resuming a session does not restore or imply a previous invocation's authority.
 
-The name `full` is intentionally broader than "all files." A future unrestricted shell or external-process capability can escape a working directory through absolute paths, subprocesses, hooks, build scripts, environment access, or networking. Such an operation may succeed only in `full` mode unless Terrarium can enforce the `workspace` or `read_only` boundary with a real operating-system or container sandbox. A current working directory and a command allowlist are not security boundaries.
+The name `full-access` is intentionally broader than "scoped files." A future unrestricted shell or external-process capability can escape any scope through subprocesses, hooks, build scripts, environment access, or networking. Such an operation may succeed only in `full-access` unless Terrarium can enforce the narrower boundary with a real operating-system or container sandbox. A write-scope check alone is not a security boundary for hostile execution.
 
 Full access remains bounded by the operating-system user, run deadlines, resource budgets, and the capabilities installed by the host. It is not root access and does not remove execution limits. Version 1 does not implement shell or external-process execution; this rule fixes the permission boundary before such a capability exists.
 
@@ -158,9 +158,9 @@ The generated host contract exposes `host.fs.list(dir)` as sorted objects with `
 
 **Run** is one fenced Terrarium JavaScript program selected by a successful model response.
 
-**Working root** is the root used by the default filesystem mount and to resolve relative program paths. An agent session binds it when the session is created: its user-facing absolute path is shared by the model and user, while its canonical host path is used for containment checks. A direct `terrarium run` invocation uses its current process directory transiently.
+**Working root** is the directory the session is anchored to. An agent session binds it when the session is created: its user-facing absolute path is named in the runtime-state block shared by the model and user, while its canonical host path is used for identity checks. A direct `terrarium run` invocation uses its current process directory transiently. Programs always use absolute paths; the working root is context, not a containment boundary for reads.
 
-**Access mode** is the invocation-wide `read_only`, `workspace`, or `full` host policy. It constrains the complete host capability set, not only filesystem calls, and is never restored from session data.
+**Filesystem mode** is the invocation-wide `read-only`, `planned-write`, or `full-access` host policy, plus operator write scopes in `planned-write`. It governs writes and is never restored from session data.
 
 **State reconstruction** means reducing stored events into session state and model-visible conversation. It never means reissuing a completed request or re-executing historical JavaScript.
 
@@ -181,8 +181,8 @@ Version 1 includes:
 - continuation of interrupted open turns;
 - conservative recovery that never repeats an uncertain run;
 - one working root bound to the session at creation;
-- one invocation-wide `read_only`, `workspace`, or `full` access mode that is never loaded from the journal;
-- restoration of the working root through the existing `Mount` validation boundary for root-scoped filesystem access;
+- one invocation-wide `read-only`, `planned-write`, or `full-access` filesystem mode (plus operator write scopes) that is never loaded from the journal;
+- validation of the working root through the existing identity-resolution boundary for the session's display context;
 - the model-driven agent as the default CLI entry point and `terrarium run` as the direct JavaScript entry point.
 
 Version 1 excludes unused capability metadata. There is no context-window, image-modality, or video-modality field until Terrarium has context management or non-text payloads that consume those values.
@@ -338,13 +338,14 @@ Tool calls, provider-managed conversation state, and multimodal content are unsu
 
 A new local session records the current working directory as its working root. A normal new session therefore needs no path argument.
 
-The invocation selects its access mode independently:
+The invocation selects its filesystem mode independently:
 
-1. `--read-only` -> `read_only`;
-2. `--full-access` -> `full`;
-3. otherwise `workspace`.
+1. `--read-only` -> `read-only`;
+2. `--full-access` -> `full-access`;
+3. `--allow-write DIR|FILE` (repeatable) -> `planned-write` with those operator scopes;
+4. otherwise `planned-write` with no operator scopes (agent) or `read-only` (direct run).
 
-`--read-only` and `--full-access` are mutually exclusive. The selected mode is not written to the session.
+`--read-only`, `--full-access`, and `--allow-write` cannot be combined. The selected mode and scopes are not written to the session.
 
 The new session selects its first profile from:
 
@@ -387,11 +388,11 @@ The resolved profile is intentionally repeated in each turn. Sessions have few t
 When a completed session receives another user message:
 
 - with `--profile NAME`, Terrarium loads current config, resolves the named profile, renders the system prompt from current prompt assets, and stores the new snapshot;
-- without `--profile`, Terrarium copies the previous turn's selected and resolved profile and turn limits, then renders the new turn's prompt with the current invocation's authorized roots; it does not read config;
+- without `--profile`, Terrarium copies the previous turn's selected and resolved profile and turn limits; the system prompt stays byte-stable and the current invocation's runtime state rides on user messages; it does not read config;
 
-The system prompt describes the stable program contract, working root, and the authorized roots for the current invocation. It does not grant authority: access checks remain host policy, and the prompt is refreshed for a new turn when the invocation's mount set changes. Access denials are observable host results, not prompt policy. This keeps adoption of current model configuration and prompt assets explicit while allowing every invocation to enforce its own access mode.
+The system prompt is byte-stable: the same role text and host contract for every invocation, with no interpolated mode, path, or model value. Per-invocation facts — working root, filesystem mode, default run timeout, installed capabilities — travel in the `<terrarium-runtime-state>` block at the head of each user message and never grant authority: access checks remain host policy. Access denials are observable host results, not prompt policy. This keeps adoption of current model configuration and prompt assets explicit while allowing every invocation to enforce its own filesystem mode.
 
-On resume, `--config` is valid only together with `--profile` while starting a new turn. `--read-only` and `--full-access` select the current invocation policy whether Terrarium continues an open turn or starts a new one; they never mutate journal state. Other invalid combinations are usage errors.
+On resume, `--config` is valid only together with `--profile` while starting a new turn. `--read-only`, `--full-access`, and `--allow-write` select the current invocation's filesystem mode whether Terrarium continues an open turn or starts a new one; they never mutate journal state. Other invalid combinations are usage errors.
 
 The journal version covers the event schema, conversation projection, protocol codec semantics, run-fence semantics, and host contract required to continue a session. A binary that cannot honor that version may inspect the file but must refuse execution.
 
@@ -421,7 +422,7 @@ The first physical line is the session header:
 
 The header is not an event and has no `seq`. `displayPath` is an absolute path in the local user's naming context and must be representable as a JSON string. `canonicalPath` is the path produced by host canonicalization when the session is created.
 
-Resume validates the stored directory through the existing `Mount` construction boundary. It fails if the root no longer exists, resolves to a different canonical location, is not a directory, or cannot be represented on the current host. Terrarium does not silently adopt the current shell directory, retarget the root, or rewrite stored paths.
+Resume validates the stored directory by re-resolving its identity. It fails if the root no longer exists, resolves to a different canonical location, is not a directory, or cannot be represented on the current host. Terrarium does not silently adopt the current shell directory, retarget the root, or rewrite stored paths.
 
 The stored root identifies the session's working context; it grants no access by itself. The current invocation decides whether that root is read-only or writable and whether full host capabilities are authorized. A future Web or multi-user service maps the session to a server-authorized project or isolated worker and must not activate an uploaded host path merely because a journal contains it.
 
@@ -760,13 +761,13 @@ After a successful `to: "model"` step, or after a recoverable protocol or run er
 Conceptual CLI forms are:
 
 ```sh
-terrarium [--config PATH] [--profile NAME] [--read-only | --full-access] [--mount /virtual=real[:rw]] <message...>
-terrarium --resume SESSION_ID [--read-only | --full-access] [--mount /virtual=real[:rw]]
-terrarium --resume SESSION_ID [--config PATH] [--profile NAME] [--read-only | --full-access] [--mount /virtual=real[:rw]] <message...>
-terrarium run [-e SOURCE | FILE] [--read-only | --full-access] [--mount /virtual=real[:rw]] [--timeout-ms N]
+terrarium [--config PATH] [--profile NAME] [--read-only | --full-access | --allow-write DIR|FILE]... <message...>
+terrarium --resume SESSION_ID [--read-only | --full-access | --allow-write DIR|FILE]...
+terrarium --resume SESSION_ID [--config PATH] [--profile NAME] [--read-only | --full-access | --allow-write DIR|FILE]... <message...>
+terrarium run [-e SOURCE | FILE] [--read-only | --full-access | --allow-write DIR|FILE]... [--timeout-ms N]
 ```
 
-The main command is always the model-driven agent. Message arguments are joined as text; Terrarium does not reinterpret an existing path as a task file. With no message, non-terminal stdin may supply the message. Explicit `--mount /virtual=real[:rw]` entries apply to every run in that invocation. In `--full-access`, `/` exposes real absolute paths subject to the current operating-system user's permissions; JavaScript does not expand `~`, so the model must use the actual absolute home path shown in the prompt. `terrarium run` is the only direct JavaScript entry point: it reads source from `-e`, one file, or non-terminal stdin, creates no durable session, and emits one structured outcome.
+The main command is always the model-driven agent. Message arguments are joined as text; Terrarium does not reinterpret an existing path as a task file. With no message, non-terminal stdin may supply the message. The filesystem mode flags apply to every run in that invocation. In `--full-access`, writes need only valid paths and the current operating-system user's permissions; JavaScript does not expand `~`, so the model must use the actual absolute home path named in the runtime state. `terrarium run` is the only direct JavaScript entry point: it reads source from `-e`, one file, or non-terminal stdin, creates no durable session, defaults to read-only, and emits one structured outcome.
 
 Rules are:
 
@@ -776,7 +777,7 @@ Rules are:
 - resume with a message requires the previous turn to be closed and starts a new turn;
 - `--profile` is valid only while starting a new turn;
 - the stored working root, prompt, profile, and limits belong to the session or open turn; the access mode belongs only to the current invocation;
-- when no access flag is supplied, every new or resumed invocation uses `workspace`, regardless of modes used by earlier invocations;
+- when no mode flag is supplied, every new or resumed agent invocation uses `planned-write` with no operator scopes, regardless of modes used by earlier invocations;
 - completed turns are never reopened;
 - the session ID is printed to stderr when a session is created, leaving stdout as the answer channel.
 
@@ -850,7 +851,7 @@ API key values exist only in host process memory and request headers. They never
 
 The journal may contain user prompts, source code, paths, model responses, program output, and answers. Version 1 adds no journal-specific permission policy, encryption, redaction, signing, or tamper detection. Protecting ordinary application-state files is the operating environment's responsibility, not part of durable-session semantics.
 
-For the local CLI, the stored working root is trusted same-user application context: editing it can make the next default `workspace` invocation target another directory available to that operating-system user. It is still not an access-mode grant, and it is not portable authority. A future service must replace local host-path trust with a server-controlled session-to-project or session-to-worker binding.
+For the local CLI, the stored working root is trusted same-user application context: editing it can make the next default invocation name another directory in its runtime state. It is still not an authority grant, and it is not portable authority. A future service must replace local host-path trust with a server-controlled session-to-project or session-to-worker binding.
 
 ## 15. Acceptance requirements
 
@@ -873,10 +874,10 @@ All acceptance tests use a local mock HTTP server. No real third-party model ser
 - A new local session stores the absolute display path and canonical path of its creation directory as one working root.
 - Resume from another process directory keeps the stored root and never silently retargets it.
 - Model programs use the same absolute working-root paths shown to the user, and user-facing observations and answers do not introduce an unrelated virtual namespace.
-- `workspace` is the default independently on every agent or direct-run invocation.
-- `--read-only` and `--full-access` are mutually exclusive and never appear in the session header, turn data, or events.
-- Editing a journal cannot select `read_only`, `workspace`, or `full`; the live host policy decides every operation.
-- An unrestricted shell or external-process operation is denied outside `full` unless a real sandbox constrains it to the narrower mode.
+- `planned-write` is the default on every agent invocation; direct run defaults to `read-only`.
+- `--read-only`, `--full-access`, and `--allow-write` never combine and never appear in the session header, turn data, or events.
+- Editing a journal cannot select a filesystem mode or write scope; the live host policy decides every operation.
+- An unrestricted shell or external-process operation is denied outside `full-access` unless a real sandbox constrains it to the narrower mode.
 - `terrarium <message...>` enters the model-driven agent and never guesses that a message naming an existing file is a task file.
 - `terrarium run` executes JavaScript from exactly one of `-e`, a source file, or non-terminal stdin without creating a session; its transient working root is the invocation's current directory.
 
@@ -898,8 +899,8 @@ All acceptance tests use a local mock HTTP server. No real third-party model ser
 - No binding registry, profile catalog, or binding hash is required.
 - API key values never appear in the journal.
 - The session header stores one stable working root and no access mode or permission grant.
-- The stored working root is validated through the existing `Mount` boundary, but the current invocation decides its effective authority.
-- `workspace` is the default for every invocation; `--read-only` and `--full-access` never persist into the journal.
+- The stored working root is validated by identity resolution, but the current invocation decides the effective filesystem mode and write scopes.
+- `planned-write` is the agent default; the mode flags and `--allow-write` scopes never persist into the journal.
 - A second writer cannot interleave events.
 
 ### 15.5 Recovery
@@ -909,8 +910,8 @@ All acceptance tests use a local mock HTTP server. No real third-party model ser
 - A malformed complete line is rejected.
 - An unmatched attempt 1 is marked interrupted and advances to attempt 2 at the same step.
 - An unmatched attempt 2 is marked interrupted and terminates the turn.
-- A saved run action without `run/start` executes once under the current invocation policy.
-- Resuming the same open turn under `workspace`, `read_only`, or `full` never changes journal state and never grants authority from stored data.
+- A saved run action without `run/start` re-derives its `run/access` decision under the current invocation policy and executes at most once.
+- Resuming the same open turn under any filesystem mode never changes journal state and never grants authority from stored data.
 - A host denial during recovered execution is stored as an ordinary run result and the source is not retried automatically.
 - A run with durable `run/start` and no result is never re-executed.
 - A stored run outcome or protocol observation continues without regenerating its text.
@@ -952,7 +953,7 @@ For users:
 ```text
 configure providers and profiles once
 start the agent in the directory that defines the session's working root
-use workspace access by default, or select read-only or full access for this invocation
+use planned-write by default, or select read-only, full access, or operator write scopes for this invocation
 resume by session ID without retargeting the working root or restoring old permissions
 use terrarium run only for direct JavaScript execution and testing
 ```
@@ -970,10 +971,10 @@ For the runtime:
 
 ```text
 Config -> one resolved turn profile
-Host invocation -> read_only | workspace | full (never journaled)
+Host invocation -> read-only | planned-write | full-access (+ write scopes, never journaled)
 Session header -> one stable working root
                -> step -> visible attempt 1 -> optional attempt 2 -> model result
-                       -> optional run under live host policy -> run result
+                       -> optional run/access decision -> run under frozen authority -> run result
                -> append-only JSONL
 ```
 

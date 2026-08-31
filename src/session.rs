@@ -615,13 +615,57 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
                     "run" => {
                         exact_keys(
                             action,
-                            &["kind", "source", "timeoutMs"],
+                            &["kind", "source", "timeoutMs", "access"],
                             &[],
                             event.seq,
                             "run action",
                         )?;
                         string_field(action, "source", event.seq, "run action")?;
                         positive_u64(action, "timeoutMs", event.seq, "run action")?;
+                        let access = object(
+                            action.get("access").unwrap(),
+                            event.seq,
+                            "run action access",
+                        )?;
+                        exact_keys(
+                            access,
+                            &["writes", "reason"],
+                            &[],
+                            event.seq,
+                            "run action access",
+                        )?;
+                        let writes =
+                            access
+                                .get("writes")
+                                .and_then(Value::as_array)
+                                .ok_or_else(|| {
+                                    format!(
+                                    "event {} run action access.writes must be an array of strings",
+                                    event.seq
+                                )
+                                })?;
+                        if writes.len() > crate::auth::MAX_WRITE_TARGETS {
+                            return Err(format!(
+                                "event {} run action access.writes exceeds the 32-target limit",
+                                event.seq
+                            ));
+                        }
+                        for entry in writes {
+                            if entry.as_str().is_none() {
+                                return Err(format!(
+                                    "event {} run action access.writes must contain only strings",
+                                    event.seq
+                                ));
+                            }
+                        }
+                        let reason =
+                            string_field(access, "reason", event.seq, "run action access")?;
+                        if reason.chars().count() > crate::auth::ACCESS_REASON_CHARS {
+                            return Err(format!(
+                                "event {} run action access.reason exceeds the 200-character limit",
+                                event.seq
+                            ));
+                        }
                     }
                     "observation" => {
                         exact_keys(
@@ -729,6 +773,126 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
                     "event {} duplicates run start for model result {result_seq}",
                     event.seq
                 ));
+            }
+            if let Some(access) = prior.iter().find(|item| {
+                item.kind == "run/access"
+                    && item.data["modelResultSeq"].as_u64() == Some(result_seq)
+            }) {
+                if matches!(
+                    access.data["decision"].as_str(),
+                    Some("deny" | "cancel" | "unavailable" | "invalid")
+                ) {
+                    return Err(format!(
+                        "event {} starts a run whose access request was not authorized",
+                        event.seq
+                    ));
+                }
+            }
+        }
+        "run/access" => {
+            let data = object(&event.data, event.seq, "run/access data")?;
+            exact_keys(
+                data,
+                &["decision", "writes", "reason", "modelResultSeq"],
+                &["observation"],
+                event.seq,
+                "run/access data",
+            )?;
+            let result_seq = positive_u64(data, "modelResultSeq", event.seq, "run/access data")?;
+            let result = prior
+                .iter()
+                .find(|item| item.seq == result_seq && item.kind == "model/result")
+                .ok_or_else(|| {
+                    format!(
+                        "event {} references missing model result {result_seq}",
+                        event.seq
+                    )
+                })?;
+            let current_turn_seq = prior
+                .iter()
+                .rfind(|item| item.kind == "turn/start")
+                .map(|item| item.seq)
+                .unwrap_or(0);
+            if result.seq <= current_turn_seq {
+                return Err(format!(
+                    "event {} references a model result from another turn",
+                    event.seq
+                ));
+            }
+            if result.data["ok"].as_bool() != Some(true) || result.data["action"]["kind"] != "run" {
+                return Err(format!(
+                    "event {} references a model result without a run action",
+                    event.seq
+                ));
+            }
+            if prior.iter().any(|item| {
+                item.kind == "run/access"
+                    && item.data["modelResultSeq"].as_u64() == Some(result_seq)
+            }) {
+                return Err(format!(
+                    "event {} duplicates access decision for model result {result_seq}",
+                    event.seq
+                ));
+            }
+            if prior.iter().any(|item| {
+                item.kind == "run/start" && item.data["modelResultSeq"].as_u64() == Some(result_seq)
+            }) {
+                return Err(format!(
+                    "event {} decides access after the run already started",
+                    event.seq
+                ));
+            }
+            let decision = string_field(data, "decision", event.seq, "run/access data")?;
+            let blocking = matches!(decision, "deny" | "cancel" | "unavailable" | "invalid");
+            if !blocking && !matches!(decision, "allow" | "covered" | "declared") {
+                return Err(format!(
+                    "event {} has unsupported access decision {decision:?}",
+                    event.seq
+                ));
+            }
+            let writes = data
+                .get("writes")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    format!(
+                        "event {} run/access writes must be an array of strings",
+                        event.seq
+                    )
+                })?;
+            if writes.len() > crate::auth::MAX_WRITE_TARGETS {
+                return Err(format!(
+                    "event {} run/access writes exceeds the 32-target limit",
+                    event.seq
+                ));
+            }
+            for entry in writes {
+                if entry.as_str().is_none() {
+                    return Err(format!(
+                        "event {} run/access writes must contain only strings",
+                        event.seq
+                    ));
+                }
+            }
+            let reason = string_field(data, "reason", event.seq, "run/access data")?;
+            if reason.chars().count() > crate::auth::ACCESS_REASON_CHARS {
+                return Err(format!(
+                    "event {} run/access reason exceeds the 200-character limit",
+                    event.seq
+                ));
+            }
+            if blocking && data.get("observation").and_then(Value::as_str).is_none() {
+                return Err(format!(
+                    "event {} blocking access decision needs an observation",
+                    event.seq
+                ));
+            }
+            if let Some(observation) = data.get("observation") {
+                if observation.as_str().is_none() {
+                    return Err(format!(
+                        "event {} run/access observation must be a string",
+                        event.seq
+                    ));
+                }
             }
         }
         "run/result" => {
@@ -1087,6 +1251,15 @@ pub fn project(events: &[Event], before_seq: u64) -> Vec<crate::llm::NeutralMess
                     });
                 }
             }
+            "run/access" => {
+                if let Some(observation) = event.data["observation"].as_str() {
+                    messages.push(NeutralMessage {
+                        role: Role::User,
+                        content: observation.into(),
+                        reasoning: None,
+                    });
+                }
+            }
             "run/result" => {
                 if let Some(observation) = event.data["observation"].as_str() {
                     messages.push(NeutralMessage {
@@ -1196,7 +1369,7 @@ mod tests {
                 kind: "model/result".into(),
                 seq: 2,
                 ts: None,
-                data: serde_json::json!({"requestSeq":1,"ok":true,"content":"```run\nreturn {}\n```","action":{"kind":"run","source":"return {}\n","timeoutMs":1}}),
+                data: serde_json::json!({"requestSeq":1,"ok":true,"content":"```run\nreturn {}\n```","action":{"kind":"run","source":"return {}\n","timeoutMs":1,"access":{"writes":[],"reason":""}}}),
             },
             Event {
                 kind: "run/result".into(),
@@ -1233,7 +1406,7 @@ mod tests {
         journal
             .append(
                 "model/result",
-                serde_json::json!({"requestSeq":2,"ok":true,"content":"```run\nreturn {}\n```","action":{"kind":"run","source":"return {}\n","timeoutMs":1}}),
+                serde_json::json!({"requestSeq":2,"ok":true,"content":"```run\nreturn {}\n```","action":{"kind":"run","source":"return {}\n","timeoutMs":1,"access":{"writes":[],"reason":""}}}),
             )
             .unwrap();
         journal
@@ -1261,7 +1434,7 @@ mod tests {
         journal
             .append(
                 "model/result",
-                serde_json::json!({"requestSeq":2,"ok":true,"content":"```run\nreturn tagged\n```","action":{"kind":"run","source":"return tagged\n","timeoutMs":1}}),
+                serde_json::json!({"requestSeq":2,"ok":true,"content":"```run\nreturn tagged\n```","action":{"kind":"run","source":"return tagged\n","timeoutMs":1,"access":{"writes":[],"reason":""}}}),
             )
             .unwrap();
         journal
@@ -1345,7 +1518,7 @@ mod tests {
                     "requestSeq": 2,
                     "ok": true,
                     "content": "```run\nreturn {}\n```",
-                    "action": {"kind":"run","source":"return {}\n","timeoutMs":1},
+                    "action": {"kind":"run","source":"return {}\n","timeoutMs":1,"access": {"writes": [], "reason": ""}},
                     "usage": {"inputTokens":10,"outputTokens":5,"cacheReadTokens":4,"cacheWriteTokens":0,"reasoningTokens":2},
                     "reasoning": {"text":"pondered","replay":{"protocol":"openai-chat-completions","field":"reasoning_content"}}
                 }),

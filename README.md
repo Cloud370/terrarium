@@ -26,22 +26,25 @@ The design is good when its behavior can be reconstructed from its boundaries: a
 
 Invariants:
 
-- Model actions are programs — exactly one complete `run` fence per model response, and nothing outside that fence executes.
+- Model actions are programs — at most one `access` fence plus exactly one complete `run` fence per model response, and nothing outside those fences executes.
 - Each run executes in a fresh cage; no mutable state crosses runs, and credentials never enter the cage.
-- Security lives in the host — mount scoping, `:rw` writes, resource limits, cancellation. Prompts describe behavior; they never provide the boundary.
+- Security lives in the host — filesystem modes, frozen write scopes, preauthorization before execution, resource limits, cancellation. Prompts describe behavior; they never provide the boundary.
 - Capabilities stay explicit, minimal, typed, bounded, and observable; errors surface at the boundary instead of falling back silently.
 - Search stays composed: the host prunes (gitignore, glob, literal `contains`) and JavaScript applies the final predicate — there is deliberately no host grep or regex capability.
-- Sessions are durable append-only JSONL files. Model requests and runs are journaled before dispatch; a run whose outcome is unknown is marked, never replayed.
+- Sessions are durable append-only JSONL files. Model requests, runs, and access decisions are journaled; a run whose outcome is unknown is marked, never replayed, and the journal is an audit record, never authority.
 - Core behavior is portable host code with no platform-specific external commands, so Linux, macOS, and Windows behave the same.
 
 ## The protocol
 
-One agent turn is a sequence of steps. Each model response must contain one closed `run` fence, and each successful program must return one explicit disposition:
+One agent turn is a sequence of steps. Each model response contains an optional `access` block followed by exactly one closed `run` fence, and each successful program returns one explicit disposition:
 
 ````text
+```access
+{"writes": ["/home/me/proj/notes.md"], "reason": "append the scan summary to the project notes"}
+```
 ```run
 const matches = [];
-for await (const line of host.fs.scan("/proj/src", {glob: "*.rs"})) {
+for await (const line of host.fs.scan("/home/me/proj/src", {glob: "*.rs"})) {
   if (line.text.includes("http client")) matches.push({file: line.file, line: line.no});
 }
 return {to: "model", facts: {matches}};
@@ -58,7 +61,7 @@ return {to: "user", message: "The HTTP client is configured in src/llm/."};
 
 A normal `return` releases the run's local JavaScript state; it does not by itself finish a turn. A returned error is not automatically a user-facing result: format, parse, traversal, validation, timeout, and other recoverable failures should return short facts to `to: "model"` so the next step can correct the work. Use `to: "user"` only when the result is established or a specific user action, missing input, authorization, or decision is required. A `catch` block that merely reports an error must not end the turn.
 
-The parser accepts exactly one complete `run` fence per reply. A missing, unclosed, or duplicated fence is a protocol error — the parser never runs the first block and silently ignores the rest. The opening fence is a standalone ```` ```run ```` line, the closing fence a standalone ```` ``` ```` line; inline triple backticks neither open nor close a block. Text outside the fence does not execute, and there is no text-based completion marker.
+The parser accepts exactly one complete `run` fence per reply, preceded by at most one `access` fence. A missing, unclosed, duplicated, or misplaced fence is a protocol error — the parser never runs the first block and silently ignores the rest. The opening fence is a standalone ```` ```run ```` or ```` ```access ```` line, the closing fence a standalone ```` ``` ```` line; inline triple backticks neither open nor close a block. Text outside the fences does not execute, and there is no text-based completion marker.
 
 Every run executes as the same kind of async function body, so top-level `return` and `await` are legal in every program. A returned value keeps its JSON structure instead of being flattened to a string.
 
@@ -77,8 +80,12 @@ A run has two data channels. Program-provided data enters the next model context
 
 - Per run: 64 MB heap, 1 MB stack, and one hard deadline. Agent mode defaults to 10 seconds; single-run mode defaults to 2 seconds. A first-line `// timeout-ms: N` directive may raise an agent run up to 300 seconds.
 - Captured stdout is limited to 16 KB. Host file reads use bounded windows or a bounded whole-file channel.
-- Filesystem access exists only under operator-declared mounts. `:rw` is required for writes. Path escapes and symlinks that resolve outside a mount are rejected; scans never follow symlinks.
+- Every path is one absolute path in the operating-system user's filesystem view; there is no virtual namespace. Reads see what the current OS user can read. Writes are governed by the invocation's frozen filesystem authority — `read-only` denies every write, `planned-write` requires a preauthorized exact file or operator-declared scope, `full-access` keeps only path validation and OS permissions. Existing symlinks are never written; scans never follow symlinks.
 - API credentials remain in the host process environment and are never exposed to JavaScript.
+
+## Write preauthorization
+
+In the default `planned-write` mode, a run that writes declares its targets up front in the `access` block — at most 32 exact absolute file paths plus a reason. The host resolves and validates every path, subtracts anything already covered by an operator `--allow-write` scope, and presents the remainder as one allow/deny decision before any JavaScript starts. Partial approval does not exist; approval covers that one run only and is discarded when it ends. A denied, cancelled, invalid, or unavailable request (no interactive terminal) runs no code and returns one bounded observation instead. Every decision — including declarations accepted and ignored under `full-access` — is journaled as a `run/access` audit event that never restores authority.
 
 ## Quick start
 
@@ -101,29 +108,28 @@ Start the model-driven agent in the current directory:
 
 ```sh
 terrarium "review this project"
-terrarium --profile main --read-only "find the unused dependencies"
+terrarium --read-only "find the unused dependencies"
 ```
 
-To let one invocation use real absolute paths outside the working directory, select full access:
+The default mode is `planned-write`: each run's writes are preauthorized through the `access` block, and the terminal asks one allow/deny question for anything not already covered. To grant a directory or file up front without prompting, add an operator scope:
 
 ```sh
-terrarium --full-access "read ~/chat/landscape-monitor"
+terrarium --allow-write "$HOME/proj/notes" "summarize the project into notes/summary.md"
 ```
 
-For a narrower authorization that remains available to every run in the invocation, add an explicit mount:
+For trusted debugging the explicit path removes the scope check:
 
 ```sh
-terrarium --read-only \
-  --mount /landscape-monitor="$HOME/chat/landscape-monitor" \
-  "read landscape-monitor"
+terrarium --full-access "read ~/chat/landscape-monitor and report"
 ```
 
-`--full-access` maps `/` to the current user's filesystem view; it does not bypass operating-system permissions. In restricted modes, the agent uses the current working directory's absolute path plus any explicit mount paths. JavaScript does not expand `~`; the prompt identifies the available roots and tells the model how to handle a denied path.
+`--full-access` keeps only path validation plus the current operating-system user's own permissions — it does not bypass OS permissions and is not root access. `--read-only`, `--full-access`, and `--allow-write` are mutually exclusive combinations rejected at startup. JavaScript does not expand `~`; the runtime state names the working root, and the model must use real absolute paths.
 
-For direct JavaScript execution, use the separate `run` command:
+For direct JavaScript execution, use the separate `run` command — read-only by default, with the same mode flags:
 
 ```sh
 terrarium run -e 'return 1 + 1'
+terrarium run --allow-write /tmp/out.json write-report.js
 ```
 
 The agent stores its session under the per-user state directory and prints the session ID to stderr when creating a session. Direct runs create no session.
@@ -131,12 +137,12 @@ The agent stores its session under the per-user state directory and prints the s
 ## Command line
 
 ```sh
-terrarium [--config PATH] [--profile NAME] [--read-only | --full-access] [--mount /virtual=real[:rw]] [--max-steps N] [--run-timeout-ms N] [message...]
-terrarium --resume SESSION_ID [--read-only | --full-access] [--mount /virtual=real[:rw]] [message...]
-terrarium run [-e SOURCE | FILE] [--read-only | --full-access] [--mount /virtual=real[:rw]] [--timeout-ms N]
+terrarium [--config PATH] [--profile NAME] [--read-only | --full-access | --allow-write DIR|FILE]... [--max-steps N] [--run-timeout-ms N] [message...]
+terrarium --resume SESSION_ID [--read-only | --full-access | --allow-write DIR|FILE]... [message...]
+terrarium run [-e SOURCE | FILE] [--read-only | --full-access | --allow-write DIR|FILE]... [--timeout-ms N]
 ```
 
-The normal command always starts or resumes the model-driven agent. Message arguments are joined as text; non-terminal stdin supplies a message when no message argument is present. `--mount` entries apply to every run in the invocation. `workspace` is the default access mode, `--read-only` and `--full-access` are mutually exclusive, and access mode and mounts are never stored in the session. The agent exits `0` after a program returns `to: "user"`, and `2` for usage or configuration errors. Direct-run exits `0` for a successful program and `1` for a failed program.
+The normal command always starts or resumes the model-driven agent. Message arguments are joined as text; non-terminal stdin supplies a message when no message argument is present. `--allow-write` may be repeated and takes one existing absolute directory (recursive prefix) or file (exact target); the three mode flags cannot be combined. Mode and write scopes are invocation-only and never stored in the session. The agent exits `0` after a program returns `to: "user"`, and `2` for usage or configuration errors. Direct-run exits `0` for a successful program and `1` for a failed program.
 
 ## Host API
 
@@ -145,16 +151,14 @@ The generated contract (`--contract`) documents the live surface:
 - `host.fs.list(dir)` lists one directory level as sorted objects with `name`, `type` (`file`, `directory`, `symlink`, or `other`), and `size` in bytes for regular files (`null` otherwise).
 - `host.fs.read(path, from, to)` reads a bounded line window and returns stable `N: text` line numbers plus a continuation footer.
 - `host.fs.text(path)` reads a whole text file into the program as LF-normalized text without display line numbers. Use it for program-side transformations, not for displaying code.
-- `host.fs.replace(path, oldText, newText[, {all}])` performs one exact targeted replacement. It requires one match by default, fails loudly for missing or ambiguous text, treats replacement text literally, and uses `{all: true}` only for intentional all-match replacement. When the old text is already known, this is the efficient one-call edit path; when it is not known, read or scan first for enough context. Do not re-read solely to confirm a write; the run result includes the host-derived receipt.
+- `host.fs.replace(path, oldText, newText[, {all}])` performs one exact targeted replacement on a write-authorized file. It requires one match by default, fails loudly for missing or ambiguous text, treats replacement text literally, and uses `{all: true}` only for intentional all-match replacement. When the old text is already known, this is the efficient one-call edit path; when it is not known, read or scan first for enough context. Do not re-read solely to confirm a write; the run result includes the host-derived receipt.
 - `host.fs.scan(path, options)` streams text-file lines from a directory tree. Pass optional `contains: "literal"` to let Rust discard non-matching lines before they cross into JavaScript; JavaScript remains the final predicate for regexes, case rules, multiple conditions, cross-line state, and custom limits. Without it, every line is yielded as before. It respects `.gitignore`, skips hidden entries, binaries, and symlinks by default, and validates option types. Traversal and decoding errors reject the scan rather than becoming an empty result.
 - `host.fs.walk(path, options)` streams one `{file, size}` per regular file from a directory tree — the file-level twin of `scan`, with the same pruning and the same options; files are never opened. Counting files or summing sizes is a walk; counting `scan` yields counts lines.
-- `host.fs.write(path, content)` atomically writes text under a declared `:rw` mount and returns the byte count. The run result also includes bounded host-derived write receipts (`path`, `created`, `changed`, `bytesBefore`, `bytesAfter`, `firstChangedLine`).
+- `host.fs.write(path, content)` atomically writes text to a write-authorized target and returns the byte count. Approving a new file includes creating its missing parent directories. The run result also includes bounded host-derived write receipts (`path`, `created`, `changed`, `bytesBefore`, `bytesAfter`, `firstChangedLine`).
 
 Agent programs use the tagged return protocol described above for model continuation or user handoff.
 
-Model requests belong to the trusted outer agent loop and are journaled in the session; the JavaScript host surface is the filesystem capability set above.
-
-The contract opens with the configured model's declared capabilities (text-only versus text-and-image input; a model without a local declaration is labeled undeclared). The request payload stays text-only regardless — image file reading, encoding, and artifact transport are not implemented.
+Model requests belong to the trusted outer agent loop and are journaled in the session; the JavaScript host surface is the filesystem capability set above. Requests are text-only; image file reading, encoding, and artifact transport are not implemented.
 
 ## Configuration
 
@@ -168,18 +172,19 @@ If no TOML file is selected, the legacy `TERRARIUM_LLM_API_KEY`, `TERRARIUM_LLM_
 
 - `src/lib.rs`, `src/kernel.rs` — reusable kernel boundary and one fresh cage per run
 - `src/main.rs`, `src/cli.rs` — process and terminal adapters
-- `src/agent.rs` — outer agent loop and run-fence parser
+- `src/agent.rs` — outer agent loop, access/run fence parser, and preauthorization lifecycle
 - `src/session.rs` — durable append-only session journal
-- `src/fs.rs`, `src/llm/`, `src/registry.rs` — host capabilities, streaming three-protocol model transport, and the live API registry
+- `src/fs.rs`, `src/auth.rs`, `src/llm/`, `src/registry.rs` — filesystem capabilities and frozen write authority, access-block parsing and the `Authorizer` boundary, streaming three-protocol model transport, and the live API registry
 - `src/prompts/`, `src/runtime/` — embedded model prompt and JavaScript runtime assets
 - `docs/` — maintained design, protocol, configuration, security, and integration notes
 
-The library exposes `Kernel` and validated `Mount` for non-CLI callers. A future Web UI should add a service adapter over this library instead of spawning the binary or scraping stderr.
+The library exposes `Kernel` and the `RunFilesystemAuthority`/`WriteScope` trust types for non-CLI callers, plus the `Authorizer` trait for embedding adapters. A future Web UI should add a service adapter over this library instead of spawning the binary or scraping stderr.
 
 ## Documentation
 
 - [Design direction](docs/design.md)
 - [Current protocol](docs/protocol.md)
+- [Filesystem authorization](docs/filesystem-authorization.md)
 - [Configuration](docs/configuration.md)
 - [Security boundary](docs/security.md)
 - [Model profiles and durable sessions](docs/model-profiles-and-durable-sessions.md)

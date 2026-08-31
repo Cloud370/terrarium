@@ -10,7 +10,7 @@ Terrarium is an agent kernel: the model submits a bounded program, the program c
 model reply
   -> closed run fence
   -> fresh QuickJS cage
-  -> host capabilities under operator mounts
+  -> host capabilities under a frozen filesystem authority
   -> structured Outcome
 ```
 
@@ -59,7 +59,7 @@ The registry is the single source for the generated contract. The current surfac
 - Context is an explicit boundary: program data crosses to the next model only through bounded `to: "model"` facts (up to 16 KiB), while large intermediate results stay local or are written to an authorized file and referenced by path. A direct run result is capped at 24 KiB. Host status, errors, and receipts are bounded trusted evidence.
 - The tagged agent return protocol: `to: "model"` for same-turn continuation and `to: "user"` for an explicit user handoff. The main model request is performed by the trusted outer loop; JavaScript has no nested model-call primitive.
 
-Mounts are the authorization boundary. The operator declares `/virtual=real` for read-only access or `/virtual=real:rw` for writes. The default model-driven agent binds its session to the current working root and mounts it at that same absolute path; `terrarium run` uses the current directory transiently. Agent invocations select `workspace` by default, or `--read-only` or `--full-access` for that invocation only. Explicit `--mount` entries apply to every run in that invocation. `--full-access` maps `/` to the real filesystem view of the current operating-system user. These modes and mounts are never stored in the journal.
+The frozen filesystem authority is the authorization boundary. Programs use the operating-system user's absolute paths directly; reads see the OS user's readable view. Writes follow one invocation-selected mode: `read-only` denies every write, `planned-write` (agent default) preauthorizes an exact per-run file set through the `access` block plus any operator `--allow-write DIR|FILE` scopes, and `full-access` keeps only path validation and OS permissions. Any user decision happens before QuickJS starts, actual write calls are re-checked against the frozen scope, and mode or scopes are never stored in the journal. See `filesystem-authorization.md` for the normative contract.
 
 Scan defaults intentionally resemble ripgrep: `.gitignore` is respected, hidden entries and binaries are skipped, symlinks are not followed, and options are explicit. Traversal, opening, and decoding errors are observable rejections rather than empty streams.
 
@@ -69,20 +69,13 @@ The implemented configuration is a strict TOML document containing named provide
 
 When no TOML file is selected, the legacy `TERRARIUM_LLM_API_KEY`, `TERRARIUM_LLM_BASE_URL`, and `TERRARIUM_LLM_MODEL` variables remain a compatibility fallback. The binary does not load `.env` files.
 
-The built-in model examples declare:
-
-```text
-deepseek-v4-flash             text -> text
-deepseek-v4-flash-vision-exp  text,image -> text
-```
-
-This phase only declares image capability. The request payload remains text-only; image file reads, encoding, content parts, and artifact storage are not implemented. The transport performs no hidden retry.
+Requests are text-only; image file reads, encoding, content parts, and artifact storage are not implemented. The transport performs no hidden retry.
 
 ## 6. Durable sessions
 
 Agent sessions use one append-only JSONL file under the per-user state directory. The header binds the session to its absolute display and canonical working root. Each turn stores the user message, exact system prompt, resolved profile, and limits. Model requests and JavaScript runs are written before network dispatch or execution; an uncertain run is recorded as `outcome_unknown` and never replayed. Access mode belongs only to the current invocation.
 
-`Kernel` and validated `Mount` are the reusable library API. The CLI, durable session journal, and outer agent loop are adapters over that core. The default command runs the model-driven agent; direct JavaScript is intentionally isolated behind `terrarium run`.
+`Kernel` and the `RunFilesystemAuthority`/`WriteScope` trust types are the reusable library API. The CLI, durable session journal, and outer agent loop are adapters over that core. The default command runs the model-driven agent; direct JavaScript is intentionally isolated behind `terrarium run`.
 
 ## 7. Explicit future work
 
@@ -91,7 +84,7 @@ The following are deliberately not part of the current contract:
 - multimodal request payloads and image transport;
 - artifacts and binary result storage;
 - a Web UI or HTTP service;
-- child runs or sub-agent sessions — a sub-agent is a controlled sub-session and must, before becoming a capability, define its own conversation history, round and per-run timeout budgets, total budget, cancellation, mounts that only inherit or narrow the parent's, structured result, explicit lifecycle state, and a recursion cap on further spawning;
+- child runs or sub-agent sessions — a sub-agent is a controlled sub-session and must, before becoming a capability, define its own conversation history, round and per-run timeout budgets, total budget, cancellation, filesystem authority that only inherits or narrows the parent's, structured result, explicit lifecycle state, and a recursion cap on further spawning;
 - token or cost hard budgets;
 - transactional effects or automatic rollback.
 

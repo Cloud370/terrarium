@@ -9,7 +9,7 @@ use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, CaughtError, Function
 use serde::Serialize;
 use tokio::sync::watch;
 
-use crate::{fs, llm, registry};
+use crate::{fs, registry};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,40 +49,10 @@ pub(crate) fn truncate_utf8(s: &str, cap: usize) -> String {
     format!("{}…[truncated]", &s[..end])
 }
 
-fn mount_label(mount: &fs::Mount) -> String {
-    if mount.virt == "/" {
-        "/".into()
-    } else {
-        mount.virt.trim_end_matches('/').to_string()
-    }
-}
-
-/// Contract = static teaching template + registry-generated API surface + actual mounts.
-pub(crate) fn contract(mounts: &[fs::Mount]) -> String {
-    contract_for(mounts, "configured model")
-}
-
-pub(crate) fn contract_for(mounts: &[fs::Mount], model: &str) -> String {
-    let ro: Vec<String> = mounts.iter().filter(|m| !m.rw).map(mount_label).collect();
-    let rw: Vec<String> = mounts.iter().filter(|m| m.rw).map(mount_label).collect();
-    let mut mounts_line = String::new();
-    mounts_line.push_str(&format!("{}\n", llm::capability_text(model)));
-    if !ro.is_empty() {
-        mounts_line.push_str(&format!(
-            "Read-only mounts: {} (`host.fs.scan` runs with ripgrep's defaults here — .gitignore respected, \
-             dot-entries skipped, binaries detected by content; override per call with `{{gitignore: false}}`/`{{hidden: true}}`)\n",
-            ro.join(", ")
-        ));
-    }
-    if !rw.is_empty() {
-        mounts_line.push_str(&format!(
-            "Writable mounts: {} — `host.fs.write` is allowed here and only here (atomic, auto-creates parent dirs; the run result includes host-derived write receipts)",
-            rw.join(", ")
-        ));
-    }
-    CONTRACT_TEMPLATE
-        .replace("{{HOST_API}}", registry::api_lines().trim_end())
-        .replace("{{MOUNTS}}", mounts_line.trim_end())
+/// The model-visible contract: static teaching template plus the registry-generated API
+/// surface. Byte-stable for this binary — no invocation value is interpolated.
+pub(crate) fn contract() -> String {
+    CONTRACT_TEMPLATE.replace("{{HOST_API}}", registry::api_lines().trim_end())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -183,7 +153,7 @@ fn value_to_json<'js>(
 pub(crate) async fn eval_js(
     code: &str,
     timeout_ms: u64,
-    mounts: &[fs::Mount],
+    authority: &fs::RunFilesystemAuthority,
     cancel_tx: watch::Sender<bool>,
 ) -> Outcome {
     if !(1..=MAX_TIMEOUT_MS).contains(&timeout_ms) {
@@ -234,7 +204,7 @@ pub(crate) async fn eval_js(
         ctx.globals().set("__log", log_fn)?;
 
         let host = Object::new(ctx.clone())?;
-        fs::install(&ctx, &host, mounts, writes.clone())?;
+        fs::install(&ctx, &host, authority, writes.clone())?;
         ctx.globals().set("host", host)?;
         ctx.eval::<Value, _>(PRELUDE)?;
 
@@ -375,77 +345,37 @@ pub(crate) async fn eval_js(
     out
 }
 
-/// Shared mount parsing for both entry modes.
-pub(crate) fn add_mount(mounts: &mut Vec<fs::Mount>, spec: &str) -> Result<(), String> {
-    let Some((virt, real_spec)) = spec.split_once('=') else {
-        return Err(format!(
-            "invalid mount spec {spec} (expected /virtual-prefix=real-path[:rw])"
-        ));
-    };
-    let virt = virt.trim_end_matches('/');
-    let (real, rw) = match real_spec.strip_suffix(":rw") {
-        Some(r) => (r, true),
-        None => (real_spec, false),
-    };
-    let root = match std::fs::canonicalize(real) {
-        Ok(root) => root,
-        Err(_) if rw => {
-            std::fs::canonicalize(real_spec).map_err(|e| format!("invalid mount {spec}: {e}"))?
-        }
-        Err(e) => return Err(format!("invalid mount {spec}: {e}")),
-    };
-    let mount = fs::Mount::from_canonical(virt, root, rw)?;
-    if mounts.iter().any(|m| m.overlaps(&mount)) {
-        return Err(format!(
-            "overlapping mount virtual roots are not allowed: {virt}"
-        ));
-    }
-    mounts.push(mount);
-    Ok(())
-}
-
-/// Reusable execution facade for non-CLI frontends.
+/// Reusable execution facade for non-CLI frontends. The kernel holds one invocation-level
+/// filesystem authority; the model-driven agent passes a per-run frozen authority to the
+/// run boundary instead.
 #[derive(Debug, Clone)]
 pub struct Kernel {
-    mounts: Vec<fs::Mount>,
+    authority: fs::RunFilesystemAuthority,
 }
 
 impl Kernel {
-    pub fn new(mut mounts: Vec<fs::Mount>) -> Result<Self, String> {
-        for (index, mount) in mounts.iter().enumerate() {
-            if mounts[index + 1..]
-                .iter()
-                .any(|other| mount.overlaps(other))
-            {
-                return Err(format!(
-                    "overlapping mount virtual roots are not allowed: {}",
-                    mount.virt.trim_end_matches('/')
-                ));
-            }
-        }
-        mounts.sort_by_key(|m| std::cmp::Reverse(m.virt.len()));
-        Ok(Self { mounts })
+    pub fn new(authority: fs::RunFilesystemAuthority) -> Self {
+        Self { authority }
     }
 
-    pub fn mounts(&self) -> &[fs::Mount] {
-        &self.mounts
+    pub fn authority(&self) -> &fs::RunFilesystemAuthority {
+        &self.authority
     }
 
     pub fn contract(&self) -> String {
-        contract(&self.mounts)
+        contract()
     }
 
     pub async fn run(&self, code: &str, timeout_ms: u64) -> Outcome {
         let (cancel_tx, _cancel_rx) = watch::channel(false);
-        eval_js(code, timeout_ms, &self.mounts, cancel_tx).await
+        eval_js(code, timeout_ms, &self.authority, cancel_tx).await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
-    use super::{add_mount, contract_for, eval_js, truncate_utf8, ErrorKind, Termination};
+    use super::{contract, eval_js, truncate_utf8, ErrorKind, Termination};
+    use crate::fs::RunFilesystemAuthority;
     use tokio::sync::watch;
 
     #[test]
@@ -458,19 +388,17 @@ mod tests {
     }
 
     #[test]
-    fn full_access_contract_describes_root_mount() {
-        let mount = crate::fs::Mount::from_canonical("/", PathBuf::from("/"), true).unwrap();
-        let contract = contract_for(&[mount], "test-model");
-        assert!(contract.contains("Writable mounts: /"), "{contract}");
-    }
-    #[test]
-    fn mount_declarations_are_validated_or_rejected() {
-        let mut ms = Vec::new();
-        assert!(add_mount(&mut ms, "no-equals-sign").is_err());
-        assert!(add_mount(&mut ms, "=path").is_err());
-        assert!(add_mount(&mut ms, "rel/path=dir").is_err());
-        assert!(add_mount(&mut ms, "/x=/definitely/not/here").is_err());
-        assert!(ms.is_empty());
+    fn contract_is_static_and_mode_free() {
+        let text = contract();
+        assert!(text.contains("host.fs.list(dir)"), "{text}");
+        assert!(text.contains("read-only"), "{text}");
+        assert!(text.contains("planned-write"), "{text}");
+        assert!(text.contains("full-access"), "{text}");
+        assert!(text.contains("```access"), "{text}");
+        assert!(!text.contains("{{MOUNTS}}"), "{text}");
+        assert!(!text.contains("{{HOST_API}}"), "{text}");
+        // byte-stable: two renders are identical and carry no invocation value
+        assert_eq!(text, contract());
     }
 
     #[tokio::test]
@@ -479,7 +407,7 @@ mod tests {
         let out = eval_js(
             "function value() { return 41; }\nreturn {to: 'model', facts: {value: value() + 1}};",
             5_000,
-            &[],
+            &RunFilesystemAuthority::ReadOnly,
             tx,
         )
         .await;
@@ -494,11 +422,23 @@ mod tests {
     #[tokio::test]
     async fn returned_json_allows_realistic_results_but_remains_bounded() {
         let (tx, _rx) = watch::channel(false);
-        let within_limit = eval_js("return 'x'.repeat(23 * 1024)", 5_000, &[], tx).await;
+        let within_limit = eval_js(
+            "return 'x'.repeat(23 * 1024)",
+            5_000,
+            &RunFilesystemAuthority::ReadOnly,
+            tx,
+        )
+        .await;
         assert!(within_limit.ok, "error: {:?}", within_limit.error);
 
         let (tx, _rx) = watch::channel(false);
-        let oversized = eval_js("return 'x'.repeat(24 * 1024 + 1)", 5_000, &[], tx).await;
+        let oversized = eval_js(
+            "return 'x'.repeat(24 * 1024 + 1)",
+            5_000,
+            &RunFilesystemAuthority::ReadOnly,
+            tx,
+        )
+        .await;
         assert!(!oversized.ok);
         let message = oversized.error.expect("result size error").message;
         assert!(message.contains("24576"), "{message}");
@@ -507,7 +447,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_timeout_is_configuration_failure() {
         let (tx, _rx) = watch::channel(false);
-        let out = eval_js("return 1", 0, &[], tx).await;
+        let out = eval_js("return 1", 0, &RunFilesystemAuthority::ReadOnly, tx).await;
         assert!(!out.ok);
         assert_eq!(out.termination, Termination::Fatal);
         assert_eq!(
@@ -522,7 +462,7 @@ mod tests {
         let out = eval_js(
             "print(\"x\".repeat(16383) + \"中文中文中文\");\nreturn 1",
             5_000,
-            &[],
+            &RunFilesystemAuthority::ReadOnly,
             tx,
         )
         .await;
@@ -535,7 +475,13 @@ mod tests {
     #[tokio::test]
     async fn print_storms_are_bounded_at_the_sink() {
         let (tx, _rx) = watch::channel(false);
-        let out = eval_js("while (true) print('x'.repeat(4000))", 500, &[], tx).await;
+        let out = eval_js(
+            "while (true) print('x'.repeat(4000))",
+            500,
+            &RunFilesystemAuthority::ReadOnly,
+            tx,
+        )
+        .await;
         assert!(!out.ok && out.timed_out);
         assert!(out.stdout.len() <= 16 * 1024 + 32);
         assert!(out.stdout.ends_with("…[truncated]"));

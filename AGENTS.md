@@ -29,13 +29,13 @@ Hints, not requirements — apply whichever fit the tools you actually have.
 
 Library core with thin presentation adapters:
 
-- `src/kernel.rs` — cage boundary: one fresh QuickJS cage per run, resource limits, `eval_js`. `src/lib.rs` exports `Kernel`, `Mount`, `Outcome` etc. for non-CLI callers.
-- `src/agent.rs` — outer agent loop and run-fence parser (one `run` code fence per model response).
-- `src/fs.rs` — host filesystem capabilities and mount scoping. `host.fs.walk` and `host.fs.scan` share one traversal engine.
+- `src/kernel.rs` — cage boundary: one fresh QuickJS cage per run, resource limits, `eval_js`. `src/lib.rs` exports `Kernel`, `RunFilesystemAuthority`, `Outcome` etc. for non-CLI callers.
+- `src/agent.rs` — outer agent loop, access/run fence parser (at most one `access` plus one `run` fence per model response), and the write-preauthorization lifecycle (`Authorizer` decision, frozen authority).
+- `src/fs.rs` — host filesystem capabilities over absolute OS-user paths and the frozen `RunFilesystemAuthority` write check. `host.fs.walk` and `host.fs.scan` share one traversal engine. `src/auth.rs` — access-block parsing/resolution, the `Authorizer` trait, operator-scope subtraction and freezing.
 - `src/llm/` — streaming model transport for three wire protocols: `openai-chat-completions`, `openai-responses`, `anthropic-messages` (SSE in `sse.rs`, reasoning replay per protocol shape).
 - `src/session.rs` — durable append-only JSONL sessions; uncertain runs are never replayed.
 - `src/config.rs` — TOML model profiles.
-- `src/registry.rs` — **single source of truth for the model-visible host API**. The prompt contract's `{{HOST_API}}` section is generated from `HOST_API` there. Add new host capabilities in `registry.rs` plus the implementation, never by editing the rendered contract text.
+- `src/registry.rs` — **single source of truth for the model-visible host API**. The prompt contract's `{{HOST_API}}` section is generated from `HOST_API` there. Add new host capabilities in `registry.rs` plus the implementation, never by editing the rendered contract text. The system prompt is byte-stable across invocations; per-invocation facts (working root, filesystem mode, timeouts, capabilities) travel only in the `<terrarium-runtime-state>` block prepended to user messages.
 - `src/main.rs` / `src/cli.rs` — process and terminal adapters only. Reusable behavior belongs in the library; a future Web UI should build a service adapter over the library, not spawn the binary.
 - `src/prompts/` and `src/runtime/prelude.js` — compiled into the binary via `include_str!`. Treat them as code: editing them changes runtime behavior.
 - `tests/library_api.rs` — public library API tests.
@@ -63,7 +63,7 @@ Ground rules:
 ## Invariants (do not break)
 
 - Each run executes in a fresh cage; runs share no mutable state. Credentials stay in the host process environment, referenced by env-var name in config, and never enter the cage.
-- Security lives in host code: mount scoping, `:rw` required for writes, symlink/path-escape rejection, resource limits, cancellation. Prompts describe behavior; they never provide the boundary.
+- Security lives in host code: filesystem modes (`read-only` / `planned-write` / `full-access`), frozen write scopes and preauthorization before QuickJS starts, symlink/path-escape rejection, resource limits, cancellation. Prompts describe behavior; they never provide the boundary.
 - Model requests are made by the trusted outer agent loop and journaled in the session; JavaScript programs cannot call a model.
 - Capabilities stay explicit, minimal, typed, bounded, and observable; errors surface at the boundary instead of falling back silently.
 - Model-facing data flows into the next step only through `to: "model"` `facts` (16 KiB limit) and bounded host-derived evidence (24 KiB result limit). These limits are hard boundaries, not targets.

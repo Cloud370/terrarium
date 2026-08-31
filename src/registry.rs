@@ -21,7 +21,7 @@ pub const HOST_API: &[HostDoc] = &[
     },
     HostDoc {
         sig: "host.fs.replace(path, oldText, newText[, {all}])",
-        doc: "→ {path, replacements, bytes}. Exact literal replacement; default requires one match, while {all: true} explicitly replaces every match. Empty, missing, ambiguous, and no-op edits fail",
+        doc: "→ {path, replacements, bytes}. Exact literal replacement; default requires one match, while {all: true} explicitly replaces every match. Empty, missing, ambiguous, and no-op edits fail. Writes through host.fs.write, so the target must be authorized for the run",
     },
     HostDoc {
         sig: "host.fs.scan(path, {glob?, contains?, skipDirs?, skipExts?, gitignore?, hidden?})",
@@ -33,7 +33,7 @@ pub const HOST_API: &[HostDoc] = &[
     },
     HostDoc {
         sig: "host.fs.write(path, content)",
-        doc: "→ bytes written. Text-only and atomic; creates parent directories. Requires a writable mount and preserves an existing file's BOM and line endings. The host separately records bounded write receipts",
+        doc: "→ bytes written. Text-only and atomic; creates approved missing parent directories. The exact target must be authorized for the current run (read-only denies every write) and preserves an existing file's BOM and line endings. The host separately records bounded write receipts",
     },
 ];
 
@@ -43,4 +43,20 @@ pub fn api_lines() -> String {
         .iter()
         .map(|d| format!("- {} — {}\n", d.sig, d.doc))
         .collect()
+}
+
+/// Sorted, de-duplicated capability namespaces ("host.fs"), rendered into the runtime state.
+pub fn capability_namespaces() -> String {
+    let mut namespaces: Vec<String> = HOST_API
+        .iter()
+        .filter_map(|doc| {
+            let signature = doc.sig.split('(').next()?.trim();
+            let mut parts: Vec<&str> = signature.split('.').collect();
+            parts.pop()?; // drop the method name
+            Some(parts.join("."))
+        })
+        .collect();
+    namespaces.sort();
+    namespaces.dedup();
+    namespaces.join(", ")
 }

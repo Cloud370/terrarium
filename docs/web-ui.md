@@ -8,7 +8,7 @@ The reusable library currently exposes:
 
 - `Kernel::run` for one fresh QuickJS execution;
 - `Kernel::contract` for the generated host contract;
-- validated `Mount` values and `Kernel::new` for operator-declared filesystem scope;
+- the `RunFilesystemAuthority`/`WriteScope` trust types and `Kernel::new` for operator-declared filesystem scope;
 - structured `Outcome` values for run results.
 
 The CLI and outer agent loop remain adapters. The agent loop still owns model conversation state and terminal output; it has not yet been promoted to a typed session API.
@@ -24,7 +24,7 @@ SessionHandle.cancel()
 SessionHandle.result() -> Answer
 ```
 
-That service would need to define session cancellation, event ownership, authentication, mount selection, and provider configuration before exposing them over HTTP or Server-Sent Events. It should use typed Rust calls and structured events rather than CLI text.
+That service would need to define session cancellation, event ownership, authentication, filesystem mode and write-scope selection, its own `Authorizer` adapter, and provider configuration before exposing them over HTTP or Server-Sent Events. It should use typed Rust calls and structured events rather than CLI text.
 
 ## Explicit non-goals for now
 
@@ -37,6 +37,6 @@ The current project does not implement:
 - browser-side provider configuration;
 - browser-visible filesystem paths or provider credentials.
 
-Provider credentials must remain in the eventual service process, and mounts must be selected by the operator or service policy rather than accepted as unrestricted browser paths.
+Provider credentials must remain in the eventual service process, and the filesystem mode and write scopes must be selected by the operator or service policy rather than accepted as unrestricted browser paths.
 
 Keep one Cargo package while only the CLI consumes the library. Split into a workspace only when a second service consumer actually exists.

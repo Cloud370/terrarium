@@ -1,12 +1,20 @@
-//! Durable model-driven agent loop.
+//! Durable model-driven agent loop. The trusted outer loop owns the invocation filesystem
+//! mode, operator write scopes, and the write-preauthorization lifecycle: every model
+//! response's optional `access` block plus one `run` block is parsed here, resolved against
+//! operator scopes, and — in `planned-write` — decided through an `Authorizer` before
+//! QuickJS starts. The kernel only ever receives the frozen per-run authority.
 
 use tokio::sync::watch;
 
 use crate::{
-    add_mount, config, eval_js,
-    fs::{normalize_path, Mount},
+    auth::{
+        covered_by_scopes, freeze_authority, parse_access_block, resolve_access_request,
+        AccessBlock, Authorizer, Decision, ResolvedAccessRequest,
+    },
+    config, eval_js,
+    fs::{FilesystemMode, RunFilesystemAuthority, WriteScope},
     kernel::FACTS_CAP,
-    llm,
+    llm, registry,
     session::{project, turn_data, Event, Journal},
     ErrorKind, Outcome, MAX_TIMEOUT_MS,
 };
@@ -17,25 +25,69 @@ const RUN_TIMEOUT_DEFAULT_MS: u64 = 10_000;
 const DEFAULT_MAX_STEPS: u64 = 256;
 const FEEDBACK_CAP: usize = 24 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccessMode {
-    ReadOnly,
-    Workspace,
-    Full,
+/// The invocation-local facts rendered at the head of every newly emitted user-role message.
+/// Deterministic by construction: same inputs, same bytes, so an unchanged state renders a
+/// byte-identical block and a retried model request reuses exactly the same message bytes.
+pub(crate) struct RuntimeState {
+    working_root: String,
+    mode: FilesystemMode,
+    default_run_timeout_ms: u64,
+    capabilities: String,
 }
 
-impl AccessMode {
-    fn parse(read_only: bool, full: bool) -> Result<Self, String> {
-        if read_only && full {
-            return Err("--read-only and --full-access are mutually exclusive".into());
+impl RuntimeState {
+    fn new(working_root: String, mode: FilesystemMode, default_run_timeout_ms: u64) -> Self {
+        Self {
+            working_root,
+            mode,
+            default_run_timeout_ms,
+            capabilities: registry::capability_namespaces(),
         }
-        Ok(if read_only {
-            Self::ReadOnly
-        } else if full {
-            Self::Full
-        } else {
-            Self::Workspace
-        })
+    }
+
+    fn block(&self) -> String {
+        format!(
+            "<terrarium-runtime-state>\n### Current runtime\n- Working root: `{}`\n- \
+             Filesystem mode: `{}`\n- Default run timeout: {} ms (hard cap {} ms)\n- Installed \
+             host capabilities: `{}`\n</terrarium-runtime-state>",
+            escape_state_text(&self.working_root),
+            self.mode.as_str(),
+            self.default_run_timeout_ms,
+            MAX_TIMEOUT_MS,
+            escape_state_text(&self.capabilities),
+        )
+    }
+
+    /// `user.content = "<terrarium-runtime-state>…</terrarium-runtime-state>\n\n" + content`.
+    fn prepend(&self, content: &str) -> String {
+        format!("{}\n\n{}", self.block(), content)
+    }
+}
+
+/// The host owns every state value; escaping keeps a value from closing the wrapper.
+fn escape_state_text(text: &str) -> String {
+    text.replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Everything one agent invocation freezes at launch: the filesystem mode, the
+/// operator-declared write scopes, the runtime-state renderer, and the authorizer the
+/// adapter supplied for user decisions.
+pub(crate) struct Invocation<'a> {
+    mode: FilesystemMode,
+    operator_scopes: Vec<WriteScope>,
+    state: RuntimeState,
+    authorizer: &'a dyn Authorizer,
+}
+
+impl Invocation<'_> {
+    fn base_authority(&self) -> RunFilesystemAuthority {
+        match self.mode {
+            FilesystemMode::ReadOnly => RunFilesystemAuthority::ReadOnly,
+            FilesystemMode::PlannedWrite => {
+                RunFilesystemAuthority::Scoped(self.operator_scopes.clone())
+            }
+            FilesystemMode::FullAccess => RunFilesystemAuthority::FullAccess,
+        }
     }
 }
 
@@ -44,18 +96,21 @@ pub struct RunProgram {
     pub timeout_ms: Option<u64>,
 }
 
-/// Only standalone run-fence lines participate in the protocol.
-fn scan_run_fences(reply: &str) -> (Vec<String>, bool) {
+/// Only standalone `run` and `access` fence lines participate in the protocol.
+fn scan_fences(reply: &str) -> (Vec<(&'static str, String)>, bool) {
     let mut blocks = Vec::new();
-    let mut body: Option<String> = None;
+    let mut body: Option<(&'static str, String)> = None;
     for line in reply.lines() {
-        match (line.trim(), body.is_some()) {
+        let trimmed = line.trim();
+        match (trimmed, body.is_some()) {
             ("```", true) => {
-                blocks.push(body.take().unwrap().trim_start_matches('\n').to_string());
+                let (kind, source) = body.take().expect("open body");
+                blocks.push((kind, source.trim_start_matches('\n').to_string()));
             }
-            ("```run", false) => body = Some(String::new()),
+            ("```run", false) => body = Some(("run", String::new())),
+            ("```access", false) => body = Some(("access", String::new())),
             _ => {
-                if let Some(source) = body.as_mut() {
+                if let Some((_, source)) = body.as_mut() {
                     source.push_str(line);
                     source.push('\n');
                 }
@@ -77,22 +132,66 @@ fn parse_timeout_directive(code: &str) -> Option<u64> {
 }
 
 pub(crate) enum Extracted {
-    Run(RunProgram),
+    Run {
+        program: RunProgram,
+        access: Option<AccessBlock>,
+    },
     NoRun,
     Truncated,
     Multiple,
+    AccessAfterRun,
+    InvalidAccess(String),
 }
 
+/// One response is one closed `run` block, optionally preceded by one closed `access` block.
+/// The parser is deliberately more forgiving than the instruction: an absent access block is
+/// the empty request. Genuine ambiguity is a protocol error.
 pub(crate) fn extract(reply: &str) -> Extracted {
-    let (blocks, unclosed) = scan_run_fences(reply);
-    match (blocks.as_slice(), unclosed) {
-        ([], false) => Extracted::NoRun,
-        ([], true) => Extracted::Truncated,
-        ([code], false) => Extracted::Run(RunProgram {
+    let (blocks, unclosed) = scan_fences(reply);
+    if unclosed {
+        return Extracted::Truncated;
+    }
+    let mut fences: Vec<(&'static str, usize)> = Vec::new();
+    let mut run_body: Option<&String> = None;
+    let mut access_body: Option<&String> = None;
+    for (index, (kind, body)) in blocks.iter().enumerate() {
+        fences.push((kind, index));
+        match *kind {
+            "run" => run_body = run_body.or(Some(body)),
+            "access" => access_body = access_body.or(Some(body)),
+            _ => {}
+        }
+    }
+    let runs = fences.iter().filter(|(kind, _)| *kind == "run").count();
+    let accesses = fences.iter().filter(|(kind, _)| *kind == "access").count();
+    if runs == 0 {
+        return Extracted::NoRun;
+    }
+    if runs > 1 || accesses > 1 {
+        return Extracted::Multiple;
+    }
+    if let (Some((_, run_index)), Some((_, access_index))) = (
+        fences.iter().find(|(kind, _)| *kind == "run"),
+        fences.iter().find(|(kind, _)| *kind == "access"),
+    ) {
+        if access_index > run_index {
+            return Extracted::AccessAfterRun;
+        }
+    }
+    let access = match access_body {
+        Some(body) => match parse_access_block(body.trim()) {
+            Ok(block) => Some(block),
+            Err(error) => return Extracted::InvalidAccess(error),
+        },
+        None => None,
+    };
+    let code = run_body.expect("at least one run body");
+    Extracted::Run {
+        program: RunProgram {
             timeout_ms: parse_timeout_directive(code),
             code: code.clone(),
-        }),
-        _ => Extracted::Multiple,
+        },
+        access,
     }
 }
 
@@ -235,92 +334,69 @@ fn protocol_observation_with_writes(
     result.to_string()
 }
 
+/// The structured preauthorization result the model receives when JavaScript did not start.
+fn authorization_observation(
+    turn: u64,
+    step: u64,
+    status: &str,
+    request: &ResolvedAccessRequest,
+    guidance: impl Into<String>,
+) -> String {
+    serde_json::json!({
+        "turn": turn,
+        "step": step,
+        "to": "model",
+        "authorization": {
+            "status": status,
+            "writes": request.displays(),
+            "reason": request.reason,
+        },
+        "error": {"kind": ErrorKind::Protocol, "message": guidance.into()},
+    })
+    .to_string()
+}
+
 fn observation_for_extract(turn: u64, step: u64, extracted: &Extracted) -> Option<String> {
     Some(match extracted {
         Extracted::Truncated => protocol_observation(
             turn,
             step,
-            "no program was executed; close the single ```run block and send one complete program with no prose or other code block",
+            "no program was executed; close the single ```run block (and the ```access block, when present) and send one complete program with no prose or other code block",
         ),
         Extracted::Multiple => protocol_observation(
             turn,
             step,
-            "no program was executed; the response contained multiple run blocks; combine the work into exactly one complete ```run program",
+            "no program was executed; the response contained multiple run or access blocks; use exactly one optional ```access block followed by one complete ```run program",
         ),
         Extracted::NoRun => protocol_observation(
             turn,
             step,
-            "no program was executed; send exactly one complete ```run program with no prose or other code block",
+            "no program was executed; send one optional ```access block followed by exactly one complete ```run program, with no prose or other code block",
         ),
-        Extracted::Run(_) => return None,
+        Extracted::AccessAfterRun => protocol_observation(
+            turn,
+            step,
+            "no program was executed; the ```access block must precede the ```run block",
+        ),
+        Extracted::InvalidAccess(error) => protocol_observation(
+            turn,
+            step,
+            format!("no program was executed; invalid access request: {error}"),
+        ),
+        Extracted::Run { .. } => return None,
     })
 }
 
-fn system_prompt(
-    profile: &config::ResolvedProfile,
-    root: &str,
-    timeout: u64,
-    mounts: &[Mount],
-) -> String {
-    let role = ROLE_TEMPLATE
-        .replace("{{RUN_DEFAULT_MS}}", &timeout.to_string())
-        .replace("{{RUN_CAP_MS}}", &MAX_TIMEOUT_MS.to_string())
-        .replace("{{MODEL}}", &profile.model);
-    let root = normalize_path(root);
+/// The byte-stable system prompt: role instructions, common principles, and the tool
+/// contract. No mode, path, model, or timeout value is interpolated — those live in the
+/// runtime-state block at the head of each user-role message.
+fn system_prompt() -> String {
     format!(
-        "{}\n\n<environment>\nWorking root: {}\n\n{}\n</environment>\n\n{}\n\n{}",
-        role,
-        root,
-        access_guidance(mounts),
+        "{}\n\n{}\n\n{}",
+        ROLE_TEMPLATE.trim_end(),
         COMMON,
-        crate::contract_for(mounts, &profile.model),
+        crate::contract()
     )
-}
-
-fn access_guidance(mounts: &[Mount]) -> String {
-    if mounts.iter().any(|mount| mount.virtual_path() == "/") {
-        let home = std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(|path| normalize_path(&path.to_string_lossy()));
-        let home_note = home
-            .map(|path| format!(" The current user's home directory is `{path}`."))
-            .unwrap_or_default();
-        format!(
-            "Filesystem root `/` is accessible. Use real absolute paths, including paths under the current user's home directory.{home_note} Relative paths such as `Cargo.toml` are not valid host paths. `~` is not expanded by JavaScript. If a path is denied, report the denial and do not retry the same path or invent another mount."
-        )
-    } else {
-        let roots = mounts
-            .iter()
-            .map(|mount| mount.virtual_path().trim_end_matches('/'))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "Accessible roots: {roots}. The session working root is the absolute path shown above; use these absolute paths exactly. Relative paths such as `Cargo.toml` are not valid host paths. `~` is not expanded by JavaScript. If a requested path is outside these roots, report that it is not authorized and do not retry alternate spellings or invent another mount. The operator must authorize another location with `--mount` or `--full-access`."
-        )
-    }
-}
-
-fn invocation_mounts(
-    access: AccessMode,
-    root: &str,
-    explicit: Vec<Mount>,
-) -> Result<Vec<Mount>, String> {
-    let mut mounts = if access == AccessMode::Full {
-        vec![Mount::new("/", "/", true)?]
-    } else {
-        vec![Mount::new(root, root, access == AccessMode::Workspace)?]
-    };
-    for mount in explicit {
-        if mounts.iter().any(|existing| existing.overlaps(&mount)) {
-            return Err(format!(
-                "overlapping mount virtual roots are not allowed: {}",
-                mount.virtual_path().trim_end_matches('/')
-            ));
-        }
-        mounts.push(mount);
-    }
-    mounts.sort_by_key(|mount| std::cmp::Reverse(mount.virtual_path().len()));
-    Ok(mounts)
 }
 
 fn greeting_response(message: &str) -> Option<&'static str> {
@@ -345,16 +421,15 @@ fn start_turn(
     journal: &mut Journal,
     message: &str,
     profile: &config::ResolvedProfile,
-    root: &str,
+    state: &RuntimeState,
     max_steps: u64,
     timeout: u64,
-    mounts: &[Mount],
 ) -> Result<(), String> {
-    let prompt = system_prompt(profile, root, timeout, mounts);
+    let prompt = system_prompt();
     journal.append(
         "turn/start",
         turn_data(
-            message,
+            &state.prepend(message),
             &prompt,
             profile,
             max_steps,
@@ -369,15 +444,11 @@ fn copy_turn(
     journal: &mut Journal,
     message: &str,
     previous: &Event,
-    root: &str,
-    mounts: &[Mount],
+    state: &RuntimeState,
 ) -> Result<(), String> {
     let mut data = previous.data.clone();
-    let profile = profile_from_turn(previous);
-    let (timeout, _) = turn_timeouts(previous);
-    data["message"] = serde_json::Value::String(message.into());
-    data["systemPrompt"] =
-        serde_json::Value::String(system_prompt(&profile, root, timeout, mounts));
+    data["message"] = serde_json::Value::String(state.prepend(message));
+    data["systemPrompt"] = serde_json::Value::String(system_prompt());
     journal.append("turn/start", data)?;
     Ok(())
 }
@@ -385,12 +456,13 @@ fn copy_turn(
 async fn execute_run(
     journal: &mut Journal,
     run_seq: u64,
-    turn: u64,
-    step: u64,
+    at: (u64, u64),
     action: &serde_json::Value,
-    mounts: &[Mount],
+    authority: &RunFilesystemAuthority,
     limits: (u64, u64),
+    state: &RuntimeState,
 ) -> Result<(), String> {
+    let (turn, step) = at;
     let source = action["source"]
         .as_str()
         .ok_or_else(|| "run action has no source".to_string())?;
@@ -400,7 +472,7 @@ async fn execute_run(
         .min(limits.1)
         .min(MAX_TIMEOUT_MS);
     let (cancel_tx, _cancel_rx) = watch::channel(false);
-    let outcome = eval_js(source, timeout, mounts, cancel_tx).await;
+    let outcome = eval_js(source, timeout, authority, cancel_tx).await;
     let returned = outcome.value.clone();
     let mut data = serde_json::json!({
         "runSeq": run_seq,
@@ -421,27 +493,199 @@ async fn execute_run(
         match parse_disposition(returned) {
             Ok(disposition) if disposition["to"] == "model" => {
                 data["disposition"] = disposition.clone();
-                data["observation"] = serde_json::Value::String(model_observation_with_writes(
-                    turn,
-                    step,
-                    &disposition,
-                    &outcome,
+                data["observation"] = serde_json::Value::String(state.prepend(
+                    &model_observation_with_writes(turn, step, &disposition, &outcome),
                 ));
             }
             Ok(disposition) => {
                 data["disposition"] = disposition;
             }
             Err(error) => {
-                data["observation"] = serde_json::Value::String(protocol_observation_with_writes(
-                    turn, step, error, &outcome,
+                data["observation"] = serde_json::Value::String(state.prepend(
+                    &protocol_observation_with_writes(turn, step, error, &outcome),
                 ));
             }
         }
     } else {
-        data["observation"] = serde_json::Value::String(feedback(&outcome, turn, step));
+        data["observation"] =
+            serde_json::Value::String(state.prepend(&feedback(&outcome, turn, step)));
     }
     journal.append("run/result", data)?;
     Ok(())
+}
+
+/// One preauthorization decision: the frozen authority for the run (or none when JavaScript
+/// must not start) plus the bounded `run/access` journal event.
+struct AccessDecision {
+    authority: Option<RunFilesystemAuthority>,
+    event: serde_json::Value,
+}
+
+fn access_block_of(action: &serde_json::Value) -> AccessBlock {
+    let writes = action["access"]["writes"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let reason = action["access"]["reason"].as_str().unwrap_or_default();
+    AccessBlock {
+        writes,
+        reason: reason.to_string(),
+    }
+}
+
+/// The complete planned-write lifecycle plus the mode-specific meaning of a declaration:
+/// resolve → subtract operator scopes → decide → freeze. An empty request runs directly
+/// under the invocation's base authority and journals nothing.
+fn authorize_run_access(
+    inv: &Invocation,
+    action: &serde_json::Value,
+    turn: u64,
+    step: u64,
+) -> AccessDecision {
+    let block = access_block_of(action);
+    if block.writes.is_empty() {
+        return AccessDecision {
+            authority: Some(inv.base_authority()),
+            event: serde_json::Value::Null,
+        };
+    }
+    let access_event = |decision: &str,
+                        request: &ResolvedAccessRequest,
+                        observation: Option<String>|
+     -> serde_json::Value {
+        let mut event = serde_json::json!({
+            "decision": decision,
+            "writes": request.displays(),
+            "reason": request.reason,
+        });
+        if let Some(text) = observation {
+            event["observation"] = serde_json::Value::String(text);
+        }
+        event
+    };
+    let resolved = match resolve_access_request(&block, inv.mode) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let request = ResolvedAccessRequest {
+                targets: Vec::new(),
+                reason: block.reason.clone(),
+            };
+            let observation = authorization_observation(
+                turn,
+                step,
+                "authorization_invalid",
+                &request,
+                format!(
+                    "no program was executed; the access request is invalid: {error}. Fix the access block and resend one complete program"
+                ),
+            );
+            return AccessDecision {
+                authority: None,
+                event: access_event("invalid", &request, Some(observation)),
+            };
+        }
+    };
+    match inv.mode {
+        FilesystemMode::FullAccess => AccessDecision {
+            authority: Some(RunFilesystemAuthority::FullAccess),
+            event: access_event("declared", &resolved, None),
+        },
+        FilesystemMode::ReadOnly => {
+            let observation = authorization_observation(
+                turn,
+                step,
+                "authorization_denied",
+                &resolved,
+                "no program was executed; the current invocation is read-only and every write \
+                 is denied. Do not request writes again in this invocation; continue with \
+                 read-only work or hand off to the user.",
+            );
+            AccessDecision {
+                authority: None,
+                event: access_event("deny", &resolved, Some(observation)),
+            }
+        }
+        FilesystemMode::PlannedWrite => {
+            let remainder: Vec<_> = resolved
+                .targets
+                .iter()
+                .filter(|target| !covered_by_scopes(&inv.operator_scopes, target))
+                .cloned()
+                .collect();
+            if remainder.is_empty() {
+                return AccessDecision {
+                    authority: Some(freeze_authority(&inv.operator_scopes, &[])),
+                    event: access_event("covered", &resolved, None),
+                };
+            }
+            let prompt_request = ResolvedAccessRequest {
+                targets: remainder,
+                reason: resolved.reason.clone(),
+            };
+            match inv.authorizer.decide(&prompt_request) {
+                Decision::Allow => AccessDecision {
+                    authority: Some(freeze_authority(
+                        &inv.operator_scopes,
+                        &prompt_request.targets,
+                    )),
+                    event: access_event("allow", &prompt_request, None),
+                },
+                Decision::Deny => AccessDecision {
+                    authority: None,
+                    event: access_event(
+                        "deny",
+                        &prompt_request,
+                        Some(authorization_observation(
+                            turn,
+                            step,
+                            "authorization_denied",
+                            &prompt_request,
+                            "no program was executed; the user denied the requested write set. \
+                             Do not re-request the same set within this turn; continue read-only \
+                             or hand off to the user",
+                        )),
+                    ),
+                },
+                Decision::Cancel => AccessDecision {
+                    authority: None,
+                    event: access_event(
+                        "cancel",
+                        &prompt_request,
+                        Some(authorization_observation(
+                            turn,
+                            step,
+                            "authorization_cancelled",
+                            &prompt_request,
+                            "no program was executed; the user cancelled the authorization \
+                             request. Do not re-request the same set within this turn; continue \
+                             read-only or hand off to the user",
+                        )),
+                    ),
+                },
+                Decision::Unavailable => AccessDecision {
+                    authority: None,
+                    event: access_event(
+                        "unavailable",
+                        &prompt_request,
+                        Some(authorization_observation(
+                            turn,
+                            step,
+                            "authorization_unavailable",
+                            &prompt_request,
+                            "no program was executed; no interactive authorizer is available in \
+                             this invocation, so no write can be authorized here. Continue \
+                             read-only or hand off to the user",
+                        )),
+                    ),
+                },
+            }
+        }
+    }
 }
 
 fn recover_unknown_run(journal: &mut Journal, run_seq: u64) -> Result<(), String> {
@@ -489,17 +733,21 @@ fn process_model_result(
     turn: u64,
     step: u64,
     reply: llm::ModelReply,
-    default_timeout: u64,
-    max_timeout: u64,
+    limits: (u64, u64),
+    state: &RuntimeState,
 ) -> Result<(), String> {
     let extracted = extract(&reply.content);
     let action = if let Some(message) = observation_for_extract(turn, step, &extracted) {
-        serde_json::json!({"kind":"observation","message":message})
-    } else if let Extracted::Run(program) = extracted {
+        serde_json::json!({"kind":"observation","message":state.prepend(&message)})
+    } else if let Extracted::Run { program, access } = extracted {
         serde_json::json!({
             "kind": "run",
             "source": program.code,
-            "timeoutMs": program.timeout_ms.unwrap_or(default_timeout).min(max_timeout),
+            "timeoutMs": program.timeout_ms.unwrap_or(limits.0).min(limits.1),
+            "access": {
+                "writes": access.as_ref().map(|b| b.writes.clone()).unwrap_or_default(),
+                "reason": access.as_ref().map(|b| b.reason.clone()).unwrap_or_default(),
+            },
         })
     } else {
         unreachable!()
@@ -589,6 +837,7 @@ async fn model_attempt(
     turn: &Event,
     step: u64,
     attempt: u64,
+    state: &RuntimeState,
 ) -> Result<(), String> {
     let request_seq = journal.append(
         "model/request",
@@ -612,8 +861,8 @@ async fn model_attempt(
                 turn_number,
                 step,
                 reply,
-                limits.0,
-                limits.1,
+                limits,
+                state,
             )
         }
         Err(error) => {
@@ -654,7 +903,27 @@ fn interrupted_model_result(request: &Event) -> serde_json::Value {
     })
 }
 
-async fn drive(mut journal: Journal, mounts: &[Mount]) -> i32 {
+/// Rebuild the frozen authority for a run whose decision was already journaled. Historical
+/// decisions are not authority by themselves — the reconstructed set is re-resolved from the
+/// journaled request against the current invocation's operator scopes.
+fn authority_from_journaled_decision(
+    inv: &Invocation,
+    action: &serde_json::Value,
+    decision: &str,
+) -> Option<RunFilesystemAuthority> {
+    match decision {
+        "declared" => Some(RunFilesystemAuthority::FullAccess),
+        "covered" => Some(freeze_authority(&inv.operator_scopes, &[])),
+        "allow" => match resolve_access_request(&access_block_of(action), inv.mode) {
+            Ok(resolved) => Some(freeze_authority(&inv.operator_scopes, &resolved.targets)),
+            Err(_) => None,
+        },
+        _ => None,
+    }
+}
+
+async fn drive(journal: Journal, inv: &Invocation<'_>) -> i32 {
+    let mut journal = journal;
     loop {
         let Some(turn) = journal.open_turn().cloned() else {
             return 1;
@@ -688,7 +957,7 @@ async fn drive(mut journal: Journal, mounts: &[Mount]) -> i32 {
                     let step = request
                         .and_then(|event| event.data["step"].as_u64())
                         .unwrap_or(1);
-                    if let Err(e) = model_attempt(&mut journal, &turn, step, 2).await {
+                    if let Err(e) = model_attempt(&mut journal, &turn, step, 2, &inv.state).await {
                         eprintln!("terrarium: {e}");
                         return 1;
                     }
@@ -731,6 +1000,54 @@ async fn drive(mut journal: Journal, mounts: &[Mount]) -> i32 {
                     }
                     continue;
                 }
+                // a journaled decision is replay-aware: blocking decisions are final for
+                // this response, permissive ones rebuild the frozen authority
+                let authority = if let Some(access) = journal.events.iter().rev().find(|event| {
+                    event.kind == "run/access"
+                        && event.data["modelResultSeq"].as_u64() == Some(last.seq)
+                }) {
+                    match authority_from_journaled_decision(
+                        inv,
+                        &last.data["action"],
+                        access.data["decision"].as_str().unwrap_or_default(),
+                    ) {
+                        Some(authority) => authority,
+                        None => continue,
+                    }
+                } else {
+                    let turn_number = journal
+                        .events
+                        .iter()
+                        .filter(|event| event.kind == "turn/start" && event.seq <= turn.seq)
+                        .count() as u64;
+                    let step = journal
+                        .events
+                        .iter()
+                        .find(|event| event.seq == last.data["requestSeq"].as_u64().unwrap_or(0))
+                        .and_then(|event| event.data["step"].as_u64())
+                        .unwrap_or(1);
+                    let decision =
+                        authorize_run_access(inv, &last.data["action"], turn_number, step);
+                    let mut event = decision.event;
+                    if !event.is_null() {
+                        event["modelResultSeq"] = serde_json::json!(last.seq);
+                        if event.get("observation").and_then(|o| o.as_str()).is_some() {
+                            let observation = event["observation"]
+                                .as_str()
+                                .expect("observation string")
+                                .to_string();
+                            event["observation"] =
+                                serde_json::Value::String(inv.state.prepend(&observation));
+                        }
+                        if journal.append("run/access", event).is_err() {
+                            return 1;
+                        }
+                    }
+                    match decision.authority {
+                        Some(authority) => authority,
+                        None => continue,
+                    }
+                };
                 let run_seq = match journal
                     .append("run/start", serde_json::json!({"modelResultSeq":last.seq}))
                 {
@@ -752,11 +1069,11 @@ async fn drive(mut journal: Journal, mounts: &[Mount]) -> i32 {
                 match execute_run(
                     &mut journal,
                     run_seq,
-                    turn_number,
-                    step,
+                    (turn_number, step),
                     &last.data["action"],
-                    mounts,
+                    &authority,
                     limits,
+                    &inv.state,
                 )
                 .await
                 {
@@ -830,7 +1147,7 @@ async fn drive(mut journal: Journal, mounts: &[Mount]) -> i32 {
             }
             continue;
         }
-        if let Err(e) = model_attempt(&mut journal, &turn, step, 1).await {
+        if let Err(e) = model_attempt(&mut journal, &turn, step, 1, &inv.state).await {
             eprintln!("terrarium: {e}");
             return 1;
         }
@@ -845,15 +1162,52 @@ fn read_message(args: &[String]) -> Result<String, String> {
     Ok(args.join(" "))
 }
 
-pub async fn run_cli(args: &[String]) -> i32 {
+fn parse_invocation<'a>(
+    read_only: bool,
+    full_access: bool,
+    allow_write: &[String],
+    working_root: String,
+    timeout: u64,
+    authorizer: &'a dyn Authorizer,
+) -> Result<Invocation<'a>, String> {
+    if read_only && full_access {
+        return Err("--read-only and --full-access are mutually exclusive".into());
+    }
+    if (read_only || full_access) && !allow_write.is_empty() {
+        return Err(
+            "--allow-write is valid only in planned-write mode; it cannot be combined with \
+             --read-only or --full-access"
+                .into(),
+        );
+    }
+    let mode = if read_only {
+        FilesystemMode::ReadOnly
+    } else if full_access {
+        FilesystemMode::FullAccess
+    } else {
+        FilesystemMode::PlannedWrite
+    };
+    let mut operator_scopes = Vec::with_capacity(allow_write.len());
+    for spec in allow_write {
+        operator_scopes.push(WriteScope::from_operator_spec(spec)?);
+    }
+    Ok(Invocation {
+        mode,
+        operator_scopes,
+        state: RuntimeState::new(working_root, mode, timeout),
+        authorizer,
+    })
+}
+
+pub async fn run_cli(args: &[String], authorizer: &dyn Authorizer) -> i32 {
     let mut profile: Option<String> = None;
     let mut config_path: Option<std::path::PathBuf> = None;
     let mut resume: Option<String> = None;
     let mut read_only = false;
     let mut full = false;
+    let mut allow_write: Vec<String> = Vec::new();
     let mut max_steps = DEFAULT_MAX_STEPS;
     let mut timeout = RUN_TIMEOUT_DEFAULT_MS;
-    let mut explicit_mounts = Vec::new();
     let mut message = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -878,6 +1232,14 @@ pub async fn run_cli(args: &[String]) -> i32 {
                 full = true;
                 i += 1;
             }
+            "--allow-write" if i + 1 < args.len() => {
+                allow_write.push(args[i + 1].clone());
+                i += 2;
+            }
+            "--allow-write" => {
+                eprintln!("terrarium: --allow-write expects an absolute DIR or FILE path");
+                return 2;
+            }
             "--max-steps" if i + 1 < args.len() => {
                 max_steps = args[i + 1].parse().ok().filter(|v| *v >= 1).unwrap_or(0);
                 if max_steps == 0 {
@@ -898,17 +1260,6 @@ pub async fn run_cli(args: &[String]) -> i32 {
                 }
                 i += 2;
             }
-            "--mount" if i + 1 < args.len() => {
-                if let Err(error) = add_mount(&mut explicit_mounts, &args[i + 1]) {
-                    eprintln!("terrarium: {error}");
-                    return 2;
-                }
-                i += 2;
-            }
-            "--mount" => {
-                eprintln!("terrarium: --mount expects /virtual=real[:rw]");
-                return 2;
-            }
             arg if arg.starts_with("--") => {
                 eprintln!("terrarium: unknown or incomplete flag: {arg}");
                 return 2;
@@ -919,13 +1270,6 @@ pub async fn run_cli(args: &[String]) -> i32 {
             }
         }
     }
-    let access = match AccessMode::parse(read_only, full) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("terrarium: {e}");
-            return 2;
-        }
-    };
     let is_resume = resume.is_some();
     let text = if is_resume {
         message.join(" ")
@@ -950,23 +1294,14 @@ pub async fn run_cli(args: &[String]) -> i32 {
             return 0;
         }
     }
-    let (mut journal, mounts) = if let Some(id) = &resume {
-        let journal = match Journal::open(id) {
+    let mut journal = if let Some(id) = &resume {
+        match Journal::open(id) {
             Ok(j) => j,
             Err(e) => {
                 eprintln!("terrarium: {e}");
                 return 2;
             }
-        };
-        let root = journal.header.working_root.display_path.clone();
-        let mounts = match invocation_mounts(access, &root, explicit_mounts) {
-            Ok(mounts) => mounts,
-            Err(error) => {
-                eprintln!("terrarium: {error}");
-                return 2;
-            }
-        };
-        (journal, mounts)
+        }
     } else {
         let root = match std::env::current_dir() {
             Ok(root) => root,
@@ -975,24 +1310,22 @@ pub async fn run_cli(args: &[String]) -> i32 {
                 return 2;
             }
         };
-        let root_display = root.to_string_lossy().into_owned();
-        let mounts = match invocation_mounts(access, &root_display, explicit_mounts) {
-            Ok(mounts) => mounts,
-            Err(error) => {
-                eprintln!("terrarium: {error}");
-                return 2;
-            }
-        };
-        let journal = match Journal::create(&root) {
+        match Journal::create(&root) {
             Ok(j) => j,
             Err(e) => {
                 eprintln!("terrarium: {e}");
                 return 2;
             }
-        };
-        (journal, mounts)
+        }
     };
     let root = journal.header.working_root.display_path.clone();
+    let inv = match parse_invocation(read_only, full, &allow_write, root, timeout, authorizer) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("terrarium: {e}");
+            return 2;
+        }
+    };
     if journal.open_turn().is_some() {
         if !message.is_empty() || profile.is_some() || config_path.is_some() {
             eprintln!(
@@ -1034,16 +1367,15 @@ pub async fn run_cli(args: &[String]) -> i32 {
                 &mut journal,
                 &text,
                 &selected,
-                &root,
+                &inv.state,
                 max_steps,
                 timeout,
-                &mounts,
             ) {
                 eprintln!("terrarium: {e}");
                 return 1;
             }
         } else if let Some(previous) = previous {
-            if let Err(e) = copy_turn(&mut journal, &text, &previous, &root, &mounts) {
+            if let Err(e) = copy_turn(&mut journal, &text, &previous, &inv.state) {
                 eprintln!("terrarium: {e}");
                 return 1;
             }
@@ -1066,10 +1398,9 @@ pub async fn run_cli(args: &[String]) -> i32 {
                 &mut journal,
                 &text,
                 &selected,
-                &root,
+                &inv.state,
                 max_steps,
                 timeout,
-                &mounts,
             ) {
                 eprintln!("terrarium: {e}");
                 return 1;
@@ -1079,92 +1410,89 @@ pub async fn run_cli(args: &[String]) -> i32 {
             eprintln!("{}", journal.id);
         }
     }
-    drive(journal, &mounts).await
+    drive(journal, &inv).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::ResolvedTarget;
+    use std::path::PathBuf;
 
-    #[test]
-    fn full_access_uses_filesystem_root_and_prompt_lists_denials() {
-        let mounts = invocation_mounts(AccessMode::Full, "/tmp", Vec::new()).unwrap();
-        assert_eq!(mounts.len(), 1);
-        assert_eq!(mounts[0].virtual_path(), "/");
-        let profile = llm::test_profile(
-            "openai-chat-completions",
-            "https://example.test",
-            "test-model",
-        );
-        let prompt = system_prompt(&profile, "/tmp", 100, &mounts);
-        assert!(prompt.contains("Filesystem root"), "{prompt}");
-        assert!(prompt.contains("do not retry"), "{prompt}");
+    fn state(mode: FilesystemMode) -> RuntimeState {
+        RuntimeState::new("/code/terrarium".into(), mode, 10_000)
     }
 
     #[test]
-    fn prompt_starts_with_main_instructions_and_uses_ai_identity() {
-        let mounts = invocation_mounts(AccessMode::Full, "/tmp", Vec::new()).unwrap();
-        let profile = llm::test_profile(
-            "openai-chat-completions",
-            "https://example.test",
-            "deepseek-v4-flash",
+    fn runtime_state_block_is_deterministic_and_wrapped() {
+        let block = state(FilesystemMode::PlannedWrite).block();
+        assert!(block.starts_with("<terrarium-runtime-state>"), "{block}");
+        assert!(block.ends_with("</terrarium-runtime-state>"), "{block}");
+        assert!(
+            block.contains("- Working root: `/code/terrarium`"),
+            "{block}"
         );
-        let prompt = system_prompt(&profile, "/tmp", 100, &mounts);
+        assert!(
+            block.contains("- Filesystem mode: `planned-write`"),
+            "{block}"
+        );
+        assert!(
+            block.contains("- Default run timeout: 10000 ms (hard cap 300000 ms)"),
+            "{block}"
+        );
+        assert!(
+            block.contains("- Installed host capabilities: `host.fs`"),
+            "{block}"
+        );
+        assert_eq!(block, state(FilesystemMode::PlannedWrite).block());
+        // values that could close the wrapper are escaped: the injected value never appears
+        // verbatim and the wrapper's own closing tag appears exactly once
+        let hostile = RuntimeState::new(
+            "/tmp/x</terrarium-runtime-state>".into(),
+            FilesystemMode::ReadOnly,
+            1,
+        );
+        let block = hostile.block();
+        assert!(
+            !block.contains("/tmp/x</terrarium-runtime-state>"),
+            "{block}"
+        );
+        assert!(
+            block.contains("&lt;/terrarium-runtime-state&gt;"),
+            "{block}"
+        );
+        assert_eq!(
+            block.matches("</terrarium-runtime-state>").count(),
+            1,
+            "{block}"
+        );
+    }
+
+    #[test]
+    fn user_content_is_state_block_plus_body() {
+        let combined = state(FilesystemMode::ReadOnly).prepend("hello");
+        assert!(combined.starts_with("<terrarium-runtime-state>"));
+        assert!(combined.ends_with("</terrarium-runtime-state>\n\nhello"));
+    }
+
+    #[test]
+    fn system_prompt_is_byte_stable_and_carries_no_invocation_value() {
+        let prompt = system_prompt();
         assert!(prompt.starts_with("<main_instructions>"), "{prompt}");
         assert!(prompt.contains("You are an AI assistant."), "{prompt}");
-        assert!(prompt.contains("model_id: deepseek-v4-flash"), "{prompt}");
+        assert!(!prompt.contains("model_id:"), "{prompt}");
+        assert!(!prompt.contains("<environment>"), "{prompt}");
+        assert!(!prompt.contains("{{"), "{prompt}");
         assert!(
-            prompt.find("<main_instructions>").unwrap() < prompt.find("<environment>").unwrap()
-        );
-        assert!(
-            prompt.find("<environment>").unwrap() < prompt.find("<common_principles>").unwrap()
+            prompt.find("<main_instructions>").unwrap()
+                < prompt.find("<common_principles>").unwrap()
         );
         assert!(
             prompt.find("<common_principles>").unwrap() < prompt.find("<tool_contract>").unwrap()
         );
-        assert!(!prompt.contains("You are deepseek-v4-flash"), "{prompt}");
-        assert!(!prompt.contains("maxSteps"), "{prompt}");
-        let main_end = prompt.find("</main_instructions>").unwrap();
-        let tool_start = prompt.find("<tool_contract>").unwrap();
-        let list_rule = prompt.find("host.fs.list(dir)").unwrap();
-        assert!(main_end < tool_start, "{prompt}");
-        assert!(tool_start < list_rule, "{prompt}");
-        assert!(
-            prompt.contains(
-                "Treat one run as the largest safe deterministic work unit, not as one tool call"
-            ),
-            "{prompt}"
-        );
-        assert!(
-            prompt.contains("Define the evidence and success postcondition that establish it"),
-            "{prompt}"
-        );
-        assert!(
-            prompt.contains("A model boundary is justified only when"),
-            "{prompt}"
-        );
-        assert!(
-            prompt.contains("`to: \"model\"` is not a progress report"),
-            "{prompt}"
-        );
-        assert!(
-            prompt.contains("discover, classify, act, and verify"),
-            "{prompt}"
-        );
-        assert!(prompt.contains("elapsedMs"), "{prompt}");
-        assert!(
-            !prompt.contains("A bounded search keeps the full result inside the current run"),
-            "{prompt}"
-        );
-        assert!(
-            !prompt.contains("A defensive one-pass workflow can combine several host APIs"),
-            "{prompt}"
-        );
-        assert!(
-            !prompt.contains("This is the shortest reliable edit path"),
-            "{prompt}"
-        );
+        assert_eq!(prompt, system_prompt());
     }
+
     #[test]
     fn greetings_are_not_sent_through_the_agent_loop() {
         assert_eq!(
@@ -1180,9 +1508,6 @@ mod tests {
 
     #[test]
     fn final_attempt_transport_failures_are_journaled_as_not_retryable() {
-        // llm marks every transport error retryable; the journal validator rejects a
-        // failed attempt-2 result that still claims retryable, so the ledger writer
-        // must clear the flag on the final attempt.
         let error = llm::LlmError {
             kind: "transport",
             message: "failed to read response".into(),
@@ -1196,48 +1521,366 @@ mod tests {
     }
 
     #[test]
-    fn only_closed_run_fences_are_programs() {
-        let Extracted::Run(block) = extract("notes\n```run\nreturn 42\n```") else {
-            panic!("expected run")
+    fn only_closed_fences_are_programs() {
+        let Extracted::Run { program, .. } = extract("notes\n```run\nreturn 42\n```") else {
+            panic!("expected run");
         };
-        assert_eq!(block.code, "return 42\n");
+        assert_eq!(program.code, "return 42\n");
         assert!(matches!(extract("plain answer"), Extracted::NoRun));
         assert!(matches!(extract("```run\nreturn 42"), Extracted::Truncated));
+        assert!(matches!(
+            extract("```access\n{\"writes\":[],\"reason\":\"\"}\n```"),
+            Extracted::NoRun
+        ));
+        assert!(matches!(
+            extract("```run\nreturn 1\n```\n```run\nreturn 2\n```"),
+            Extracted::Multiple
+        ));
+        assert!(matches!(
+            extract("```access\n{}\n```\n```access\n{}\n```\n```run\nreturn 1\n```"),
+            Extracted::Multiple
+        ));
     }
 
     #[test]
-    fn restricted_access_keeps_explicit_mounts_for_the_invocation() {
-        let workdir = std::env::temp_dir();
-        let root_display = workdir.to_string_lossy().into_owned();
-        let extra = Mount::from_canonical("/outside", workdir.clone(), false).unwrap();
-        let mounts = invocation_mounts(AccessMode::ReadOnly, &root_display, vec![extra]).unwrap();
-        let expected_root = Mount::new(&root_display, &workdir, false)
+    fn access_block_rules_match_the_contract() {
+        let root = std::env::temp_dir();
+        let file = root.join("terrarium-access-test-file.txt");
+        std::fs::write(&file, "x").unwrap();
+        let file_display = file.to_string_lossy().replace('\\', "/");
+        let full = extract(&format!(
+            "```access\n{{\"writes\":[\"{}\"],\"reason\":\"update the file\"}}\n```\n```run\nreturn 1\n```",
+            file_display
+        ));
+        let Extracted::Run { access, .. } = full else {
+            panic!("expected run");
+        };
+        let access = access.expect("access block");
+        assert_eq!(access.writes, vec![file_display.clone()]);
+        assert_eq!(access.reason, "update the file");
+        let resolved = resolve_access_request(&access, FilesystemMode::PlannedWrite).unwrap();
+        assert_eq!(resolved.targets.len(), 1);
+        assert_eq!(resolved.targets[0].display, file_display);
+        assert!(!resolved.targets[0].parents_missing);
+
+        // absent access block = empty request
+        let missing = extract("```run\nreturn 1\n```");
+        let Extracted::Run { access, .. } = missing else {
+            panic!("expected run")
+        };
+        assert!(access.is_none());
+
+        // invalid JSON / shapes are protocol errors, not empty requests
+        assert!(matches!(
+            extract("```access\nnot json\n```\n```run\nreturn 1\n```"),
+            Extracted::InvalidAccess(_)
+        ));
+        assert!(matches!(
+            extract("```access\n{\"writes\":[]}\n```\n```run\nreturn 1\n```"),
+            Extracted::InvalidAccess(_)
+        ));
+        assert!(matches!(
+            extract("```access\n{\"writes\":[],\"reason\":\"\",\"extra\":1}\n```\n```run\nreturn 1\n```"),
+            Extracted::InvalidAccess(_)
+        ));
+        // access after run is ambiguous
+        assert!(matches!(
+            extract("```run\nreturn 1\n```\n```access\n{\"writes\":[],\"reason\":\"\"}\n```"),
+            Extracted::AccessAfterRun
+        ));
+    }
+
+    #[test]
+    fn access_request_bounds_and_path_rules_are_enforced() {
+        let root = std::env::temp_dir().join("terrarium-access-rules");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let existing = root.join("existing.txt");
+        std::fs::write(&existing, "x").unwrap();
+        let existing_display = existing.to_string_lossy().replace('\\', "/");
+
+        let resolve = |writes: &[String], reason: &str, mode| {
+            resolve_access_request(
+                &AccessBlock {
+                    writes: writes.to_vec(),
+                    reason: reason.into(),
+                },
+                mode,
+            )
+        };
+        // planned-write requires a reason for non-empty requests
+        assert!(resolve(
+            std::slice::from_ref(&existing_display),
+            "",
+            FilesystemMode::PlannedWrite
+        )
+        .is_err());
+        assert!(resolve(
+            std::slice::from_ref(&existing_display),
+            "r",
+            FilesystemMode::PlannedWrite
+        )
+        .is_ok());
+        // other modes do not
+        assert!(resolve(
+            std::slice::from_ref(&existing_display),
+            "",
+            FilesystemMode::FullAccess
+        )
+        .is_ok());
+        assert!(resolve(
+            std::slice::from_ref(&existing_display),
+            "",
+            FilesystemMode::ReadOnly
+        )
+        .is_ok());
+
+        let dir = root.to_string_lossy().replace('\\', "/");
+        // directories, globs, relative paths, dot segments, duplicates
+        assert!(
+            resolve(std::slice::from_ref(&dir), "r", FilesystemMode::FullAccess)
+                .unwrap_err()
+                .contains("directory")
+        );
+        assert!(resolve(&[format!("{dir}/*.txt")], "r", FilesystemMode::FullAccess).is_err());
+        assert!(resolve(
+            &["relative.txt".to_string()],
+            "r",
+            FilesystemMode::FullAccess
+        )
+        .is_err());
+        assert!(resolve(
+            &[format!("{dir}/../x.txt")],
+            "r",
+            FilesystemMode::FullAccess
+        )
+        .is_err());
+        assert!(resolve(
+            &[existing_display.clone(), existing_display.clone()],
+            "r",
+            FilesystemMode::FullAccess
+        )
+        .unwrap_err()
+        .contains("duplicate"));
+        // new files resolve and are marked as parent-creating
+        let resolved = resolve(
+            &[format!("{dir}/new/deep/file.txt")],
+            "r",
+            FilesystemMode::FullAccess,
+        )
+        .unwrap();
+        assert!(resolved.targets[0].parents_missing);
+        // existing symlink targets are rejected for writes
+        #[cfg(unix)]
+        {
+            let link = root.join("link.txt");
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&existing, &link).unwrap();
+            let error = resolve(
+                &[link.to_string_lossy().into_owned()],
+                "r",
+                FilesystemMode::FullAccess,
+            )
+            .unwrap_err();
+            assert!(error.contains("symbolic"), "{error}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn access_request_size_bounds_hold() {
+        let too_many: Vec<String> = (0..33)
+            .map(|index| format!("/tmp/file-{index}.txt"))
+            .collect();
+        assert!(parse_access_block(
+            &serde_json::json!({"writes": too_many, "reason": "r"}).to_string()
+        )
+        .unwrap_err()
+        .contains("32"));
+        let long_reason = "r".repeat(201);
+        assert!(parse_access_block(
+            &serde_json::json!({"writes": [], "reason": long_reason}).to_string()
+        )
+        .unwrap_err()
+        .contains("200"));
+        let oversized = serde_json::json!({"writes": [format!("/tmp/{}.txt", "x".repeat(5000))], "reason": "r"}).to_string();
+        assert!(parse_access_block(&oversized).unwrap_err().contains("4096"));
+    }
+
+    struct FixedAuthorizer(Decision);
+
+    impl Authorizer for FixedAuthorizer {
+        fn decide(&self, _request: &ResolvedAccessRequest) -> Decision {
+            self.0
+        }
+    }
+
+    fn invocation_with(mode: FilesystemMode, decision: Decision) -> Invocation<'static> {
+        let authorizer: &'static FixedAuthorizer = Box::leak(Box::new(FixedAuthorizer(decision)));
+        let root = std::env::temp_dir().join("terrarium-auth-inv");
+        std::fs::create_dir_all(&root).unwrap();
+        let scopes = vec![WriteScope::from_operator_spec(&root.to_string_lossy()).unwrap()];
+        Invocation {
+            mode,
+            operator_scopes: scopes,
+            state: RuntimeState::new(root.to_string_lossy().into_owned(), mode, 10_000),
+            authorizer,
+        }
+    }
+
+    fn run_action(writes: &[String], reason: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "run",
+            "source": "return 1",
+            "timeoutMs": 100,
+            "access": {"writes": writes, "reason": reason}
+        })
+    }
+
+    #[test]
+    fn planned_write_lifecycle_subtracts_prompts_and_freezes() {
+        let root = std::env::temp_dir().join("terrarium-auth-lifecycle");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let inside = root.join("inside.txt");
+        std::fs::write(&inside, "x").unwrap();
+        // a sibling of the scoped root: outside every operator scope, but a clean absolute
+        // path (lexical `..` escapes are rejected at validation and would test the wrong rule)
+        let outside = std::env::temp_dir().join("terrarium-auth-outside.txt");
+        std::fs::write(&outside, "x").unwrap();
+        let root_display = root.to_string_lossy().replace('\\', "/");
+        let scope = WriteScope::from_operator_spec(&root_display).unwrap();
+        let state = RuntimeState::new(root_display.clone(), FilesystemMode::PlannedWrite, 10_000);
+        let inside_display = inside.to_string_lossy().replace('\\', "/");
+        let outside_display = outside.to_string_lossy().replace('\\', "/");
+
+        // covered: operator scope absorbs the request, no prompt, no approved exacts
+        let inv = Invocation {
+            mode: FilesystemMode::PlannedWrite,
+            operator_scopes: vec![scope.clone()],
+            state: RuntimeState::new(root_display.clone(), FilesystemMode::PlannedWrite, 10_000),
+            authorizer: &FixedAuthorizer(Decision::Deny),
+        };
+        let covered = authorize_run_access(
+            &inv,
+            &run_action(std::slice::from_ref(&inside_display), "edit"),
+            1,
+            1,
+        );
+        assert_eq!(covered.event["decision"], "covered");
+        let authority = covered.authority.expect("covered runs");
+        assert!(authority
+            .authorize_write("display", &inside.canonicalize().unwrap())
+            .is_ok());
+
+        // remainder prompts: denial ends the run with a structured observation
+        let denied = authorize_run_access(
+            &inv,
+            &run_action(std::slice::from_ref(&outside_display), "edit outside"),
+            1,
+            2,
+        );
+        assert!(denied.authority.is_none());
+        assert_eq!(denied.event["decision"], "deny");
+        let observation = denied.event["observation"].as_str().unwrap();
+        assert!(
+            observation.contains("authorization_denied"),
+            "{observation}"
+        );
+        assert!(
+            observation.contains("denied the requested write set"),
+            "{observation}"
+        );
+
+        // approval freezes operator scopes plus the approved exact path
+        let allowing_inv = Invocation {
+            mode: FilesystemMode::PlannedWrite,
+            operator_scopes: vec![scope.clone()],
+            state: RuntimeState::new(root_display.clone(), FilesystemMode::PlannedWrite, 10_000),
+            authorizer: &FixedAuthorizer(Decision::Allow),
+        };
+        let allowed = authorize_run_access(
+            &allowing_inv,
+            &run_action(
+                &[inside_display.clone(), outside_display.clone()],
+                "edit both",
+            ),
+            1,
+            3,
+        );
+        assert_eq!(allowed.event["decision"], "allow");
+        let authority = allowed.authority.expect("approved run");
+        assert!(authority
+            .authorize_write("display", &outside.canonicalize().unwrap())
+            .is_ok());
+        assert!(authority
+            .authorize_write("display", &inside.canonicalize().unwrap())
+            .is_ok());
+        // a path outside every frozen scope stays denied even after an approval
+        let bystander = std::env::temp_dir().join("terrarium-auth-bystander.txt");
+        std::fs::write(&bystander, "x").unwrap();
+        let bystander_identity = bystander.canonicalize().unwrap();
+        let _ = std::fs::remove_file(&bystander);
+        assert!(authority
+            .authorize_write("display", &bystander_identity)
+            .is_err());
+
+        // unavailable: no interactive authorizer in this invocation
+        let unavailable_inv = Invocation {
+            mode: FilesystemMode::PlannedWrite,
+            operator_scopes: vec![scope],
+            state,
+            authorizer: &FixedAuthorizer(Decision::Unavailable),
+        };
+        let unavailable = authorize_run_access(
+            &unavailable_inv,
+            &run_action(std::slice::from_ref(&outside_display), "edit"),
+            1,
+            4,
+        );
+        assert!(unavailable.authority.is_none());
+        assert_eq!(unavailable.event["decision"], "unavailable");
+        assert!(unavailable.event["observation"]
+            .as_str()
             .unwrap()
-            .virtual_path()
-            .to_string();
-        let paths = mounts.iter().map(Mount::virtual_path).collect::<Vec<_>>();
-        assert!(paths.contains(&expected_root.as_str()), "{paths:?}");
-        assert!(paths.contains(&"/outside/"), "{paths:?}");
-        let absolute_file = format!(
-            "{}/report.txt",
-            normalize_path(&root_display).trim_end_matches('/')
-        );
-        let canonical_workdir = workdir.canonicalize().unwrap();
+            .contains("no interactive authorizer"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn mode_specific_declarations_are_journaled_not_enforced() {
+        let root = std::env::temp_dir().join("terrarium-auth-modes");
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("f.txt");
+        std::fs::write(&file, "x").unwrap();
+        let display = file.to_string_lossy().replace('\\', "/");
+        let action = run_action(&[display], "r");
+
+        let full = invocation_with(FilesystemMode::FullAccess, Decision::Deny);
+        let declared = authorize_run_access(&full, &action, 1, 1);
+        assert_eq!(declared.event["decision"], "declared");
+        assert!(declared.event.get("observation").is_none());
         assert_eq!(
-            crate::fs::resolve_mount(&mounts, &absolute_file).unwrap(),
-            canonical_workdir.join("report.txt")
+            declared.authority.expect("full access runs"),
+            RunFilesystemAuthority::FullAccess
         );
-        let profile = llm::test_profile(
-            "openai-chat-completions",
-            "https://example.test",
-            "test-model",
-        );
-        let prompt = system_prompt(&profile, &root_display, 100, &mounts);
-        let prompt_root = normalize_path(&root_display);
-        assert!(prompt.contains(&prompt_root), "{prompt}");
-        assert!(prompt.contains("/outside"), "{prompt}");
-        assert!(prompt.contains("Accessible roots"), "{prompt}");
-        assert!(prompt.contains("--mount"), "{prompt}");
+
+        let read_only = invocation_with(FilesystemMode::ReadOnly, Decision::Allow);
+        let denied = authorize_run_access(&read_only, &action, 1, 2);
+        assert!(denied.authority.is_none());
+        assert_eq!(denied.event["decision"], "deny");
+        assert!(denied.event["observation"]
+            .as_str()
+            .unwrap()
+            .contains("read-only"));
+
+        // empty request never journals an event and runs under the base authority
+        let empty = run_action(&[], "");
+        let quiet = authorize_run_access(&read_only, &empty, 1, 3);
+        assert!(quiet.event.is_null());
+        assert_eq!(quiet.authority.unwrap(), RunFilesystemAuthority::ReadOnly);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1260,10 +1903,10 @@ mod tests {
         );
         for value in [
             serde_json::json!("done"),
-            serde_json::json!({"to":"model"}),
-            serde_json::json!({"to":"model","facts":"large text"}),
-            serde_json::json!({"to":"user","message":"done","facts":{}}),
-            serde_json::json!({"to":"agent","facts":{}}),
+            serde_json::json!({"to": "model"}),
+            serde_json::json!({"to": "model","facts":"large text"}),
+            serde_json::json!({"to": "user","message":"done","facts":{}}),
+            serde_json::json!({"to": "agent","facts":{}}),
         ] {
             assert!(parse_disposition(Some(value)).is_err());
         }
@@ -1358,63 +2001,51 @@ mod tests {
     }
 
     #[test]
-    fn prompt_distinguishes_recoverable_errors_from_user_handoff() {
-        let mounts = invocation_mounts(AccessMode::Full, "/tmp", Vec::new()).unwrap();
-        let profile = llm::test_profile(
-            "openai-chat-completions",
-            "https://example.test",
-            "test-model",
-        );
-        let prompt = system_prompt(&profile, "/tmp", 100, &mounts);
-        assert!(prompt.contains("A session is a durable conversation"));
-        assert!(prompt.contains("A turn is one user request and stays open while you work"));
-        assert!(prompt.contains("A step is one model response and its one JavaScript run"));
-        assert!(prompt.contains("`to: \"model\"` ends only the current run"));
-        assert!(prompt.contains("`to: \"user\"` ends the turn"));
-        assert!(prompt.contains("The host owns turn and step coordinates"));
-        assert!(prompt.contains("If the user explicitly requires an order"));
-        assert!(prompt.contains("Information obtainable from the authorized environment"));
-        assert!(prompt.contains("Relative paths such as `Cargo.toml` are not valid host paths"));
-        assert!(prompt.contains("A semantic interpretation required from the model"));
-        assert!(prompt.contains("Input, permission, or a decision required from the user"));
-        assert!(prompt.contains("A run may commit some writes before a later operation fails"));
-        assert!(prompt.contains("Never blindly repeat a program after partial writes"));
-        assert!(prompt.contains(
-            "permits `{all: true}` only when every exact occurrence in that file should change"
-        ));
-        assert!(prompt.contains("No match is not universally success"));
-        assert!(prompt.contains("Deterministic facts include paths, literal matches, counts"));
-        assert!(prompt.contains("Semantic decisions include what the user meant"));
-        assert!(prompt.contains("A model boundary is justified only when"));
-        assert!(prompt.contains("`to: \"model\"` is not a progress report"));
-        assert!(prompt.contains("A caught operation error is evidence, not task completion"));
-        assert!(prompt.contains("protocol observation means the host rejected the response format"));
-        assert!(
-            prompt.contains("Do not wrap the program in an async IIFE"),
-            "{prompt}"
-        );
-        assert!(prompt.contains("Agent `facts` must serialize to at most 16384 bytes"));
-        assert!(prompt.contains("to: \"model\""));
-        // walk is the file-level primitive; scan yields must never be counted as files
-        assert!(prompt.contains("host.fs.walk"));
-        assert!(prompt.contains("host.fs.replace(path, oldText, newText[, {all}])"));
-        assert!(prompt.contains("enters the next model context only through"));
-        assert!(prompt.contains("discover, classify, act, and verify"));
-        assert!(prompt.contains("Encode expected result branches before execution"));
-        assert!(prompt.contains("A discovery-only run is justified only when"));
-        assert!(prompt.contains("identify the specific question that requires model judgment"));
-        assert!(
-            prompt.contains("include enough bounded evidence for the next step to decide and act")
-        );
-        assert!(prompt.contains("do not create a separate follow-up step merely to read context"));
-        assert!(prompt.contains("If the facts contain only paths, matches, counts"));
-        assert!(prompt
-            .contains("Do not return complete scan results, whole file contents, large arrays"));
-        assert!(prompt.contains("authorized file"));
-        assert!(prompt.contains("return only its path"));
-        assert!(prompt.contains("host-derived write receipts"));
-        assert!(prompt.contains("stable `N: text` line numbers"));
-        assert!(prompt.contains("Counting scan yields counts lines, not files"));
-        assert!(prompt.contains("For one known file, use `host.fs.read` or `host.fs.text` instead"));
+    fn resolved_target_shape_is_display_identity_and_missing_parents() {
+        let target = ResolvedTarget {
+            display: "/tmp/terrarium-target.txt".into(),
+            identity: PathBuf::from("/tmp/terrarium-target.txt"),
+            parents_missing: true,
+        };
+        let request = ResolvedAccessRequest {
+            targets: vec![target],
+            reason: "why".into(),
+        };
+        assert_eq!(request.displays(), vec!["/tmp/terrarium-target.txt"]);
+        assert_eq!(request.reason, "why");
+    }
+
+    #[test]
+    fn parse_invocation_rejects_flag_combinations() {
+        let authorizer = FixedAuthorizer(Decision::Deny);
+        assert!(parse_invocation(true, true, &[], "/tmp".into(), 10_000, &authorizer).is_err());
+        assert!(parse_invocation(
+            true,
+            false,
+            &["/tmp".into()],
+            "/tmp".into(),
+            10_000,
+            &authorizer
+        )
+        .is_err());
+        assert!(parse_invocation(
+            false,
+            true,
+            &["/tmp".into()],
+            "/tmp".into(),
+            10_000,
+            &authorizer
+        )
+        .is_err());
+        assert!(parse_invocation(false, false, &[], "/tmp".into(), 10_000, &authorizer).is_ok());
+        assert!(parse_invocation(
+            false,
+            false,
+            &["/definitely/not/a/real/path".into()],
+            "/tmp".into(),
+            10_000,
+            &authorizer
+        )
+        .is_err());
     }
 }

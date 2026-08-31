@@ -4,6 +4,7 @@
 //! Web UI, should call the library instead of spawning the binary or parsing terminal output.
 
 mod agent;
+mod auth;
 pub mod cli;
 mod config;
 mod fs;
@@ -12,8 +13,9 @@ mod llm;
 mod registry;
 mod session;
 
+pub use auth::{Authorizer, Decision, ResolvedAccessRequest};
 pub use config::{Config, ProfileConfig, ProviderConfig, ResolvedProfile};
-pub use fs::Mount;
+pub use fs::{FilesystemMode, RunFilesystemAuthority, WriteScope};
 pub use kernel::{ErrorKind, Kernel, Outcome, RunError, Termination, WriteSummary};
 
-pub(crate) use kernel::{add_mount, contract_for, eval_js, MAX_TIMEOUT_MS, MEM_LIMIT};
+pub(crate) use kernel::{contract, eval_js, MAX_TIMEOUT_MS, MEM_LIMIT};

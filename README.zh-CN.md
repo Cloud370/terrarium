@@ -26,22 +26,25 @@ Terrarium 是一个有边界的程序运行时：模型输出程序，宿主提�
 
 不变量：
 
-- 模型动作是程序——每次模型回复恰好一个完整的 `run` 围栏，围栏之外的文字一律不执行。
+- 模型动作是程序——每次模型回复至多一个 `access` 围栏加恰好一个完整的 `run` 围栏，围栏之外的文字一律不执行。
 - 每次运行在全新笼子中执行；可变状态不跨运行传递，凭据永不进入笼子。
-- 安全由宿主承担——挂载范围、`:rw` 写入、资源限额、取消。Prompt 描述行为，永远不构成安全边界。
+- 安全由宿主承担——文件系统模式、冻结的写入范围、执行前预授权、资源限额、取消。Prompt 描述行为，永远不构成安全边界。
 - 能力保持显式、最小、有类型、有边界、可观察；错误在边界处暴露，不做静默回退。
 - 搜索由组合完成：宿主负责剪枝（gitignore、glob、字面量 `contains`），JavaScript 做最终判断——刻意不提供宿主侧 grep 或正则能力。
-- 会话是持久化的仅追加 JSONL 文件。模型请求和运行在派发前先写入日志；结果未知的运行会被标记，绝不重放。
+- 会话是持久化的仅追加 JSONL 文件。模型请求、运行和授权决策都写入日志；结果未知的运行会被标记，绝不重放，日志只是审计记录，永远不构成授权。
 - 核心行为是可移植的宿主代码，不依赖平台特定的外部命令，Linux、macOS 和 Windows 行为一致。
 
 ## 协议
 
-一次 agent 轮由多个步骤组成。每次模型回复必须包含一个闭合的 `run` 围栏；每个成功的程序必须返回一个显式的处置对象：
+一次 agent 轮由多个步骤组成。每次模型回复包含可选的一个 `access` 块和恰好一个闭合的 `run` 围栏；每个成功的程序必须返回一个显式的处置对象：
 
 ````text
+```access
+{"writes": ["/home/me/proj/notes.md"], "reason": "把扫描摘要追加进项目笔记"}
+```
 ```run
 const matches = [];
-for await (const line of host.fs.scan("/proj/src", {glob: "*.rs"})) {
+for await (const line of host.fs.scan("/home/me/proj/src", {glob: "*.rs"})) {
   if (line.text.includes("http client")) matches.push({file: line.file, line: line.no});
 }
 return {to: "model", facts: {matches}};
@@ -58,7 +61,7 @@ return {to: "user", message: "HTTP client 配置位于 src/llm/。"};
 
 普通顶层 `return` 会释放本次运行的局部 JavaScript 状态，但不会自行结束轮。格式、解析、遍历、校验、超时及其他可恢复的操作错误，不应自动交还用户；应返回简短 facts 给 `to: "model"`，让下一步修正操作、缩小范围或补充证据。只有结果已经确定，或确实需要用户提供输入、授权或做决定时，才使用 `to: "user"`。只报告错误的 `catch` 块不能结束当前轮。
 
-解析器对每条回复只接受恰好一个完整的 `run` 围栏。缺失、未闭合或出现多个 `run` 围栏都是协议错误——解析器绝不执行第一个块后静默忽略其余块。开栏必须是一行独立的 ```` ```run ````，闭栏必须是一行独立的 ```` ``` ````；行内三反引号既不开栏也不闭栏。围栏外的文字不会执行。没有基于文本的完成标记。
+解析器对每条回复只接受恰好一个完整的 `run` 围栏，且它前面至多一个 `access` 围栏。`run` 缺失、未闭合、出现多个 `run` 或多个 `access`、`access` 出现在 `run` 之后、`access` 内容不是合法的访问 JSON,都是协议错误——解析器绝不执行第一个块后静默忽略其余块。开栏必须是一行独立的 ```` ```run ```` 或 ```` ```access ````,闭栏必须是一行独立的 ```` ``` ````；行内三反引号既不开栏也不闭栏。围栏外的文字不会执行。没有基于文本的完成标记。
 
 每次运行都按同一种 async function body 语义执行，因此顶层 `return` 和 `await` 在所有程序中都合法。结果保留 JSON 值的结构，不会先格式化成字符串。
 
@@ -77,8 +80,12 @@ return {to: "user", message: "HTTP client 配置位于 src/llm/。"};
 
 - 每次运行限制 64MB 堆、1MB 栈和一个硬截止时间。agent 模式默认 10 秒；单次运行默认 2 秒。首行 `// timeout-ms: N` 可将 agent 单次运行提高到最多 300 秒。
 - stdout 每次最多捕获 16KB。宿主文件读取使用有界行窗口或有界全文通道。
-- 文件系统只能访问启动时声明的挂载；写入必须使用 `:rw`。路径越界和解析后越出挂载根的符号链接会被拒绝；scan 从不跟随符号链接。
+- 没有虚拟路径命名空间：程序中的每个路径都是操作系统用户文件视图中的一个绝对路径。读取看到的就是当前 OS 用户可读的内容。写入由本次调用冻结的文件系统授权决定——`read-only` 拒绝一切写入，`planned-write` 要求解析后的目标身份命中已批准的精确文件或操作者声明的范围，`full-access` 只保留路径校验和 OS 自身权限。已存在的符号链接永远不被写入;scan 从不跟随符号链接。
 - API 凭据只留在宿主进程环境中，不会暴露给 JavaScript。
+
+## 写入预授权
+
+默认的 `planned-write` 模式下，需要写入的运行必须先在 `access` 块中声明目标——至多 32 个精确的绝对文件路径加一个理由。宿主解析并校验每条路径，减去已被操作者 `--allow-write` 范围覆盖的部分，把余下部分作为一次整体的允许/拒绝决定在 JavaScript 启动前提交。不存在部分批准；批准只对这一次运行有效，运行结束即作废。被拒绝、取消、非法或不可用（没有交互终端）的请求不会执行代码，而是返回一条有界观察。每个决策——包括 `full-access` 下接受但被忽略的声明——都作为 `run/access` 审计事件写入日志，且永远不会从日志恢复授权。
 
 ## 快速开始
 
@@ -101,29 +108,28 @@ model = "qwen3-coder"
 
 ```sh
 terrarium "review this project"
-terrarium --profile main --read-only "find the unused dependencies"
+terrarium --read-only "find the unused dependencies"
 ```
 
-如果一次调用需要读取工作目录之外的真实绝对路径，可以选择 full access：
+默认模式是 `planned-write`：每次运行的写入通过 `access` 块预授权，未被预先覆盖的部分由终端提问一次允许/拒绝。要预先授予一个目录或文件而不再提示，可加操作者范围：
 
 ```sh
-terrarium --full-access "读取 ~/chat/landscape-monitor"
+terrarium --allow-write "$HOME/proj/notes" "把项目总结写进 notes/summary.md"
 ```
 
-如果只需要授权一个更窄的目录，可声明一个在本次调用的所有运行中都有效的挂载：
+可信调试场景可用显式路径移除范围检查：
 
 ```sh
-terrarium --read-only \
-  --mount /landscape-monitor="$HOME/chat/landscape-monitor" \
-  "读取 landscape-monitor"
+terrarium --full-access "读取 ~/chat/landscape-monitor 并汇报"
 ```
 
-`--full-access` 将 `/` 映射到当前操作系统用户可见的文件系统，但不会绕过操作系统权限。受限模式下 agent 直接使用当前工作目录的绝对路径，以及显式挂载的路径。JavaScript 不会展开 `~`；prompt 会列出可用根目录，并说明如何处理被拒绝的路径。
+`--full-access` 只保留路径校验加上当前操作系统用户自身的权限——它不绕过 OS 权限，也不是 root 访问。`--read-only`、`--full-access` 与 `--allow-write` 之间的组合会在启动时报错。JavaScript 不会展开 `~`;runtime state 会标明工作根，模型必须使用真实绝对路径。
 
-直接执行 JavaScript 使用独立的 `run` 命令：
+直接执行 JavaScript 使用独立的 `run` 命令——默认只读，模式标志相同：
 
 ```sh
 terrarium run -e 'return 1 + 1'
+terrarium run --allow-write /tmp/out.json write-report.js
 ```
 
 agent 会话存储在每用户状态目录中，创建会话时将会话 ID 打印到 stderr；直接运行不会创建会话。
@@ -131,12 +137,12 @@ agent 会话存储在每用户状态目录中，创建会话时将会话 ID 打�
 ## 命令行
 
 ```sh
-terrarium [--config PATH] [--profile NAME] [--read-only | --full-access] [--mount /virtual=real[:rw]] [--max-steps N] [--run-timeout-ms N] [消息...]
-terrarium --resume SESSION_ID [--read-only | --full-access] [--mount /virtual=real[:rw]] [消息...]
-terrarium run [-e SOURCE | FILE] [--read-only | --full-access] [--mount /virtual=real[:rw]] [--timeout-ms N]
+terrarium [--config PATH] [--profile NAME] [--read-only | --full-access | --allow-write DIR|FILE]... [--max-steps N] [--run-timeout-ms N] [消息...]
+terrarium --resume SESSION_ID [--read-only | --full-access | --allow-write DIR|FILE]... [消息...]
+terrarium run [-e SOURCE | FILE] [--read-only | --full-access | --allow-write DIR|FILE]... [--timeout-ms N]
 ```
 
-普通命令始终启动或恢复模型驱动 agent。没有消息参数时，非终端 stdin 可提供消息。`--mount` 对本次调用的每一次运行都有效。默认访问模式是 `workspace`；`--read-only` 与 `--full-access` 互斥；访问模式和挂载都不会写入会话。agent 在程序返回 `to: "user"` 后以 `0` 退出；使用错误或配置错误时以 `2` 退出。直接运行在程序成功时以 `0` 退出，失败时以 `1` 退出。
+普通命令始终启动或恢复模型驱动 agent。没有消息参数时，非终端 stdin 可提供消息。`--allow-write` 可重复出现，每次接受一个已存在的绝对目录（递归前缀）或文件（精确目标）；三个模式标志不能组合。模式和写入范围只属于本次调用，不会写入会话。agent 在程序返回 `to: "user"` 后以 `0` 退出；使用错误或配置错误时以 `2` 退出。直接运行在程序成功时以 `0` 退出，失败时以 `1` 退出。
 
 ## Host API
 
@@ -145,16 +151,14 @@ terrarium run [-e SOURCE | FILE] [--read-only | --full-access] [--mount /virtual
 - `host.fs.list(dir)` 将一级目录返回为按名称排序的对象数组，字段为 `name`、`type`（`file`、`directory`、`symlink` 或 `other`）和 `size`；普通文件的 `size` 是字节数，其他类型为 `null`。
 - `host.fs.read(path, from, to)` 读取有界行窗口，返回稳定的 `N: text` 行号和续读提示；`to=Infinity` 在窗口预算内读取到 EOF。
 - `host.fs.text(path)` 将整个文本文件以 LF 规范化字符串交给程序，不带展示行号；它用于程序变换，不用于展示代码。
-- `host.fs.replace(path, oldText, newText[, {all}])` 执行一次精确的定点替换。默认要求恰好一个匹配，未找到或多匹配会明确失败；替换文本按字面量处理，只有明确需要全部替换时才使用 `{all: true}`。旧文本已知时，这是最高效的一次调用编辑路径；未知时先读取或搜索足够上下文。不要只为确认写入而重新读取，run 结果会提供宿主生成的回执。
+- `host.fs.replace(path, oldText, newText[, {all}])` 对写入已授权的文件执行一次精确的定点替换。默认要求恰好一个匹配，未找到或多匹配会明确失败；替换文本按字面量处理，只有明确需要全部替换时才使用 `{all: true}`。旧文本已知时，这是最高效的一次调用编辑路径；未知时先读取或搜索足够上下文。不要只为确认写入而重新读取，run 结果会提供宿主生成的回执。
 - `host.fs.scan(path, options)` 从目录树流式读取文本文件行。可选传入 `contains: "literal"`，让 Rust 在跨入 JavaScript 前丢弃不匹配的行；正则、大小写规则、多条件、跨行状态和自定义限制仍由 JavaScript 做最终判断。不传时保持逐行产出。默认尊重 `.gitignore`、跳过隐藏项、二进制和符号链接，并严格校验选项类型。遍历、打开或解码错误会拒绝 scan，不会静默变成空结果。
 - `host.fs.walk(path, options)` 从目录树流式产出每个普通文件的 `{file, size}`——scan 的文件级孪生：同样的剪枝、同样的选项；文件从不会被打开。数文件、算总大小用 walk；数 scan 的产出数是在数行。
-- `host.fs.write(path, content)` 在声明为 `:rw` 的挂载下原子写入文本，返回字节数；run 结果还包含有界的宿主写入回执（`path`、`created`、`changed`、`bytesBefore`、`bytesAfter`、`firstChangedLine`）。
+- `host.fs.write(path, content)` 向写入已授权的目标原子写入文本，返回字节数；批准新文件时包含创建缺失的父目录。run 结果还包含有界的宿主写入回执（`path`、`created`、`changed`、`bytesBefore`、`bytesAfter`、`firstChangedLine`）。
 
 Agent 程序使用上文的 tagged return 协议来继续交给模型或交还用户。
 
-模型请求属于可信的外层 agent 循环并写入会话日志；JavaScript 宿主能力面只有上述文件系统能力。
-
-契约首行声明所配置模型的能力（纯文本输入，或文本加图像输入；本地未声明的模型会标注为未声明）。无论声明如何，请求 payload 始终是纯文本——图像读取、编码和 artifact 传输尚未实现。
+模型请求属于可信的外层 agent 循环并写入会话日志；JavaScript 宿主能力面只有上述文件系统能力。请求始终是纯文本——图像读取、编码和 artifact 传输尚未实现。
 
 ## 配置
 
@@ -168,18 +172,19 @@ Agent 程序使用上文的 tagged return 协议来继续交给模型或交还�
 
 - `src/lib.rs`、`src/kernel.rs` —— 可复用 kernel 边界，每次运行一个全新笼子
 - `src/main.rs`、`src/cli.rs` —— 进程和终端适配层
-- `src/agent.rs` —— 外层 agent 循环和 run 围栏解析器
+- `src/agent.rs` —— 外层 agent 循环、access/run 围栏解析器和预授权生命周期
 - `src/session.rs` —— 持久化仅追加会话日志
-- `src/fs.rs`、`src/llm/`、`src/registry.rs` —— 宿主能力、三协议流式模型传输和实时 API 注册表
+- `src/fs.rs`、`src/auth.rs`、`src/llm/`、`src/registry.rs` —— 文件系统能力与冻结写入授权、access 块解析与 `Authorizer` 边界、三协议流式模型传输和实时 API 注册表
 - `src/prompts/`、`src/runtime/` —— 编译进二进制的模型 prompt 和 JavaScript runtime 资产
 - `docs/` —— 设计、协议、配置、安全和集成说明
 
-库向非 CLI 调用方暴露 `Kernel` 和经过校验的 `Mount`。未来 Web UI 应在此库上增加服务适配层，而不是启动二进制或解析 stderr。
+库向非 CLI 调用方暴露 `Kernel`、`RunFilesystemAuthority`/`WriteScope` 信任类型，以及供嵌入适配层使用的 `Authorizer` trait。未来 Web UI 应在此库上增加服务适配层，而不是启动二进制或解析 stderr。
 
 ## 文档
 
 - [设计方向](docs/design.md)
 - [当前协议](docs/protocol.md)
+- [文件系统授权](docs/filesystem-authorization.zh-CN.md)
 - [配置](docs/configuration.md)
 - [安全边界](docs/security.md)
 - [模型配置档与持久会话](docs/model-profiles-and-durable-sessions.md)

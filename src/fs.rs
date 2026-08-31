@@ -1,10 +1,14 @@
-//! host.fs —— surface over real mounted directories: list / windowed read / streaming scan / atomic write.
-//! Mounting: --mount /proj=real-dir (read-only, the default) or --mount /proj=real-dir:rw (writable).
-//! Boundary = lexical `..` guard + parent canonicalize + prefix check; writes additionally require the
-//! mount to be declared :rw at launch — the kernel executes that operator decision, it never makes one.
+//! host.fs —— surface over the operating-system user's filesystem view: list / windowed read /
+//! streaming scan / atomic write. Every path is one absolute user path. Reads use the OS user's
+//! readable view. Writes are decided by the invocation's frozen `RunFilesystemAuthority`:
+//! `read-only` denies every write, `planned-write` requires the resolved target to match an
+//! approved exact file or an operator-declared prefix, `full-access` keeps only path validation
+//! and the OS user's own permissions. The kernel executes that host-derived decision; it never
+//! makes one.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -39,80 +43,235 @@ impl WriteLog {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Mount {
-    pub(crate) virt: String,
-    pub(crate) root: PathBuf,
-    pub(crate) rw: bool,
+/// The one filesystem mode a trusted caller selects for an invocation. The model can observe it
+/// (runtime state) but never change it: `read-only` is a hard denial, not a mode it can elevate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilesystemMode {
+    ReadOnly,
+    PlannedWrite,
+    FullAccess,
 }
 
-pub(crate) fn normalize_path(path: &str) -> String {
+impl FilesystemMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::PlannedWrite => "planned-write",
+            Self::FullAccess => "full-access",
+        }
+    }
+}
+
+/// One frozen write scope. `Exact` is a user-approved exact file for one run; `Prefix` is an
+/// operator-declared recursive directory granted at launch. Both store the canonical identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteScope {
+    Exact(PathBuf),
+    Prefix(PathBuf),
+}
+
+impl WriteScope {
+    /// Operator `--allow-write DIR|FILE`: an existing directory becomes a recursive prefix,
+    /// an existing file an exact scope. Symlinked operands resolve to their target identity —
+    /// the operator argument is trusted, unlike a model-declared target.
+    pub fn from_operator_spec(spec: &str) -> Result<Self, String> {
+        let path = validate_user_path(spec, true)
+            .map_err(|error| format!("--allow-write {spec}: {error}"))?;
+        let (base, tail) =
+            resolve_existing(&path).map_err(|error| format!("--allow-write {spec}: {error}"))?;
+        // joining an empty tail would leave a trailing separator and break the file case
+        let identity = if tail.is_empty() {
+            base
+        } else {
+            base.join(tail.iter().collect::<PathBuf>())
+        };
+        let meta = std::fs::symlink_metadata(&identity)
+            .map_err(|_| format!("--allow-write {spec}: target does not exist"))?;
+        if meta.is_dir() {
+            Ok(Self::Prefix(identity))
+        } else if meta.is_file() {
+            Ok(Self::Exact(identity))
+        } else {
+            Err(format!(
+                "--allow-write {spec}: target is neither a regular file nor a directory"
+            ))
+        }
+    }
+
+    pub(crate) fn matches(&self, identity: &Path) -> bool {
+        match self {
+            Self::Exact(path) => same_identity(path, identity),
+            Self::Prefix(dir) => identity_under_prefix(identity, dir),
+        }
+    }
+
+    pub fn display(&self) -> String {
+        match self {
+            Self::Exact(path) => path.display().to_string(),
+            Self::Prefix(dir) => format!("{}/", dir.display()),
+        }
+    }
+}
+
+/// The authority a run's actual write calls are checked against, frozen before QuickJS starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunFilesystemAuthority {
+    ReadOnly,
+    Scoped(Vec<WriteScope>),
+    FullAccess,
+}
+
+impl RunFilesystemAuthority {
+    pub fn mode(&self) -> FilesystemMode {
+        match self {
+            Self::ReadOnly => FilesystemMode::ReadOnly,
+            Self::Scoped(_) => FilesystemMode::PlannedWrite,
+            Self::FullAccess => FilesystemMode::FullAccess,
+        }
+    }
+
+    /// Deterministic write decision on the resolved target identity. Alternate spellings,
+    /// symlinks, and other host functions cannot expand a frozen scope.
+    pub(crate) fn authorize_write(&self, display: &str, identity: &Path) -> Result<(), String> {
+        match self {
+            Self::ReadOnly => Err(
+                "write_denied: the invocation is read-only and every write is denied. \
+                 Policy denial, not a bug — report it in your result, do not retry another way."
+                    .into(),
+            ),
+            Self::FullAccess => Ok(()),
+            Self::Scoped(scopes) if scopes.iter().any(|scope| scope.matches(identity)) => Ok(()),
+            Self::Scoped(_) => Err(format!(
+                "write_not_authorized: {display} matches no write scope approved for this run; \
+                 declare the file in the access block or continue read-only. Alternate spellings \
+                 cannot expand the frozen scope."
+            )),
+        }
+    }
+}
+
+/// Identity comparison that folds the forms canonicalization cannot (a not-yet-existing tail on
+/// a case-insensitive filesystem). Canonical identities make this a plain equality everywhere
+/// except a new file's final components.
+pub(crate) fn same_identity(a: &Path, b: &Path) -> bool {
     #[cfg(windows)]
     {
-        path.replace('\\', "/")
+        let fold = |p: &Path| p.to_string_lossy().replace('\\', "/").to_lowercase();
+        fold(a) == fold(b)
     }
     #[cfg(not(windows))]
     {
-        path.to_string()
+        a == b
     }
 }
 
-impl Mount {
-    pub fn new(virt: impl Into<String>, root: impl AsRef<Path>, rw: bool) -> Result<Self, String> {
-        let root = root
-            .as_ref()
-            .canonicalize()
-            .map_err(|e| format!("invalid mount root: {e}"))?;
-        Self::from_canonical(&virt.into(), root, rw)
+fn identity_under_prefix(identity: &Path, prefix: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let fold = |p: &Path| p.to_string_lossy().replace('\\', "/").to_lowercase();
+        let identity = fold(identity);
+        let prefix = fold(prefix).trim_end_matches('/').to_string();
+        identity == prefix || identity.starts_with(&format!("{prefix}/"))
     }
+    #[cfg(not(windows))]
+    {
+        identity.starts_with(prefix)
+    }
+}
 
-    pub(crate) fn from_canonical(virt: &str, root: PathBuf, rw: bool) -> Result<Self, String> {
-        let virt = normalize_path(virt);
-        let virt = if virt == "/" {
-            "/".to_string()
-        } else {
-            virt.trim_end_matches('/').to_string()
-        };
-        let is_absolute = virt.starts_with('/') || Path::new(&virt).is_absolute();
-        if (virt != "/" && virt.len() < 2)
-            || !is_absolute
-            || (virt.contains("//") && !virt.starts_with("//"))
-        {
+/// Lexical contract for every host.fs path: one absolute user path, unambiguous. Relative
+/// paths, `~`, `.`/`..` segments, `//`, and — where `\` is not a separator — backslashes are
+/// rejected before any filesystem access. `exact_file` additionally rejects trailing slashes
+/// and glob metacharacters, because a write target is one exact file.
+pub(crate) fn validate_user_path(raw: &str, exact_file: bool) -> Result<PathBuf, String> {
+    if raw.is_empty() {
+        return Err("path must not be empty".into());
+    }
+    if raw.starts_with('~') {
+        return Err(format!("{raw}: `~` is not expanded; use the absolute path"));
+    }
+    if raw.contains('\0') {
+        return Err(format!("{raw}: NUL is not a valid path character"));
+    }
+    #[cfg(windows)]
+    let normalized = raw.replace('\\', "/");
+    #[cfg(not(windows))]
+    let normalized = raw.to_string();
+    #[cfg(not(windows))]
+    if normalized.contains('\\') {
+        return Err(format!(
+            "{raw}: backslash is not a path separator here; use a plain absolute path"
+        ));
+    }
+    if normalized.contains("//") {
+        return Err(format!(
+            "{raw}: `//` is an ambiguous separator; use one slash per component"
+        ));
+    }
+    // a single trailing slash is tolerated on read paths and normalized away; write targets
+    // reject it outright below
+    let trimmed = if normalized.len() > 1 {
+        normalized.trim_end_matches('/').to_string()
+    } else {
+        normalized.clone()
+    };
+    // string-level segment rules: `Path::components` silently normalizes `.` away, but the
+    // contract rejects dot segments outright
+    if trimmed != "/"
+        && trimmed
+            .split('/')
+            .skip(1)
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(format!(
+            "{raw}: `.`, `..`, and empty segments are not allowed; use the exact absolute path"
+        ));
+    }
+    let path = PathBuf::from(&trimmed);
+    if !path.is_absolute() {
+        return Err(format!("{raw}: not an absolute path"));
+    }
+    if exact_file {
+        if normalized.ends_with('/') && normalized.len() > 1 {
             return Err(format!(
-                "invalid mount path {virt:?} (expected an absolute path such as /name)"
+                "{raw}: a write target must be an exact file path, not a directory"
             ));
         }
-        if virt != "/" && virt.split('/').any(|part| part == "." || part == "..") {
+        if raw.contains(['*', '?', '[']) {
             return Err(format!(
-                "invalid mount path {virt:?} (dot segments are not allowed)"
+                "{raw}: glob patterns are not write targets; declare the exact file path"
             ));
         }
-        Ok(Self {
-            virt: if virt == "/" {
-                "/".into()
-            } else {
-                format!("{virt}/")
-            },
-            root,
-            rw,
-        })
-    }
-
-    pub fn virtual_path(&self) -> &str {
-        &self.virt
-    }
-
-    pub fn is_writable(&self) -> bool {
-        self.rw
-    }
-
-    pub(crate) fn overlaps(&self, other: &Self) -> bool {
-        let a = self.virt.trim_end_matches('/');
-        let b = other.virt.trim_end_matches('/');
-        if self.virt == "/" || other.virt == "/" {
-            return true;
+        if path.components().next().is_none() || trimmed == "/" {
+            return Err(format!(
+                "{raw}: a write target must be a file, not the filesystem root"
+            ));
         }
-        a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+    }
+    Ok(path)
+}
+
+/// Canonical identity for scope decisions: canonicalize the deepest existing ancestor, then
+/// rejoin the missing tail. Symlinked ancestors, macOS `/tmp` aliases, and Windows drive-letter
+/// and separator spellings collapse into one comparable form.
+pub(crate) fn resolve_existing(path: &Path) -> Result<(PathBuf, Vec<OsString>), String> {
+    let mut probe = path.to_path_buf();
+    let mut tail: Vec<OsString> = Vec::new();
+    loop {
+        match std::fs::canonicalize(&probe) {
+            Ok(canonical) => return Ok((canonical, tail)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = probe.file_name().map(OsString::from) else {
+                    return Err(format!("cannot resolve {}: {error}", path.display()));
+                };
+                let Some(parent) = probe.parent() else {
+                    return Err(format!("cannot resolve {}: {error}", path.display()));
+                };
+                tail.insert(0, name);
+                probe = parent.to_path_buf();
+            }
+            Err(error) => return Err(format!("cannot resolve {}: {error}", path.display())),
+        }
     }
 }
 
@@ -145,139 +304,6 @@ impl Default for ScanOpts {
 const LINE_READ_CAP: usize = 2000; // read: per-line character cap — a minified file must not blow context
 static TMP_CTR: AtomicU64 = AtomicU64::new(0);
 
-fn absolute_mount_remainder(mount: &Mount, js_path: &str) -> Option<String> {
-    let mount_path = Path::new(mount.virt.trim_end_matches('/'));
-    if !mount_path.is_absolute() || mount_path.canonicalize().ok()?.as_path() != mount.root {
-        return None;
-    }
-    let path = Path::new(js_path);
-    if !path.is_absolute()
-        || (js_path.starts_with("///") || js_path[1..].contains("//"))
-        || path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::CurDir | std::path::Component::ParentDir
-            )
-        })
-    {
-        return None;
-    }
-    if let Ok(canonical) = path.canonicalize() {
-        if !canonical.starts_with(&mount.root) {
-            return None;
-        }
-        let relative = canonical
-            .strip_prefix(&mount.root)
-            .ok()?
-            .to_string_lossy()
-            .into_owned();
-        return Some(normalize_path(&relative));
-    }
-    let parent = path.parent()?;
-    let tail = path.file_name()?;
-    let canonical_parent = parent.canonicalize().ok()?;
-    if !canonical_parent.starts_with(&mount.root) {
-        return None;
-    }
-    let relative = canonical_parent
-        .strip_prefix(&mount.root)
-        .ok()?
-        .join(tail)
-        .to_string_lossy()
-        .into_owned();
-    Some(normalize_path(&relative))
-}
-
-/// Configured path → (mount, relative remainder). Shared by every fs operation.
-/// Component-wise: mount /t owns "/t" and "/t/…" but never "/tmp2" — a textual prefix would
-/// silently misfile neighboring paths (and make /a vs /ab registration-order dependent).
-fn strip_mount<'a>(mounts: &'a [Mount], js_path: &str) -> Result<(&'a Mount, String), String> {
-    let js_path = normalize_path(js_path);
-    for m in mounts {
-        let virt = m.virt.trim_end_matches('/');
-        #[cfg(windows)]
-        if m.virt == "/" && Path::new(&js_path).is_absolute() && !js_path.starts_with('/') {
-            if js_path.contains("//")
-                || Path::new(&js_path).components().any(|component| {
-                    matches!(
-                        component,
-                        std::path::Component::CurDir | std::path::Component::ParentDir
-                    )
-                })
-            {
-                return Err(format!("invalid virtual path: {js_path}"));
-            }
-            return Ok((m, js_path.clone()));
-        }
-        if js_path == virt || js_path == format!("{virt}/") {
-            return Ok((m, String::new()));
-        }
-        if let Some(rel) = js_path.strip_prefix(&format!("{virt}/")) {
-            if rel.is_empty() {
-                return Ok((m, String::new()));
-            }
-            if rel.split('/').any(|part| part == "..") {
-                return Err(format!("path escapes mount root, rejected: {js_path}"));
-            }
-            if rel.starts_with('/') || rel.contains("//") || rel.contains('\\') {
-                return Err(format!("invalid virtual path: {js_path}"));
-            }
-            if rel.split('/').any(|part| part.is_empty() || part == ".") {
-                return Err(format!("invalid virtual path: {js_path}"));
-            }
-            return Ok((m, rel.to_string()));
-        }
-        if let Some(rel) = absolute_mount_remainder(m, &js_path) {
-            return Ok((m, rel));
-        }
-    }
-    let avail: Vec<String> = mounts.iter().map(|m| m.virt.clone()).collect();
-    Err(format!(
-        "path {js_path} is not under any mount point; available: {}",
-        avail.join(", ")
-    ))
-}
-
-/// Configured path → real path; escapes (including .. chains, symlinks) are always rejected
-pub fn resolve_mount(mounts: &[Mount], js_path: &str) -> Result<PathBuf, String> {
-    let (m, rel) = strip_mount(mounts, js_path)?;
-    if rel.is_empty() {
-        return m
-            .root
-            .canonicalize()
-            .map_err(|e| format!("stat failed {js_path}: {e}"));
-    }
-    let joined = m.root.join(&rel);
-    // target may not exist: canonicalize the parent then re-join the filename; deep .. chains resolve here and get caught
-    let parent = joined.parent().unwrap_or(&m.root).to_path_buf();
-    let tail = joined
-        .file_name()
-        .map(|f| f.to_os_string())
-        .unwrap_or_default();
-    let canon_parent = parent
-        .canonicalize()
-        .map_err(|e| format!("stat failed {js_path}: {e}"))?;
-    // canonicalize the root too: a symlink component in the mount path (/tmp → /private/tmp, Windows 8.3 short
-    // names) would otherwise mismatch the canonical parent and reject every legitimate read (write_file does same)
-    let root = m
-        .root
-        .canonicalize()
-        .map_err(|e| format!("stat failed {js_path}: {e}"))?;
-    if !canon_parent.starts_with(&root) {
-        return Err(format!("path escapes mount root, rejected: {js_path}"));
-    }
-    // the tail itself may be a symlink: resolve it and re-verify containment, so the boundary
-    // decision is complete (parent + tail) instead of leaving the last hop to File::open.
-    // Internal symlinks (target still under the root) stay legal; nonexistent targets pass —
-    // an open() of them can't follow anything.
-    let target = canon_parent.join(tail);
-    match target.canonicalize() {
-        Ok(full) if full.starts_with(&root) => Ok(full),
-        Ok(_) => Err(format!("path escapes mount root, rejected: {js_path}")),
-        Err(_) => Ok(target),
-    }
-}
-
 #[derive(Debug, Clone)]
 struct ListEntry {
     name: String,
@@ -298,8 +324,8 @@ impl<'js> rquickjs::IntoJs<'js> for ListEntry {
     }
 }
 
-fn list_dir(mounts: &[Mount], dir: &str) -> Result<Vec<ListEntry>, String> {
-    let p = resolve_mount(mounts, dir)?;
+fn list_dir(dir: &str) -> Result<Vec<ListEntry>, String> {
+    let p = validate_user_path(dir, false)?;
     let mut out = Vec::new();
     for ent in std::fs::read_dir(&p).map_err(|e| format!("{dir}: {e}"))? {
         let ent = ent.map_err(|e| format!("{dir}: {e}"))?;
@@ -364,13 +390,13 @@ fn read_line_limited(
 }
 
 /// Windowed read: "N: text" lines from..to (1-based, inclusive), a continue-footer iff more lines follow.
-fn read_window(mounts: &[Mount], path: &str, a: usize, b: usize) -> Result<String, String> {
+fn read_window(path: &str, a: usize, b: usize) -> Result<String, String> {
     if a == 0 || b < a {
         return Err(format!(
             "read window must satisfy 1 <= from <= to (got {a}..{b})"
         ));
     }
-    let p = resolve_mount(mounts, path)?;
+    let p = validate_user_path(path, false)?;
     let meta = std::fs::metadata(&p).map_err(|e| format!("{path}: {e}"))?;
     if !meta.is_file() {
         return Err(format!("{path} is not a regular file"));
@@ -424,8 +450,8 @@ fn read_window(mounts: &[Mount], path: &str, a: usize, b: usize) -> Result<Strin
 /// Whole-file text channel for PROGRAM consumption: LF-normalized, BOM-stripped (the in-program
 /// canonical form — write restores the target's own EOL and BOM), no line numbers or
 /// line caps. Bounded by the cage heap: a file bigger than 64MB is refused, not buffered.
-fn read_text(mounts: &[Mount], path: &str) -> Result<String, String> {
-    let p = resolve_mount(mounts, path)?;
+fn read_text(path: &str) -> Result<String, String> {
+    let p = validate_user_path(path, false)?;
     let meta = std::fs::metadata(&p).map_err(|e| format!("{path}: {e}"))?;
     if !meta.is_file() {
         return Err(format!("{path} is not a regular file"));
@@ -669,14 +695,11 @@ struct ScanState {
 }
 
 /// scan and walk share one traversal engine; only the yield unit differs (lines vs entries).
-fn open_tree(
-    mounts: &[Mount],
-    js_path: &str,
-    opts: ScanOpts,
-    label: &'static str,
-) -> Result<ScanState, String> {
-    let js_path = normalize_path(js_path);
-    let real = resolve_mount(mounts, &js_path)?;
+fn open_tree(js_path: &str, opts: ScanOpts, label: &'static str) -> Result<ScanState, String> {
+    let display_base = validate_user_path(js_path, false)?;
+    let real = display_base
+        .canonicalize()
+        .map_err(|e| format!("{js_path}: {e}"))?;
     let meta = std::fs::metadata(&real).map_err(|e| format!("{js_path}: {e}"))?;
     if !meta.is_dir() {
         return Err(format!(
@@ -687,7 +710,7 @@ fn open_tree(
         label,
         dir_queue: vec![(real.clone(), Vec::new())],
         root: real,
-        virt_base: js_path.trim_end_matches('/').to_string(),
+        virt_base: display_base.to_string_lossy().replace('\\', "/"),
         files: VecDeque::new(),
         cur: None,
         lineno: 0,
@@ -696,12 +719,12 @@ fn open_tree(
     })
 }
 
-fn scan_open(mounts: &[Mount], js_path: &str, opts: ScanOpts) -> Result<ScanState, String> {
-    open_tree(mounts, js_path, opts, "scan")
+fn scan_open(js_path: &str, opts: ScanOpts) -> Result<ScanState, String> {
+    open_tree(js_path, opts, "scan")
 }
 
-fn walk_open(mounts: &[Mount], js_path: &str, opts: ScanOpts) -> Result<ScanState, String> {
-    open_tree(mounts, js_path, opts, "walk")
+fn walk_open(js_path: &str, opts: ScanOpts) -> Result<ScanState, String> {
+    open_tree(js_path, opts, "walk")
 }
 
 fn scan_virtual_path(st: &ScanState, path: &Path) -> String {
@@ -1015,8 +1038,12 @@ fn detect_shape(target: &Path) -> (bool, bool) {
 }
 
 #[cfg(test)]
-fn write_file(mounts: &[Mount], js_path: &str, content: &str) -> Result<usize, String> {
-    write_file_with_log(mounts, js_path, content, &mut WriteLog::default())
+fn write_file(
+    authority: &RunFilesystemAuthority,
+    js_path: &str,
+    content: &str,
+) -> Result<usize, String> {
+    write_file_with_log(authority, js_path, content, &mut WriteLog::default())
 }
 
 struct BeforeFileSummary {
@@ -1062,66 +1089,78 @@ fn inspect_before(target: &Path, after: &[u8]) -> Result<Option<BeforeFileSummar
     }))
 }
 
-/// Atomic write into a :rw mount: lexical `..` guard → mkdir parents → canonicalize + prefix check → temp+rename.
-/// Preserves an existing target's BOM and line-ending style; returns bytes written and records a bounded receipt.
+/// Atomic write under the frozen authority: lexical validation → mode → symlink/directory
+/// target checks → canonical identity + scope membership → create approved missing parents →
+/// recheck identity and target state under the final parent → temp+rename. Preserves an
+/// existing target's BOM and line-ending style; returns bytes written and records a bounded
+/// receipt. Approving a new-file target subsumes creating its missing parent directories.
 fn write_file_with_log(
-    mounts: &[Mount],
+    authority: &RunFilesystemAuthority,
     js_path: &str,
     content: &str,
     writes: &mut WriteLog,
 ) -> Result<usize, String> {
-    let (m, rel) = strip_mount(mounts, js_path)?;
-    let virt = m.virt.trim_end_matches('/');
-    if !m.rw {
-        return Err(format!(
-            "write denied: {virt} is a read-only mount (the operator declares --mount {virt}=…:rw at launch). \
-             Policy denial, not a bug — report it in your final answer, do not retry another way."
-        ));
+    let path = validate_user_path(js_path, true)?;
+    if let RunFilesystemAuthority::ReadOnly = authority {
+        return Err(
+            "write_denied: the invocation is read-only and every write is denied. \
+             Policy denial, not a bug — report it in your result, do not retry another way."
+                .into(),
+        );
     }
-    if rel.is_empty() {
-        return Err(format!(
-            "{js_path} is the mount root itself; write a file path under {virt}/"
-        ));
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{js_path}: a write target needs a parent directory"))?
+        .to_path_buf();
+    let name = path
+        .file_name()
+        .map(OsString::from)
+        .ok_or_else(|| format!("{js_path}: a write target needs a file name"))?;
+    let (canon_base, missing) = resolve_existing(&parent)?;
+    let identity = missing
+        .iter()
+        .fold(canon_base.join(&name), |joined, part| joined.join(part));
+    // target state under the resolved parent: existing symbolic links and directories are
+    // never written; a missing target is the new-file case the approval covered.
+    let target_meta = std::fs::symlink_metadata(&identity);
+    match &target_meta {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(format!(
+                "write_denied: {js_path} is a symbolic link; existing symbolic-link targets cannot be written"
+            ));
+        }
+        Ok(meta) if meta.is_dir() => {
+            return Err(format!(
+                "{js_path} is a directory; write an exact file path"
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("{js_path}: {error}")),
     }
-    if Path::new(&rel)
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(format!("path escapes mount root, rejected: {js_path}"));
-    }
-    let joined = m.root.join(&rel);
-    let parent = joined.parent().unwrap_or(&m.root).to_path_buf();
-    let root = m
-        .root
-        .canonicalize()
-        .map_err(|e| format!("{js_path}: {e}"))?;
-    let mut existing = parent.clone();
-    while !existing.exists() {
-        let Some(next) = existing.parent() else {
-            return Err(format!("cannot resolve parent for {js_path}"));
-        };
-        existing = next.to_path_buf();
-    }
-    let canon_existing = existing
-        .canonicalize()
-        .map_err(|e| format!("{js_path}: {e}"))?;
-    if !canon_existing.starts_with(&root) {
-        return Err(format!("path escapes mount root, rejected: {js_path}"));
-    }
+    authority.authorize_write(js_path, &identity)?;
     std::fs::create_dir_all(&parent).map_err(|e| format!("{js_path}: {e}"))?;
     let canon_parent = parent
         .canonicalize()
         .map_err(|e| format!("{js_path}: {e}"))?;
-    if !canon_parent.starts_with(&root) {
-        return Err(format!("path escapes mount root, rejected: {js_path}"));
+    let target = canon_parent.join(&name);
+    // recheck: creating missing parents (or a concurrent filesystem change) may have shifted
+    // the identity or swapped the target state after the first decision.
+    if !same_identity(&target, &identity) {
+        authority.authorize_write(js_path, &target)?;
     }
-    let target = canon_parent.join(joined.file_name().unwrap_or_default());
+    if let Ok(meta) = std::fs::symlink_metadata(&target) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "write_denied: {js_path} became a symbolic link before the write; rejected"
+            ));
+        }
+    }
     let target_meta = std::fs::symlink_metadata(&target);
     let created = target_meta
         .as_ref()
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
-    // rename replaces a symlink rather than following it; the link itself carries no shape, and
-    // sniffing through it would read an out-of-mount file. New/regular targets keep their shape.
+    // symlink targets were rejected above; new/regular targets carry their own shape
     let (bom, crlf) = match &target_meta {
         Ok(md) if md.file_type().is_symlink() => (false, false),
         _ => detect_shape(&target),
@@ -1262,23 +1301,21 @@ fn parse_tree_opts(o: &Object<'_>, allow_contains: bool) -> rquickjs::Result<Sca
     Ok(so)
 }
 
-/// Registers the host.fs namespace
+/// Registers the host.fs namespace. Read capabilities are unconditional (the OS user's
+/// readable view); the write capability enforces the frozen run authority.
 pub fn install<'js>(
     ctx: &Ctx<'js>,
     host: &Object<'js>,
-    mounts: &[Mount],
+    authority: &RunFilesystemAuthority,
     writes: Rc<RefCell<WriteLog>>,
 ) -> rquickjs::Result<()> {
     let fsobj = Object::new(ctx.clone())?;
-    let mounts: Vec<Mount> = mounts.to_vec();
 
-    let m = mounts.clone();
     let list_fn = Function::new(ctx.clone(), move |dir: String| {
-        list_dir(&m, &dir).map_err(js_err)
+        list_dir(&dir).map_err(js_err)
     })?;
     fsobj.set("list", list_fn)?;
 
-    let m = mounts.clone();
     // window-only: an explicit line range per read — to=Infinity reads to EOF
     let read_fn = Function::new(
         ctx.clone(),
@@ -1291,12 +1328,11 @@ pub fn install<'js>(
                 )))
             }
         };
-            read_window(&m, &path, a, b).map_err(js_err)
+            read_window(&path, a, b).map_err(js_err)
         },
     )?;
     fsobj.set("read", read_fn)?;
 
-    let m = mounts.clone();
     // scan and walk share one traversal engine: scan streams the tree's LINES,
     // walk streams its FILE ENTRIES. next() resolves to an array; empty = exhausted.
     // The async-iterator blessing (Symbol.asyncIterator, chunk flattening) lives in prelude.js.
@@ -1307,7 +1343,7 @@ pub fn install<'js>(
                 Some(o) => parse_tree_opts(&o, true)?,
                 None => ScanOpts::default(),
             };
-            let st = scan_open(&m, &path, so).map_err(js_err)?;
+            let st = scan_open(&path, so).map_err(js_err)?;
             let rc: Rc<RefCell<ScanState>> = Rc::new(RefCell::new(st));
             let next_fn = Function::new(
                 ctx.clone(),
@@ -1323,7 +1359,6 @@ pub fn install<'js>(
     )?;
     fsobj.set("scan", scan_fn)?;
 
-    let m = mounts.clone();
     let walk_fn = Function::new(
         ctx.clone(),
         move |ctx: Ctx<'js>, path: String, opts: Opt<Object>| -> rquickjs::Result<Object> {
@@ -1331,7 +1366,7 @@ pub fn install<'js>(
                 Some(o) => parse_tree_opts(&o, false)?,
                 None => ScanOpts::default(),
             };
-            let st = walk_open(&m, &path, so).map_err(js_err)?;
+            let st = walk_open(&path, so).map_err(js_err)?;
             let rc: Rc<RefCell<ScanState>> = Rc::new(RefCell::new(st));
             let next_fn = Function::new(
                 ctx.clone(),
@@ -1347,16 +1382,16 @@ pub fn install<'js>(
     )?;
     fsobj.set("walk", walk_fn)?;
 
-    let m = mounts.clone();
     let text_fn = Function::new(ctx.clone(), move |path: String| {
-        read_text(&m, &path).map_err(js_err)
+        read_text(&path).map_err(js_err)
     })?;
     fsobj.set("text", text_fn)?;
 
-    let m = mounts.clone();
+    let authority = authority.clone();
     let write_log = writes.clone();
     let write_fn = Function::new(ctx.clone(), move |path: String, content: String| {
-        write_file_with_log(&m, &path, &content, &mut write_log.borrow_mut()).map_err(js_err)
+        write_file_with_log(&authority, &path, &content, &mut write_log.borrow_mut())
+            .map_err(js_err)
     })?;
     fsobj.set("write", write_fn)?;
 
@@ -1375,8 +1410,20 @@ mod tests {
         p
     }
 
-    fn mounts_at(root: &Path, rw: bool) -> Vec<Mount> {
-        vec![Mount::from_canonical("/t", root.to_path_buf(), rw).unwrap()]
+    /// display path of a real dir, in the separator form the model would use
+    fn display(p: &Path) -> String {
+        p.to_string_lossy().replace('\\', "/")
+    }
+
+    /// planned-write authority whose only scope is a recursive prefix over `root`
+    fn scoped_at(root: &Path) -> RunFilesystemAuthority {
+        RunFilesystemAuthority::Scoped(
+            vec![WriteScope::from_operator_spec(&display(root)).unwrap()],
+        )
+    }
+
+    fn read_only() -> RunFilesystemAuthority {
+        RunFilesystemAuthority::ReadOnly
     }
 
     #[test]
@@ -1386,7 +1433,7 @@ mod tests {
         std::fs::write(root.join("file.txt"), "hello").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(root.join("file.txt"), root.join("link")).expect("symlink");
-        let entries = list_dir(&mounts_at(&root, false), "/t").unwrap();
+        let entries = list_dir(&display(&root)).unwrap();
         assert_eq!(entries[0].name, "dir");
         assert_eq!(entries[0].entry_type, "directory");
         assert_eq!(entries[0].size, None);
@@ -1400,14 +1447,20 @@ mod tests {
             assert_eq!(entries[2].size, None);
         }
     }
+
     #[tokio::test]
     async fn list_serializes_entries_for_javascript() {
         let root = tmp_root("list-json");
         std::fs::create_dir(root.join("dir")).unwrap();
         std::fs::write(root.join("file.txt"), "hello").unwrap();
-        let mounts = mounts_at(&root, false);
         let (tx, _rx) = tokio::sync::watch::channel(false);
-        let out = crate::kernel::eval_js("return host.fs.list('/t')", 5_000, &mounts, tx).await;
+        let out = crate::kernel::eval_js(
+            &format!("return host.fs.list('{}')", display(&root)),
+            5_000,
+            &read_only(),
+            tx,
+        )
+        .await;
         assert!(out.ok, "error: {:?}", out.error);
         assert_eq!(
             out.value,
@@ -1436,32 +1489,85 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_root_mount_accepts_absolute_paths() {
-        let mount = Mount::from_canonical("/", PathBuf::from("/"), true).unwrap();
-        assert_eq!(mount.virtual_path(), "/");
-        // The resolved root is canonical (\\?\D:\ on Windows) and an existing tail is
-        // canonicalized too (/tmp → /private/tmp on macOS) while a missing one passes
-        // through, so containment is the property stable on every platform.
-        let root = resolve_mount(std::slice::from_ref(&mount), "/").unwrap();
-        assert!(root.is_absolute(), "{root:?}");
-        let resolved = resolve_mount(&[mount], "/tmp").unwrap();
-        assert!(resolved.starts_with(&root), "{resolved:?} escapes {root:?}");
-    }
-    #[test]
-    fn mount_paths_reject_ambiguous_components() {
-        let root = tmp_root("mount-path");
-        assert!(Mount::from_canonical("/t//x", root.clone(), false).is_err());
-        assert!(Mount::from_canonical("/t/../x", root.clone(), false).is_err());
-        assert!(Mount::from_canonical("/t/./x", root, false).is_err());
+    fn user_paths_reject_ambiguous_and_relative_forms() {
+        assert!(validate_user_path("/tmp/x.txt", false).is_ok());
+        assert!(validate_user_path("/tmp/x.txt", true).is_ok());
+        assert!(validate_user_path("rel/x.txt", false).is_err());
+        assert!(validate_user_path("~/x.txt", false).is_err());
+        assert!(validate_user_path("/tmp/../x.txt", false).is_err());
+        assert!(validate_user_path("/tmp/./x.txt", false).is_err());
+        assert!(validate_user_path("/tmp//x.txt", false).is_err());
+        #[cfg(not(windows))]
+        assert!(validate_user_path(r"/tmp\x.txt", false).is_err());
+        assert!(validate_user_path("", false).is_err());
+        // exact-file rules: no trailing slash, no globs, not the root
+        assert!(validate_user_path("/tmp/dir/", true).is_err());
+        assert!(validate_user_path("/tmp/*.txt", true).is_err());
+        assert!(validate_user_path("/tmp/x?.txt", true).is_err());
+        assert!(validate_user_path("/", true).is_err());
+        // reads tolerate a trailing slash (directories are read roots)
+        assert_eq!(
+            validate_user_path("/tmp/dir/", false).unwrap(),
+            PathBuf::from("/tmp/dir")
+        );
+        // tildes and relative paths are named in the error the model sees
+        let error = validate_user_path("~/x", false).unwrap_err();
+        assert!(error.contains("~"), "{error}");
+        let error = validate_user_path("x/y", false).unwrap_err();
+        assert!(error.contains("absolute"), "{error}");
     }
 
     #[test]
-    fn nested_mounts_are_order_independent() {
-        let root = tmp_root("mount-overlap");
-        let outer = Mount::from_canonical("/a", root.clone(), false).unwrap();
-        let inner = Mount::from_canonical("/a/b", root, true).unwrap();
-        assert!(outer.overlaps(&inner));
-        assert!(inner.overlaps(&outer));
+    fn resolve_existing_folds_aliases_and_keeps_missing_tails() {
+        let root = tmp_root("identity");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a/f.txt"), "x").unwrap();
+        let (base, tail) = resolve_existing(&root.join("a/f.txt")).unwrap();
+        assert_eq!(base, root.join("a/f.txt").canonicalize().unwrap());
+        assert!(tail.is_empty());
+        let (base, tail) = resolve_existing(&root.join("a/new/deep.txt")).unwrap();
+        assert_eq!(base, root.join("a").canonicalize().unwrap());
+        assert_eq!(
+            tail,
+            vec![
+                std::ffi::OsString::from("new"),
+                std::ffi::OsString::from("deep.txt")
+            ]
+        );
+        // a file where a directory is required cannot resolve
+        assert!(resolve_existing(&root.join("a/f.txt/sub")).is_err());
+    }
+
+    #[test]
+    fn operator_scopes_resolve_dirs_and_files_to_identities() {
+        let root = tmp_root("scopes");
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::write(root.join("f.txt"), "x").unwrap();
+        let dir_scope = WriteScope::from_operator_spec(&display(&root.join("d"))).unwrap();
+        let file_scope = WriteScope::from_operator_spec(&display(&root.join("f.txt"))).unwrap();
+        match (&dir_scope, &file_scope) {
+            (WriteScope::Prefix(dir), WriteScope::Exact(file)) => {
+                assert_eq!(*dir, root.join("d").canonicalize().unwrap());
+                assert_eq!(*file, root.join("f.txt").canonicalize().unwrap());
+            }
+            _ => panic!("wrong scope kinds {dir_scope:?} {file_scope:?}"),
+        }
+        assert!(dir_scope.matches(&root.join("d").canonicalize().unwrap().join("nested/x.txt")));
+        assert!(!dir_scope.matches(
+            &root
+                .join("outside.txt")
+                .canonicalize()
+                .unwrap_or(root.join("outside.txt"))
+        ));
+        assert!(file_scope.matches(&root.join("f.txt").canonicalize().unwrap()));
+        assert!(!file_scope.matches(
+            &root
+                .join("g.txt")
+                .canonicalize()
+                .unwrap_or(root.join("g.txt"))
+        ));
+        assert!(WriteScope::from_operator_spec("/definitely/not/here").is_err());
+        assert!(WriteScope::from_operator_spec("relative/path").is_err());
     }
 
     #[tokio::test]
@@ -1469,21 +1575,24 @@ mod tests {
         let root = tmp_root("scan-contains");
         std::fs::write(root.join("a.txt"), "keep one\nskip\nkeep two\n").unwrap();
         std::fs::write(root.join("b.txt"), "skip\n").unwrap();
-        let mounts = mounts_at(&root, false);
         let (tx, _rx) = tokio::sync::watch::channel(false);
         let out = crate::kernel::eval_js(
-            "const lines = []; for await (const line of host.fs.scan('/t', {contains: 'keep'})) lines.push({file: line.file, no: line.no, text: line.text}); return lines;",
+            &format!(
+                "const lines = []; for await (const line of host.fs.scan('{}', {{contains: 'keep'}})) lines.push({{file: line.file, no: line.no, text: line.text}}); return lines;",
+                display(&root)
+            ),
             5_000,
-            &mounts,
+            &read_only(),
             tx,
         )
         .await;
         assert!(out.ok, "error: {:?}", out.error);
+        let base = display(&root);
         assert_eq!(
             out.value,
             Some(serde_json::json!([
-                {"file":"/t/a.txt","no":1,"text":"keep one"},
-                {"file":"/t/a.txt","no":3,"text":"keep two"}
+                {"file": format!("{base}/a.txt"), "no": 1, "text": "keep one"},
+                {"file": format!("{base}/a.txt"), "no": 3, "text": "keep two"}
             ]))
         );
     }
@@ -1493,12 +1602,14 @@ mod tests {
         let root = tmp_root("scan-contains-empty-batch");
         let content = format!("{}\nneedle\n", "x".repeat(SCAN_CHUNK_BYTES + 1));
         std::fs::write(root.join("a.txt"), content).unwrap();
-        let mounts = mounts_at(&root, false);
         let (tx, _rx) = tokio::sync::watch::channel(false);
         let out = crate::kernel::eval_js(
-            "const lines = []; for await (const line of host.fs.scan('/t', {contains: 'needle'})) lines.push(line.text); return lines;",
+            &format!(
+                "const lines = []; for await (const line of host.fs.scan('{}', {{contains: 'needle'}})) lines.push(line.text); return lines;",
+                display(&root)
+            ),
             5_000,
-            &mounts,
+            &read_only(),
             tx,
         )
         .await;
@@ -1510,11 +1621,14 @@ mod tests {
     async fn walk_rejects_scan_only_contains_filter() {
         let root = tmp_root("walk-contains");
         std::fs::write(root.join("a.txt"), "keep\n").unwrap();
-        let mounts = mounts_at(&root, false);
         let (tx, _rx) = tokio::sync::watch::channel(false);
-        let out =
-            crate::kernel::eval_js("host.fs.walk('/t', {contains: 'keep'})", 5_000, &mounts, tx)
-                .await;
+        let out = crate::kernel::eval_js(
+            &format!("host.fs.walk('{}', {{contains: 'keep'}})", display(&root)),
+            5_000,
+            &read_only(),
+            tx,
+        )
+        .await;
         assert!(!out.ok);
         let message = out.error.expect("walk option error").message;
         assert!(message.contains("contains"), "{message}");
@@ -1524,10 +1638,14 @@ mod tests {
     #[tokio::test]
     async fn scan_rejects_invalid_option_types() {
         let root = tmp_root("scan-options");
-        let mounts = mounts_at(&root, false);
         let (tx, _rx) = tokio::sync::watch::channel(false);
-        let out =
-            crate::kernel::eval_js("host.fs.scan('/t', {hidden: 'yes'})", 5_000, &mounts, tx).await;
+        let out = crate::kernel::eval_js(
+            &format!("host.fs.scan('{}', {{hidden: 'yes'}})", display(&root)),
+            5_000,
+            &read_only(),
+            tx,
+        )
+        .await;
         assert!(!out.ok);
         let message = out.error.expect("scan option error").message;
         assert!(message.contains("hidden"), "{message}");
@@ -1537,8 +1655,7 @@ mod tests {
     fn scan_reports_invalid_utf8_instead_of_skipping_the_file() {
         let root = tmp_root("scan-utf8");
         std::fs::write(root.join("bad.txt"), b"ok\n\xff\n").unwrap();
-        let mounts = mounts_at(&root, false);
-        let mut state = scan_open(&mounts, "/t", ScanOpts::default()).unwrap();
+        let mut state = scan_open(&display(&root), ScanOpts::default()).unwrap();
         let error = scan_next_chunk(&mut state).unwrap_err();
         assert!(error.contains("bad.txt"), "{error}");
         assert!(
@@ -1556,7 +1673,7 @@ mod tests {
         std::fs::write(root.join("x/c.txt"), "four\n").unwrap();
         std::fs::write(root.join("x/y/b.rs"), "three\n").unwrap();
         std::fs::write(root.join("x/.git/config"), "needle\n").unwrap();
-        let ms = mounts_at(&root, false);
+        let base = display(&root.join("x"));
 
         let drains = |mut st: ScanState| {
             let mut all = Vec::new();
@@ -1570,17 +1687,16 @@ mod tests {
             all
         };
         // defaults (rg semantics): dot-entries skipped, .git never entered
-        let all = drains(scan_open(&ms, "/t/x", ScanOpts::default()).unwrap());
+        let all = drains(scan_open(&base, ScanOpts::default()).unwrap());
         let texts: Vec<&str> = all.iter().map(|l| l.text.as_str()).collect();
         assert_eq!(texts, ["one", "two", "four", "three"]);
-        assert_eq!(all[0].file, "/t/x/a.rs");
+        assert_eq!(all[0].file, format!("{base}/a.rs"));
         assert_eq!(all[0].no, 1);
-        assert_eq!(all[2].file, "/t/x/c.txt");
+        assert_eq!(all[2].file, format!("{base}/c.txt"));
         // glob filters candidates host-side (non-matching files are never opened)
         let rs = drains(
             scan_open(
-                &ms,
-                "/t/x",
+                &base,
                 ScanOpts {
                     glob: Some("*.rs".into()),
                     ..ScanOpts::default()
@@ -1593,8 +1709,7 @@ mod tests {
         // {hidden: true} surfaces dot-entries (rg --hidden polarity)
         let all = drains(
             scan_open(
-                &ms,
-                "/t/x",
+                &base,
                 ScanOpts {
                     skip_hidden: false,
                     ..ScanOpts::default()
@@ -1608,8 +1723,7 @@ mod tests {
         std::fs::write(root.join("x/vendor/v.rs"), "vend\n").unwrap();
         let all = drains(
             scan_open(
-                &ms,
-                "/t/x",
+                &base,
                 ScanOpts {
                     skip_dirs: vec!["vendor".into()],
                     ..ScanOpts::default()
@@ -1619,7 +1733,7 @@ mod tests {
         );
         assert!(!all.iter().any(|l| l.file.contains("vendor")));
         // not-a-directory is a caller error
-        let err = scan_open(&ms, "/t/x/a.rs", ScanOpts::default()).unwrap_err();
+        let err = scan_open(&format!("{base}/a.rs"), ScanOpts::default()).unwrap_err();
         assert!(err.contains("not a directory"), "{err}");
     }
 
@@ -1632,7 +1746,7 @@ mod tests {
         std::fs::write(root.join("x/c.txt"), "four\n").unwrap();
         std::fs::write(root.join("x/y/b.rs"), "three\n").unwrap();
         std::fs::write(root.join("x/.git/config"), "needle\n").unwrap();
-        let ms = mounts_at(&root, false);
+        let base = display(&root.join("x"));
 
         let drain_walk = |mut st: ScanState| {
             let mut all = Vec::new();
@@ -1662,20 +1776,19 @@ mod tests {
         };
 
         // defaults: same file set as scan, in the same deterministic order, with sizes
-        let walked: Vec<(String, u64)> =
-            drain_walk(walk_open(&ms, "/t/x", ScanOpts::default()).unwrap())
-                .into_iter()
-                .map(|e| (e.file, e.size))
-                .collect();
+        let walked: Vec<(String, u64)> = drain_walk(walk_open(&base, ScanOpts::default()).unwrap())
+            .into_iter()
+            .map(|e| (e.file, e.size))
+            .collect();
         assert_eq!(
             walked,
             vec![
-                ("/t/x/a.rs".to_string(), 8),
-                ("/t/x/c.txt".to_string(), 5),
-                ("/t/x/y/b.rs".to_string(), 6),
+                (format!("{base}/a.rs"), 8),
+                (format!("{base}/c.txt"), 5),
+                (format!("{base}/y/b.rs"), 6),
             ]
         );
-        let scanned = drain_scan_files(scan_open(&ms, "/t/x", ScanOpts::default()).unwrap());
+        let scanned = drain_scan_files(scan_open(&base, ScanOpts::default()).unwrap());
         assert_eq!(
             walked.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>(),
             scanned,
@@ -1685,8 +1798,7 @@ mod tests {
         // glob filters host-side: non-matching files are never touched
         let rs: Vec<String> = drain_walk(
             walk_open(
-                &ms,
-                "/t/x",
+                &base,
                 ScanOpts {
                     glob: Some("*.rs".into()),
                     ..ScanOpts::default()
@@ -1697,13 +1809,12 @@ mod tests {
         .into_iter()
         .map(|e| e.file)
         .collect();
-        assert_eq!(rs, ["/t/x/a.rs".to_string(), "/t/x/y/b.rs".to_string()]);
+        assert_eq!(rs, [format!("{base}/a.rs"), format!("{base}/y/b.rs")]);
 
         // {hidden: true} surfaces dot-entries (rg --hidden polarity), parity with scan
         let with_hidden = drain_walk(
             walk_open(
-                &ms,
-                "/t/x",
+                &base,
                 ScanOpts {
                     skip_hidden: false,
                     ..ScanOpts::default()
@@ -1718,8 +1829,7 @@ mod tests {
         std::fs::write(root.join("x/vendor/v.rs"), "vend\n").unwrap();
         let pruned = drain_walk(
             walk_open(
-                &ms,
-                "/t/x",
+                &base,
                 ScanOpts {
                     skip_dirs: vec!["vendor".into()],
                     ..ScanOpts::default()
@@ -1732,13 +1842,13 @@ mod tests {
         // walk never opens files: a NUL binary counts as an entry even though scan
         // (a text channel) never yields its lines — the layering, made observable
         std::fs::write(root.join("x/bin.dat"), b"\x00\x01binary").unwrap();
-        let w = drain_walk(walk_open(&ms, "/t/x", ScanOpts::default()).unwrap());
+        let w = drain_walk(walk_open(&base, ScanOpts::default()).unwrap());
         assert!(w.iter().any(|e| e.file.ends_with("bin.dat")));
-        let s = drain_scan_files(scan_open(&ms, "/t/x", ScanOpts::default()).unwrap());
+        let s = drain_scan_files(scan_open(&base, ScanOpts::default()).unwrap());
         assert!(!s.iter().any(|f| f.ends_with("bin.dat")));
 
         // not-a-directory is the same caller error as scan
-        let err = walk_open(&ms, "/t/x/a.rs", ScanOpts::default()).unwrap_err();
+        let err = walk_open(&format!("{base}/a.rs"), ScanOpts::default()).unwrap_err();
         assert!(err.contains("not a directory"), "{err}");
     }
 
@@ -1749,12 +1859,14 @@ mod tests {
         std::fs::write(root.join("d/a.rs"), "x\n").unwrap();
         std::fs::write(root.join("d/b.txt"), "y\n").unwrap();
         std::fs::write(root.join("d/c.rs"), "z\n").unwrap();
-        let mounts = mounts_at(&root, false);
         let (tx, _rx) = tokio::sync::watch::channel(false);
         let out = crate::kernel::eval_js(
-            "let n = 0, bytes = 0;\nfor await (const f of host.fs.walk('/t/d', {glob: '*.rs'})) { n++; bytes += f.size; }\nreturn {n, bytes};",
+            &format!(
+                "let n = 0, bytes = 0;\nfor await (const f of host.fs.walk('{}', {{glob: '*.rs'}})) {{ n++; bytes += f.size; }}\nreturn {{n, bytes}};",
+                display(&root.join("d"))
+            ),
             5_000,
-            &mounts,
+            &read_only(),
             tx,
         )
         .await;
@@ -1786,9 +1898,9 @@ mod tests {
         std::fs::write(root.join("sub/vend/v.rs"), "x\n").unwrap(); // ignored by nested scope
         std::fs::create_dir_all(root.join("vend")).unwrap();
         std::fs::write(root.join("vend/root.rs"), "r\n").unwrap(); // NOT covered by sub/.gitignore
-        let ms = mounts_at(&root, false);
+        let base = display(&root);
         let drain = |opts: ScanOpts| {
-            let mut st = scan_open(&ms, "/t", opts).unwrap();
+            let mut st = scan_open(&base, opts).unwrap();
             let mut v = Vec::new();
             loop {
                 let c = scan_next_chunk(&mut st).unwrap();
@@ -1803,10 +1915,10 @@ mod tests {
         let mut uniq = on.clone();
         uniq.dedup();
         assert_eq!(uniq.len(), 4, "{uniq:?}"); // the 4 non-hidden survivors
-        assert!(uniq.contains(&"/t/keep.rs".to_string()));
-        assert!(uniq.contains(&"/t/important.log".to_string())); // negation won
-        assert!(uniq.contains(&"/t/src/ok.rs".to_string()));
-        assert!(uniq.contains(&"/t/vend/root.rs".to_string())); // nested scope stays nested
+        assert!(uniq.contains(&format!("{base}/keep.rs")));
+        assert!(uniq.contains(&format!("{base}/important.log"))); // negation won
+        assert!(uniq.contains(&format!("{base}/src/ok.rs")));
+        assert!(uniq.contains(&format!("{base}/vend/root.rs"))); // nested scope stays nested
         assert!(!on.iter().any(|f| f.contains("a.log")));
         assert!(!on.iter().any(|f| f.contains("/out/")));
         assert!(!on.iter().any(|f| f.contains("build/")));
@@ -1818,8 +1930,8 @@ mod tests {
             skip_hidden: false,
             ..ScanOpts::default()
         });
-        assert!(seen.iter().any(|f| f == "/t/.gitignore"));
-        assert!(seen.iter().any(|f| f == "/t/sub/.gitignore"));
+        assert!(seen.iter().any(|f| f == &format!("{base}/.gitignore")));
+        assert!(seen.iter().any(|f| f == &format!("{base}/sub/.gitignore")));
         // the model's escape hatch: everything non-hidden comes back
         let off = drain(ScanOpts {
             gitignore: false,
@@ -1845,8 +1957,7 @@ mod tests {
         // delivered WHOLE — match completeness belongs to the predicate, not the transport
         let long = format!("{}tail\nafter\n", "x".repeat(200 * 1024));
         std::fs::write(root.join("mini.json"), long).unwrap();
-        let ms = mounts_at(&root, false);
-        let mut st = scan_open(&ms, "/t", ScanOpts::default()).unwrap();
+        let mut st = scan_open(&display(&root), ScanOpts::default()).unwrap();
         let mut all = Vec::new();
         loop {
             let c = scan_next_chunk(&mut st).unwrap();
@@ -1884,8 +1995,7 @@ mod tests {
         blob.push_str("needle\n");
         std::fs::write(root.join("blob.txt"), blob.as_bytes()).unwrap();
         std::fs::write(root.join("after.txt"), "still scanned\n").unwrap();
-        let ms = mounts_at(&root, false);
-        let mut st = scan_open(&ms, "/t", ScanOpts::default()).unwrap();
+        let mut st = scan_open(&display(&root), ScanOpts::default()).unwrap();
         let mut all = Vec::new();
         loop {
             let c = scan_next_chunk(&mut st).unwrap();
@@ -1912,25 +2022,28 @@ mod tests {
     }
 
     #[test]
-    fn write_requires_rw_mount() {
+    fn write_is_denied_in_read_only_mode() {
         let root = tmp_root("ro");
-        let ms = mounts_at(&root, false);
-        let err = write_file(&ms, "/t/new.txt", "hi").unwrap_err();
+        let err = write_file(&read_only(), &display(&root.join("new.txt")), "hi").unwrap_err();
         assert!(
-            err.contains("read-only mount") && err.contains("Policy denial"),
+            err.contains("write_denied")
+                && err.contains("read-only")
+                && err.contains("Policy denial"),
             "{err}"
         );
+        assert!(!root.join("new.txt").exists());
     }
 
     #[test]
     fn write_is_atomic_creates_parents_and_round_trips() {
         let root = tmp_root("rw");
-        let ms = mounts_at(&root, true);
+        let authority = scoped_at(&root);
         let mut writes = WriteLog::default();
-        let n = write_file_with_log(&ms, "/t/a/b/c.txt", "hello\nworld", &mut writes).unwrap();
+        let target = display(&root.join("a/b/c.txt"));
+        let n = write_file_with_log(&authority, &target, "hello\nworld", &mut writes).unwrap();
         assert_eq!(n, 11);
         assert_eq!(writes.items.len(), 1);
-        assert_eq!(writes.items[0].path, "/t/a/b/c.txt");
+        assert_eq!(writes.items[0].path, target);
         assert!(writes.items[0].created);
         assert!(writes.items[0].changed);
         assert_eq!(writes.items[0].bytes_before, None);
@@ -1947,13 +2060,13 @@ mod tests {
             .to_string_lossy()
             .starts_with(".terrarium-")));
         // overwrite is a rename, not a truncate-in-place
-        write_file_with_log(&ms, "/t/a/b/c.txt", "x", &mut writes).unwrap();
+        write_file_with_log(&authority, &target, "x", &mut writes).unwrap();
         assert_eq!(writes.items.len(), 2);
         assert!(!writes.items[1].created);
         assert_eq!(writes.items[1].bytes_before, Some(11));
         assert_eq!(writes.items[1].bytes_after, 1);
         assert_eq!(writes.items[1].first_changed_line, Some(1));
-        write_file_with_log(&ms, "/t/a/b/c.txt", "x", &mut writes).unwrap();
+        write_file_with_log(&authority, &target, "x", &mut writes).unwrap();
         assert_eq!(writes.items.len(), 3);
         assert!(!writes.items[2].created);
         assert!(!writes.items[2].changed);
@@ -1967,11 +2080,48 @@ mod tests {
     }
 
     #[test]
-    fn write_rejects_dotdot_escape() {
+    fn undeclared_targets_are_rejected_with_write_not_authorized() {
+        let root = tmp_root("scoped");
+        let authority = scoped_at(&root);
+        // inside the operator prefix: allowed
+        assert!(write_file(&authority, &display(&root.join("in.txt")), "x").is_ok());
+        // outside: write_not_authorized, nothing created
+        let outside = tmp_root("scoped-outside");
+        let err = write_file(&authority, &display(&outside.join("out.txt")), "x").unwrap_err();
+        assert!(
+            err.contains("write_not_authorized") && err.contains("access block"),
+            "{err}"
+        );
+        assert!(!outside.join("out.txt").exists());
+        // an exact-file scope covers exactly one file
+        let exact_root = tmp_root("scoped-exact");
+        std::fs::write(exact_root.join("one.txt"), "1").unwrap();
+        let exact = RunFilesystemAuthority::Scoped(vec![WriteScope::from_operator_spec(&display(
+            &exact_root.join("one.txt"),
+        ))
+        .unwrap()]);
+        assert!(write_file(&exact, &display(&exact_root.join("one.txt")), "2").is_ok());
+        let err = write_file(&exact, &display(&exact_root.join("two.txt")), "x").unwrap_err();
+        assert!(err.contains("write_not_authorized"), "{err}");
+        assert!(!exact_root.join("two.txt").exists());
+        // empty scope denies everything but stays planned-write shaped
+        let empty = RunFilesystemAuthority::Scoped(Vec::new());
+        let err = write_file(&empty, &display(&root.join("denied.txt")), "x").unwrap_err();
+        assert!(err.contains("write_not_authorized"), "{err}");
+    }
+
+    #[test]
+    fn lexical_escapes_are_rejected_before_any_filesystem_access() {
         let root = tmp_root("esc");
-        let ms = mounts_at(&root, true);
-        let err = write_file(&ms, "/t/../escape.txt", "x").unwrap_err();
-        assert!(err.contains("escapes mount root"), "{err}");
+        let authority = scoped_at(&root);
+        for spec in [
+            format!("{}/../escape.txt", display(&root).trim_end_matches('/')),
+            format!("{}/./x.txt", display(&root).trim_end_matches('/')),
+            format!("{}/..", display(&root).trim_end_matches('/')),
+        ] {
+            let err = write_file(&authority, &spec, "x").unwrap_err();
+            assert!(err.contains("..") || err.contains("`.`"), "{spec} -> {err}");
+        }
         assert!(!root.parent().unwrap().join("escape.txt").exists());
     }
 
@@ -1979,27 +2129,28 @@ mod tests {
     fn read_window_footer_iff_more_lines() {
         let root = tmp_root("read");
         std::fs::write(root.join("f.txt"), "one\ntwo\nthree\nfour").unwrap();
-        let ms = mounts_at(&root, false);
-        let cut = read_window(&ms, "/t/f.txt", 1, 2).unwrap();
+        let file = display(&root.join("f.txt"));
+        let cut = read_window(&file, 1, 2).unwrap();
         assert_eq!(
             cut,
-            "1: one\n2: two\n[more lines follow — continue with host.fs.read(\"/t/f.txt\", 3, …)]"
+            format!(
+                "1: one\n2: two\n[more lines follow — continue with host.fs.read(\"{file}\", 3, …)]"
+            )
         );
-        let whole = read_window(&ms, "/t/f.txt", 1, usize::MAX).unwrap();
+        let whole = read_window(&file, 1, usize::MAX).unwrap();
         assert!(
             whole.ends_with("4: four") && !whole.contains("more lines"),
             "{whole}"
         );
-        let mid = read_window(&ms, "/t/f.txt", 2, 3).unwrap();
-        assert_eq!(mid, "2: two\n3: three\n[more lines follow — continue with host.fs.read(\"/t/f.txt\", 4, …)]");
+        let mid = read_window(&file, 2, 3).unwrap();
+        assert_eq!(mid, format!("2: two\n3: three\n[more lines follow — continue with host.fs.read(\"{file}\", 4, …)]"));
     }
 
     #[test]
     fn read_caps_pathological_lines() {
         let root = tmp_root("longline");
         std::fs::write(root.join("min.txt"), format!("{}\nend", "x".repeat(5000))).unwrap();
-        let ms = mounts_at(&root, false);
-        let s = read_window(&ms, "/t/min.txt", 1, 2).unwrap();
+        let s = read_window(&display(&root.join("min.txt")), 1, 2).unwrap();
         let l1 = s.lines().next().unwrap();
         assert!(
             l1.starts_with("1: ") && l1.ends_with('…') && l1.chars().count() <= 2004,
@@ -2010,10 +2161,10 @@ mod tests {
     #[test]
     fn write_restores_crlf_bom_and_lone_cr() {
         let root = tmp_root("shape");
-        let ms = mounts_at(&root, true);
+        let authority = scoped_at(&root);
         // CRLF-dominant + BOM target: round-trip restores both; return value counts real bytes written
         std::fs::write(root.join("win.txt"), b"\xEF\xBB\xBFa\r\nb\r\nc\n").unwrap();
-        let n = write_file(&ms, "/t/win.txt", "x\ny").unwrap();
+        let n = write_file(&authority, &display(&root.join("win.txt")), "x\ny").unwrap();
         assert_eq!(
             std::fs::read(root.join("win.txt")).unwrap(),
             b"\xEF\xBB\xBFx\r\ny"
@@ -2021,29 +2172,31 @@ mod tests {
         assert_eq!(n, 3 + 3 + 1); // BOM + "x\r\n" + "y"
                                   // LF target stays LF; lone \r survives untouched either way
         std::fs::write(root.join("unix.txt"), "a\nb\n").unwrap();
-        write_file(&ms, "/t/unix.txt", "x\ry\n").unwrap();
+        write_file(&authority, &display(&root.join("unix.txt")), "x\ry\n").unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("unix.txt")).unwrap(),
             "x\ry\n"
         );
         // a brand-new file gets exactly what was given — no BOM, no CRLF invention
-        write_file(&ms, "/t/fresh.txt", "1\n2").unwrap();
+        write_file(&authority, &display(&root.join("fresh.txt")), "1\n2").unwrap();
         assert_eq!(std::fs::read(root.join("fresh.txt")).unwrap(), b"1\n2");
         // majority rules within the 4KB sample: CRLF wins ties only on strict majority
         std::fs::write(root.join("mix.txt"), "a\r\nb\nc\n").unwrap(); // crlf=1, lf=1 → LF
-        write_file(&ms, "/t/mix.txt", "z\n").unwrap();
+        write_file(&authority, &display(&root.join("mix.txt")), "z\n").unwrap();
         assert_eq!(std::fs::read(root.join("mix.txt")).unwrap(), b"z\n");
     }
 
     #[test]
     fn text_channel_is_lf_normalized_and_round_trips() {
         let root = tmp_root("textch");
-        let ms = mounts_at(&root, true);
+        let authority = scoped_at(&root);
         std::fs::write(root.join("c.txt"), "a\r\nb\r\nc").unwrap();
-        assert_eq!(read_text(&ms, "/t/c.txt").unwrap(), "a\nb\nc");
+        assert_eq!(read_text(&display(&root.join("c.txt"))).unwrap(), "a\nb\nc");
         // surgical idiom: text → replace → write restores the file's own EOL
-        let edited = read_text(&ms, "/t/c.txt").unwrap().replace("b", "B");
-        write_file(&ms, "/t/c.txt", &edited).unwrap();
+        let edited = read_text(&display(&root.join("c.txt")))
+            .unwrap()
+            .replace("b", "B");
+        write_file(&authority, &display(&root.join("c.txt")), &edited).unwrap();
         assert_eq!(std::fs::read(root.join("c.txt")).unwrap(), b"a\r\nB\r\nc");
     }
 
@@ -2051,12 +2204,14 @@ mod tests {
     async fn host_fs_replace_makes_one_exact_change_and_returns_a_small_receipt() {
         let root = tmp_root("edit-replace");
         std::fs::write(root.join("file.txt"), "one\ntwo\nthree\n").unwrap();
-        let mounts = mounts_at(&root, true);
         let (tx, _rx) = tokio::sync::watch::channel(false);
         let out = crate::kernel::eval_js(
-            "return host.fs.replace('/t/file.txt', 'two', 'TWO')",
+            &format!(
+                "return host.fs.replace('{}', 'two', 'TWO')",
+                display(&root.join("file.txt"))
+            ),
             5_000,
-            &mounts,
+            &scoped_at(&root),
             tx,
         )
         .await;
@@ -2064,13 +2219,13 @@ mod tests {
         assert_eq!(
             out.value,
             Some(serde_json::json!({
-                "path": "/t/file.txt",
+                "path": display(&root.join("file.txt")),
                 "replacements": 1,
                 "bytes": 14
             }))
         );
         assert_eq!(out.writes.len(), 1);
-        assert_eq!(out.writes[0].path, "/t/file.txt");
+        assert_eq!(out.writes[0].path, display(&root.join("file.txt")));
         assert!(!out.writes[0].created);
         assert!(out.writes[0].changed);
         assert_eq!(out.writes[0].bytes_before, Some(14));
@@ -2083,14 +2238,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replace_enforces_the_runs_frozen_authority() {
+        let root = tmp_root("edit-auth");
+        std::fs::write(root.join("file.txt"), "one\ntwo\n").unwrap();
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        // read-only invocation: the replace fails at the underlying write
+        let out = crate::kernel::eval_js(
+            &format!(
+                "return host.fs.replace('{}', 'two', 'TWO')",
+                display(&root.join("file.txt"))
+            ),
+            5_000,
+            &read_only(),
+            tx,
+        )
+        .await;
+        assert!(!out.ok);
+        let message = out.error.expect("denied").message;
+        assert!(message.contains("write_denied"), "{message}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("file.txt")).unwrap(),
+            "one\ntwo\n"
+        );
+    }
+
+    #[tokio::test]
     async fn write_receipt_survives_a_later_program_failure() {
         let root = tmp_root("write-failure");
-        let mounts = mounts_at(&root, true);
         let (tx, _rx) = tokio::sync::watch::channel(false);
         let out = crate::kernel::eval_js(
-            "host.fs.write('/t/file.txt', 'written'); throw new Error('after write')",
+            &format!(
+                "host.fs.write('{}', 'written'); throw new Error('after write')",
+                display(&root.join("file.txt"))
+            ),
             5_000,
-            &mounts,
+            &scoped_at(&root),
             tx,
         )
         .await;
@@ -2109,24 +2291,33 @@ mod tests {
         let root = tmp_root("edit-reject");
         let original = "same\nmiddle\nsame\n";
         std::fs::write(root.join("file.txt"), original).unwrap();
-        let mounts = mounts_at(&root, true);
+        let authority = scoped_at(&root);
 
         for (source, expected) in [
             (
-                "return host.fs.replace('/t/file.txt', 'missing', 'new')",
+                format!(
+                    "return host.fs.replace('{}', 'missing', 'new')",
+                    display(&root.join("file.txt"))
+                ),
                 "not found",
             ),
             (
-                "return host.fs.replace('/t/file.txt', 'same', 'new')",
+                format!(
+                    "return host.fs.replace('{}', 'same', 'new')",
+                    display(&root.join("file.txt"))
+                ),
                 "matched 2 times",
             ),
             (
-                "return host.fs.replace('/t/file.txt', 'middle', 'middle')",
+                format!(
+                    "return host.fs.replace('{}', 'middle', 'middle')",
+                    display(&root.join("file.txt"))
+                ),
                 "identical",
             ),
         ] {
             let (tx, _rx) = tokio::sync::watch::channel(false);
-            let out = crate::kernel::eval_js(source, 5_000, &mounts, tx).await;
+            let out = crate::kernel::eval_js(&source, 5_000, &authority, tx).await;
             assert!(!out.ok, "source unexpectedly succeeded: {source}");
             let message = out.error.expect("edit error").message;
             assert!(message.contains(expected), "{message}");
@@ -2141,12 +2332,14 @@ mod tests {
     async fn host_fs_replace_treats_replacement_text_literally() {
         let root = tmp_root("edit-literal");
         std::fs::write(root.join("file.txt"), "const marker = OLD;\n").unwrap();
-        let mounts = mounts_at(&root, true);
         let (tx, _rx) = tokio::sync::watch::channel(false);
         let out = crate::kernel::eval_js(
-            "return host.fs.replace('/t/file.txt', 'OLD', '$&')",
+            &format!(
+                "return host.fs.replace('{}', 'OLD', '$&')",
+                display(&root.join("file.txt"))
+            ),
             5_000,
-            &mounts,
+            &scoped_at(&root),
             tx,
         )
         .await;
@@ -2161,12 +2354,14 @@ mod tests {
     async fn host_fs_replace_all_is_explicit() {
         let root = tmp_root("edit-all");
         std::fs::write(root.join("file.txt"), "x x x").unwrap();
-        let mounts = mounts_at(&root, true);
         let (tx, _rx) = tokio::sync::watch::channel(false);
         let out = crate::kernel::eval_js(
-            "return host.fs.replace('/t/file.txt', 'x', 'y', {all: true})",
+            &format!(
+                "return host.fs.replace('{}', 'x', 'y', {{all: true}})",
+                display(&root.join("file.txt"))
+            ),
             5_000,
-            &mounts,
+            &scoped_at(&root),
             tx,
         )
         .await;
@@ -2178,35 +2373,105 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn resolve_rejects_escape_and_offmount() {
-        let root = tmp_root("resolve");
-        let ms = mounts_at(&root, false);
-        assert!(resolve_mount(&ms, "/t/../../../etc/passwd").is_err());
-        assert!(resolve_mount(&ms, "/nope/x")
-            .unwrap_err()
-            .contains("not under any mount"));
+    fn reads_follow_the_os_view_while_writes_reject_symlinks() {
+        let root = tmp_root("symlink");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("secret.txt"), "top secret").unwrap();
+        let outside = tmp_root("symlink-out");
+        std::fs::write(outside.join("private.txt"), "private").unwrap();
+        // reads use the OS user's readable view: an outward symlink is readable
+        std::os::unix::fs::symlink(outside.join("private.txt"), root.join("leak.txt")).unwrap();
+        std::os::unix::fs::symlink(root.join("secret.txt"), root.join("alias.txt")).unwrap();
+        assert_eq!(
+            read_text(&display(&root.join("leak.txt"))).unwrap(),
+            "private"
+        );
+        assert_eq!(
+            read_text(&display(&root.join("alias.txt"))).unwrap(),
+            "top secret"
+        );
+        // writes never target an existing symlink, in or out of scope
+        let authority = scoped_at(&root);
+        let err = write_file(&authority, &display(&root.join("leak.txt")), "x").unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+        let err = write_file(&authority, &display(&root.join("alias.txt")), "x").unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(outside.join("private.txt")).unwrap(),
+            "private"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("secret.txt")).unwrap(),
+            "top secret"
+        );
+        // scan never follows symlinks during traversal (rg default without -L)
+        std::os::unix::fs::symlink(&outside, root.join("sub/evil")).unwrap();
+        let mut st = scan_open(&display(&root), ScanOpts::default()).unwrap();
+        let mut files = Vec::new();
+        loop {
+            let c = scan_next_chunk(&mut st).unwrap();
+            if c.is_empty() {
+                break;
+            }
+            files.extend(c.into_iter().map(|l| l.file));
+        }
+        assert!(!files.iter().any(|f| f.contains("private")), "{files:?}");
+        assert!(!files.iter().any(|f| f.contains("leak")), "{files:?}");
+        assert!(!files.iter().any(|f| f.contains("alias")), "{files:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_scan_root_reads_through_the_link() {
+        let root = tmp_root("symlink-root");
+        let outside = tmp_root("symlink-root-out");
+        std::fs::write(outside.join("visible.txt"), "v\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("rootlink")).unwrap();
+        let mut st = scan_open(&display(&root.join("rootlink")), ScanOpts::default()).unwrap();
+        let mut files = Vec::new();
+        loop {
+            let c = scan_next_chunk(&mut st).unwrap();
+            if c.is_empty() {
+                break;
+            }
+            files.extend(c.into_iter().map(|l| l.file));
+        }
+        assert!(
+            files.iter().any(|f| f.ends_with("visible.txt")),
+            "{files:?}"
+        );
     }
 
     #[test]
-    fn absolute_mount_prefix_keeps_path_boundary() {
-        let root = tmp_root("absolute-prefix");
-        let prefix = root.to_string_lossy().into_owned();
-        let canonical_root = root.canonicalize().unwrap();
-        let mount = Mount::new(&prefix, &root, false).unwrap();
-        let mounts = [mount];
+    fn text_channel_rejects_files_beyond_the_cage_heap() {
+        let root = tmp_root("huge");
+        let f = std::fs::File::create(root.join("huge.bin")).unwrap();
+        f.set_len(crate::MEM_LIMIT as u64 + 1).unwrap(); // sparse: no bytes actually written
+        let err = read_text(&display(&root.join("huge.bin"))).unwrap_err();
+        assert!(err.contains("64MB cage heap"), "{err}");
+    }
+
+    #[test]
+    fn text_channel_strips_a_leading_bom() {
+        let root = tmp_root("bom");
+        std::fs::write(root.join("b.txt"), b"\xEF\xBB\xBFa\r\nb").unwrap();
+        assert_eq!(read_text(&display(&root.join("b.txt"))).unwrap(), "a\nb");
+        // write restores what the target had: the round trip is shape-preserving both ways
+        let authority = scoped_at(&root);
+        write_file(&authority, &display(&root.join("b.txt")), "c\nd").unwrap();
         assert_eq!(
-            resolve_mount(&mounts, &format!("{prefix}/file.txt")).unwrap(),
-            canonical_root.join("file.txt")
+            std::fs::read(root.join("b.txt")).unwrap(),
+            b"\xEF\xBB\xBFc\r\nd"
         );
-        assert!(resolve_mount(&mounts, &format!("{prefix}/../outside.txt")).is_err());
     }
 
     #[cfg(any(target_os = "macos", windows))]
     #[test]
-    fn absolute_mount_accepts_case_spelling_used_by_the_filesystem() {
+    fn alternate_case_spellings_collapse_to_one_identity() {
         let root = tmp_root("case-spelling");
-        let prefix = root.to_string_lossy().into_owned();
+        let prefix = display(&root);
         let alternate: String = prefix
             .chars()
             .map(|ch| {
@@ -2223,37 +2488,16 @@ mod tests {
             return;
         }
         std::fs::write(root.join("file.txt"), "case-insensitive").unwrap();
-        let mount = Mount::new(&prefix, &root, false).unwrap();
         assert_eq!(
-            read_text(&[mount], &format!("{alternate}/file.txt")).unwrap(),
+            read_text(&format!("{alternate}/file.txt")).unwrap(),
             "case-insensitive"
         );
-    }
-
-    #[test]
-    fn strip_mount_is_component_wise() {
-        let root = tmp_root("prefix");
-        let ms = mounts_at(&root, false);
-        // "/t" must never capture "/tmp2/…" — the old textual prefix silently misfiled neighbors
-        assert!(strip_mount(&ms, "/tmp2/fs.rs").is_err());
-        assert_eq!(strip_mount(&ms, "/t").unwrap().1, "");
-        assert_eq!(strip_mount(&ms, "/t/").unwrap().1, "");
-        assert_eq!(strip_mount(&ms, "/t/a/b.rs").unwrap().1, "a/b.rs");
-        // sibling-prefix mounts resolve by component, independent of registration order
-        for ms in [
-            vec![
-                Mount::from_canonical("/a", root.clone(), false).unwrap(),
-                Mount::from_canonical("/ab", root.clone(), false).unwrap(),
-            ],
-            vec![
-                Mount::from_canonical("/ab", root.clone(), false).unwrap(),
-                Mount::from_canonical("/a", root.clone(), false).unwrap(),
-            ],
-        ] {
-            assert_eq!(strip_mount(&ms, "/ab").unwrap().0.virtual_path(), "/ab/");
-            assert_eq!(strip_mount(&ms, "/ab/x").unwrap().0.virtual_path(), "/ab/");
-            assert_eq!(strip_mount(&ms, "/a/x").unwrap().0.virtual_path(), "/a/");
-        }
+        // write scope membership also collapses the spelling
+        let authority = scoped_at(&root);
+        assert!(
+            write_file(&authority, &format!("{alternate}/file.txt"), "ok").is_ok(),
+            "scope membership must be case-insensitive on this platform"
+        );
     }
 
     #[test]
@@ -2265,77 +2509,5 @@ mod tests {
         // deep `**` chains must not recurse (multi-MB patterns once overflowed the native stack)
         let deep: Vec<char> = "*".repeat(2000).chars().collect();
         assert!(glob_match(&deep, &"x/y/z".chars().collect::<Vec<_>>()));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn tail_symlinks_resolve_through_the_boundary_decision() {
-        let root = tmp_root("symlink");
-        std::fs::create_dir_all(root.join("sub")).unwrap();
-        std::fs::write(root.join("secret.txt"), "top secret").unwrap();
-        let outside = tmp_root("symlink-out");
-        std::fs::write(outside.join("private.txt"), "private").unwrap();
-        // outward symlink on every channel's final component…
-        std::os::unix::fs::symlink(outside.join("private.txt"), root.join("leak.txt")).unwrap();
-        // …while a symlink that stays inside the mount is legitimate repo furniture
-        std::os::unix::fs::symlink(root.join("secret.txt"), root.join("alias.txt")).unwrap();
-        let ms = mounts_at(&root, false);
-        let err = read_text(&ms, "/t/leak.txt").unwrap_err();
-        assert!(err.contains("escapes mount root"), "{err}");
-        assert!(read_window(&ms, "/t/leak.txt", 1, 5).is_err());
-        assert_eq!(read_text(&ms, "/t/alias.txt").unwrap(), "top secret");
-        let prefix = root.to_string_lossy().into_owned();
-        let absolute_ms = [Mount::new(&prefix, &root, false).unwrap()];
-        let absolute_err = read_text(&absolute_ms, &format!("{prefix}/leak.txt")).unwrap_err();
-        assert!(
-            absolute_err.contains("escapes mount root"),
-            "{absolute_err}"
-        );
-        assert_eq!(
-            read_text(&absolute_ms, &format!("{prefix}/alias.txt")).unwrap(),
-            "top secret"
-        );
-        // scan never follows symlinks (rg default without -L): outward or inward, links are skipped
-        std::os::unix::fs::symlink(&outside, root.join("sub/evil")).unwrap();
-        let mut st = scan_open(&ms, "/t", ScanOpts::default()).unwrap();
-        let mut files = Vec::new();
-        loop {
-            let c = scan_next_chunk(&mut st).unwrap();
-            if c.is_empty() {
-                break;
-            }
-            files.extend(c.into_iter().map(|l| l.file));
-        }
-        assert!(!files.iter().any(|f| f.contains("private")), "{files:?}");
-        assert!(!files.iter().any(|f| f.contains("leak")), "{files:?}");
-        assert!(!files.iter().any(|f| f.contains("alias")), "{files:?}");
-        // a scan ROOT that is itself an outward symlink is rejected by the same boundary rule
-        std::os::unix::fs::symlink(&outside, root.join("rootlink")).unwrap();
-        assert!(scan_open(&ms, "/t/rootlink", ScanOpts::default()).is_err());
-    }
-
-    #[test]
-    fn text_channel_rejects_files_beyond_the_cage_heap() {
-        let root = tmp_root("huge");
-        let f = std::fs::File::create(root.join("huge.bin")).unwrap();
-        f.set_len(crate::MEM_LIMIT as u64 + 1).unwrap(); // sparse: no bytes actually written
-        let ms = mounts_at(&root, false);
-        let err = read_text(&ms, "/t/huge.bin").unwrap_err();
-        assert!(err.contains("64MB cage heap"), "{err}");
-    }
-
-    #[test]
-    fn text_channel_strips_a_leading_bom() {
-        let root = tmp_root("bom");
-        std::fs::write(root.join("b.txt"), b"\xEF\xBB\xBFa\r\nb").unwrap();
-        let ms = mounts_at(&root, false);
-        assert_eq!(read_text(&ms, "/t/b.txt").unwrap(), "a\nb");
-        // write restores what the target had: the round trip is shape-preserving both ways
-        let ms = mounts_at(&root, true);
-        write_file(&ms, "/t/b.txt", "c\nd").unwrap();
-        assert_eq!(
-            std::fs::read(root.join("b.txt")).unwrap(),
-            b"\xEF\xBB\xBFc\r\nd"
-        );
     }
 }

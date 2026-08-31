@@ -1,14 +1,56 @@
 //! Command-line adapter for the Terrarium library.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
-use crate::{add_mount, agent, llm, Kernel, Mount};
+use crate::{
+    agent,
+    auth::{Authorizer, Decision, ResolvedAccessRequest},
+    fs::{RunFilesystemAuthority, WriteScope},
+    llm, Kernel,
+};
+
+/// One terminal decision prompt. An invocation without an interactive stdin — a pipe, CI
+/// job, or background run — reports `Unavailable` instead of guessing; EOF while prompting
+/// cancels rather than approving.
+struct TerminalAuthorizer;
+
+impl Authorizer for TerminalAuthorizer {
+    fn decide(&self, request: &ResolvedAccessRequest) -> Decision {
+        if !std::io::stdin().is_terminal() {
+            return Decision::Unavailable;
+        }
+        let mut out = std::io::stdout();
+        let _ = writeln!(out, "Terrarium requests write authorization for this run");
+        if !request.reason.trim().is_empty() {
+            let _ = writeln!(out, "Reason: {}", request.reason);
+        }
+        for target in &request.targets {
+            let note = if target.parents_missing {
+                " (new file; missing parent directories will be created)"
+            } else {
+                ""
+            };
+            let _ = writeln!(out, "  {}{}", target.display, note);
+        }
+        let _ = write!(out, "Allow these writes? [y/N] ");
+        let _ = out.flush();
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) => Decision::Cancel,
+            Ok(_) => match line.trim().to_lowercase().as_str() {
+                "y" | "yes" => Decision::Allow,
+                _ => Decision::Deny,
+            },
+            Err(_) => Decision::Cancel,
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 struct RunArgs {
     timeout_ms: Option<u64>,
-    mounts: Vec<Mount>,
+    allow_write: Vec<String>,
     contract: bool,
     expression: Option<String>,
     file: Option<PathBuf>,
@@ -54,11 +96,13 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 parsed.full_access = true;
                 i += 1;
             }
-            "--mount" if i + 1 < args.len() => {
-                add_mount(&mut parsed.mounts, &args[i + 1])?;
+            "--allow-write" if i + 1 < args.len() => {
+                parsed.allow_write.push(args[i + 1].clone());
                 i += 2;
             }
-            "--mount" => return Err("--mount expects /virtual=real[:rw]".into()),
+            "--allow-write" => {
+                return Err("--allow-write expects an absolute DIR or FILE path".into())
+            }
             arg if arg.starts_with("--") => {
                 return Err(format!("unknown or incomplete flag: {arg}"))
             }
@@ -74,7 +118,30 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     if parsed.read_only && parsed.full_access {
         return Err("--read-only and --full-access are mutually exclusive".into());
     }
+    if (parsed.read_only || parsed.full_access) && !parsed.allow_write.is_empty() {
+        return Err(
+            "--allow-write is valid only in planned-write mode; it cannot be combined with \
+             --read-only or --full-access"
+                .into(),
+        );
+    }
     Ok(parsed)
+}
+
+/// Direct run is read-only by default; `--full-access` is the explicit trusted path and
+/// `--allow-write` scopes switch the invocation to planned-write without a model access block.
+fn direct_run_authority(parsed: &RunArgs) -> Result<RunFilesystemAuthority, String> {
+    if parsed.full_access {
+        return Ok(RunFilesystemAuthority::FullAccess);
+    }
+    if parsed.allow_write.is_empty() {
+        return Ok(RunFilesystemAuthority::ReadOnly);
+    }
+    let mut scopes = Vec::with_capacity(parsed.allow_write.len());
+    for spec in &parsed.allow_write {
+        scopes.push(WriteScope::from_operator_spec(spec)?);
+    }
+    Ok(RunFilesystemAuthority::Scoped(scopes))
 }
 
 async fn run_direct(args: &[String]) -> i32 {
@@ -82,39 +149,18 @@ async fn run_direct(args: &[String]) -> i32 {
         Ok(v) => v,
         Err(error) => {
             eprintln!("terrarium: {error}");
-            eprintln!("usage: terrarium run [-e SOURCE | FILE] [--read-only | --full-access] [--mount /virtual=real[:rw]] [--timeout-ms N]");
+            eprintln!("usage: terrarium run [-e SOURCE | FILE] [--read-only | --full-access | --allow-write PATH]... [--timeout-ms N]");
             return 2;
         }
     };
-    let writable = !parsed.read_only;
-    let root = if parsed.full_access {
-        Mount::new("/", "/", true)
-    } else {
-        let cwd = match std::env::current_dir() {
-            Ok(path) => path,
-            Err(error) => {
-                eprintln!("terrarium: cannot determine working root: {error}");
-                return 2;
-            }
-        };
-        Mount::new(cwd.to_string_lossy().into_owned(), cwd, writable)
-    };
-    let root = match root {
-        Ok(mount) => mount,
-        Err(error) => {
-            eprintln!("terrarium: {error}");
-            return 2;
-        }
-    };
-    let mut mounts = vec![root];
-    mounts.extend(parsed.mounts);
-    let kernel = match Kernel::new(mounts) {
+    let authority = match direct_run_authority(&parsed) {
         Ok(v) => v,
         Err(error) => {
             eprintln!("terrarium: {error}");
             return 2;
         }
     };
+    let kernel = Kernel::new(authority);
     if parsed.contract {
         print!("{}", kernel.contract());
         return 0;
@@ -158,17 +204,14 @@ async fn run_direct(args: &[String]) -> i32 {
             "writes_truncated": outcome.writes_truncated,
             "target": format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
             "limits": {"memory":"64MB","stack":"1MB","timeout_ms":timeout_ms},
-            "mounts": kernel
-                .mounts()
-                .iter()
-                .map(|m| {
-                    if m.virtual_path() == "/" {
-                        "/".to_string()
-                    } else {
-                        m.virtual_path().trim_end_matches('/').to_string()
-                    }
-                })
-                .collect::<Vec<_>>(),
+            "filesystem": {
+                "mode": kernel.authority().mode().as_str(),
+                "writeScopes": match kernel.authority() {
+                    RunFilesystemAuthority::Scoped(scopes) =>
+                        scopes.iter().map(WriteScope::display).collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                },
+            },
             "llm_usage": llm::usage_json()
         })
     );
@@ -180,12 +223,19 @@ pub async fn run(args: &[String]) -> i32 {
     if args.first().map(String::as_str) == Some("run") {
         return run_direct(&args[1..]).await;
     }
-    agent::run_cli(args).await
+    agent::run_cli(args, &TerminalAuthorizer).await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_run_args;
+    use super::{direct_run_authority, parse_run_args, RunArgs};
+    use crate::fs::RunFilesystemAuthority;
+
+    fn run_args(mut base: RunArgs, read_only: bool, full_access: bool) -> RunArgs {
+        base.read_only = read_only;
+        base.full_access = full_access;
+        base
+    }
 
     #[test]
     fn run_inputs_are_mutually_exclusive() {
@@ -196,16 +246,69 @@ mod tests {
         assert!(parse_run_args(&["-e".into(), "return 1".into(), "file.js".into()]).is_err());
         assert!(parse_run_args(&["--timeout-ms".into()]).is_err());
         assert!(parse_run_args(&["--read-only".into(), "--full-access".into()]).is_err());
-        let mount_spec = format!("/data={}", std::env::temp_dir().display());
-        let parsed = parse_run_args(&[
-            "--read-only".into(),
-            "--mount".into(),
-            mount_spec,
-            "-e".into(),
-            "return 1".into(),
-        ])
-        .unwrap();
-        assert!(parsed.read_only);
-        assert_eq!(parsed.mounts.len(), 1);
+        assert!(parse_run_args(&["--mount".into(), "/x=/y".into()]).is_err());
+    }
+
+    #[test]
+    fn allow_write_conflicts_with_fixed_modes() {
+        let with_scope = |scope: &str| {
+            vec![
+                "--allow-write".into(),
+                scope.into(),
+                "-e".into(),
+                "return 1".into(),
+            ]
+        };
+        assert!(parse_run_args(&with_scope("/tmp")).is_ok());
+        assert!(parse_run_args(&with_scope("/tmp/definitely/missing")).is_ok());
+        assert!(parse_run_args(
+            &["--read-only".into()]
+                .into_iter()
+                .chain(with_scope("/tmp"))
+                .collect::<Vec<_>>()
+        )
+        .is_err());
+        assert!(parse_run_args(
+            &["--full-access".into()]
+                .into_iter()
+                .chain(with_scope("/tmp"))
+                .collect::<Vec<_>>()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn direct_run_is_read_only_by_default_and_scopes_enable_planned_write() {
+        let root = std::env::temp_dir();
+        let root_display = root.to_string_lossy().into_owned();
+        assert_eq!(
+            direct_run_authority(&run_args(RunArgs::default(), false, false)).unwrap(),
+            RunFilesystemAuthority::ReadOnly
+        );
+        assert_eq!(
+            direct_run_authority(&run_args(RunArgs::default(), true, false)).unwrap(),
+            RunFilesystemAuthority::ReadOnly
+        );
+        assert_eq!(
+            direct_run_authority(&run_args(RunArgs::default(), false, true)).unwrap(),
+            RunFilesystemAuthority::FullAccess
+        );
+        let mut scoped = RunArgs::default();
+        scoped.allow_write.push(root_display.clone());
+        let authority = direct_run_authority(&scoped).unwrap();
+        assert_eq!(authority.mode(), crate::fs::FilesystemMode::PlannedWrite);
+        let probe = root.join("terrarium-cli-scope-probe.txt");
+        assert!(authority
+            .authorize_write(&probe.display().to_string(), &probe)
+            .is_ok());
+        let outside = std::path::PathBuf::from("/definitely/not/covered.txt");
+        assert!(authority
+            .authorize_write(outside.to_str().unwrap_or_default(), &outside)
+            .is_err());
+        let mut missing = RunArgs::default();
+        missing
+            .allow_write
+            .push("/definitely/not/a/real/path".into());
+        assert!(direct_run_authority(&missing).is_err());
     }
 }

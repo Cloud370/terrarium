@@ -54,9 +54,9 @@ terrarium run -e 'return await host.fs.text("/work/project/Cargo.toml")'
 
 ### 2.4 存储事实，而非框架对象
 
-会话工作根目录是会话生命周期内稳定的资源身份。版本 1 不持久化附件注册表、动态挂载集合、虚拟路径别名或目录级 ACL。根本属于另一个目录的任务应启动另一个会话。
+会话工作根目录是会话生命周期内稳定的资源身份。版本 1 不持久化附件注册表、写入范围、虚拟路径别名或目录级 ACL。根本属于另一个目录的任务应启动另一个会话。
 
-一次调用可以使用 `--mount /virtual=real[:rw]` 添加显式挂载；这些挂载由可信宿主选择，并在本次调用的每一次运行中持续有效，但不会写入日志。默认挂载直接使用会话工作根的绝对路径，因此用户消息和模型程序使用相同的路径。`--full-access` 安装 `/ -> /`，允许模型使用当前操作系统用户可见的真实绝对路径，包括会话工作根之外的路径。JavaScript 不会展开 `~`；prompt 会列出可用的授权根路径。路径被拒绝时应将其视为授权结果，不得猜测其他路径或虚构挂载。
+每次调用选择一个文件系统模式——`read-only`、`planned-write`（agent 默认）或 `full-access`——在 `planned-write` 下还可附加操作者 `--allow-write DIR|FILE` 范围。这些由可信宿主选择，在本次调用内固定不变，但不会写入日志。`planned-write` 中，每次运行的写入通过 `access` 块预授权，详见 `filesystem-authorization.zh-CN.md`。`--full-access` 允许模型使用当前操作系统用户可见的真实绝对路径，包括会话工作根之外的路径。JavaScript 不会展开 `~`；runtime state 会标明工作根。路径被拒绝时应将其视为授权结果，不得猜测其他路径或虚构范围。
 
 生成的主机契约将 `host.fs.list(dir)` 暴露为按名称排序的对象数组，字段为 `name`、`type` 和 `size`。`type` 可以是 `file`、`directory`、`symlink` 或 `other`；普通文件的 `size` 是字节数，其他类型为 `null`。程序应直接检查这些字段，不要解析展示字符串。递归统计时一次列出一个目录；仅对 `type` 为 `directory` 的条目继续递归，并且只累加 `type` 为 `file` 的 `size`。应记录遍历错误；如果任何必要目录无法列出，就必须报告结果不完整，不得提交确定的完整总数。
 
@@ -147,7 +147,7 @@ JavaScript 程序则不同。如果 `run/start` 已持久化但 `run/result` 缺
 - 每个主 agent 步骤至多一次重试；
 - 被中断的未闭合轮的继续；
 - 保守恢复，绝不重复结果不确定的运行；
-- 通过现有的 `Mount` 校验边界恢复会话挂载。
+- 通过现有的身份解析边界校验并恢复会话工作根。
 
 版本 1 排除未使用的能力元数据。在 Terrarium 具备上下文管理或会消耗这些值的非文本负载之前，不设上下文窗口、图像模态或视频模态字段。
 
@@ -365,7 +365,7 @@ API 密钥的值绝不写入。
 
 头部不是事件，没有 `seq`。`displayPath` 是本地用户命名空间中的绝对路径；`canonicalPath` 是创建会话时由宿主规范化得到的路径。
 
-恢复时，宿主会重新验证存储的目录。如果目录不存在、解析到不同的规范路径、不是目录或无法在当前主机表示，恢复失败。Terrarium 不会静默采用当前 shell 目录、重定向根目录或重写存储路径。存储的根目录不授予权限；当前调用独立决定文件系统访问模式。
+恢复时，宿主会重新解析存储目录的身份。如果目录不存在、解析到不同的规范路径、不是目录或无法在当前主机表示，恢复失败。Terrarium 不会静默采用当前 shell 目录、重定向根目录或重写存储路径。存储的根目录不授予权限；当前调用独立决定文件系统模式与写入范围。
 
 ### 8.3 事件信封
 
@@ -682,22 +682,22 @@ turn/end
 概念上的 CLI 形式：
 
 ```sh
-terrarium [--config PATH] [--profile NAME] [--read-only | --full-access] [--mount /virtual=real[:rw]] <消息...>
-terrarium --resume SESSION_ID [--read-only | --full-access] [--mount /virtual=real[:rw]]
-terrarium --resume SESSION_ID [--config PATH] [--profile NAME] [--read-only | --full-access] [--mount /virtual=real[:rw]] <消息...>
-terrarium run [-e SOURCE | FILE] [--read-only | --full-access] [--mount /virtual=real[:rw]] [--timeout-ms N]
+terrarium [--config PATH] [--profile NAME] [--read-only | --full-access | --allow-write DIR|FILE]... <消息...>
+terrarium --resume SESSION_ID [--read-only | --full-access | --allow-write DIR|FILE]...
+terrarium --resume SESSION_ID [--config PATH] [--profile NAME] [--read-only | --full-access | --allow-write DIR|FILE]... <消息...>
+terrarium run [-e SOURCE | FILE] [--read-only | --full-access | --allow-write DIR|FILE]... [--timeout-ms N]
 ```
 
-普通命令始终是模型驱动 agent。消息参数会拼接成文本；Terrarium 不会把看起来像现有文件的消息重新解释为任务文件。没有消息时，非终端 stdin 可提供消息。显式 `--mount /virtual=real[:rw]` 对本次调用的每一次运行都有效。`--full-access` 下，`/` 暴露受当前操作系统用户权限约束的真实绝对路径；JavaScript 不会展开 `~`，因此模型必须使用 prompt 中显示的实际绝对 home 路径。`terrarium run` 是唯一的直接 JavaScript 入口：它从 `-e`、一个文件或非终端 stdin 读取源码，不创建持久会话，并输出一个结构化结果。
+普通命令始终是模型驱动 agent。消息参数会拼接成文本；Terrarium 不会把看起来像现有文件的消息重新解释为任务文件。没有消息时，非终端 stdin 可提供消息。文件系统模式标志对本次调用的每一次运行都有效。`--full-access` 下，写入只需通过路径校验并受当前操作系统用户权限约束；JavaScript 不会展开 `~`，因此模型必须使用 runtime state 中标明的实际绝对 home 路径。`terrarium run` 是唯一的直接 JavaScript 入口：它从 `-e`、一个文件或非终端 stdin 读取源码，不创建持久会话，默认只读，并输出一个结构化结果。
 
 - 不带 `--resume`：创建会话并开始第一轮；
 - `--resume ID` 不带消息：继续一个打开的轮；
 - 无打开的轮时，不带消息的恢复失败；
 - 带消息的恢复要求上一轮已闭合，并开启新轮；
 - `--profile` 仅在开启新轮时有效；
-- 打开中的轮始终使用其存储的提示词、配置档和限制；当前调用独立选择访问模式；
+- 打开中的轮始终使用其存储的配置档和限制；系统提示词字节稳定，当前调用的运行时状态随 user 消息传递；文件系统模式由当前调用独立选择；
 - 已完成的轮绝不被重新打开；
-- `--read-only`、`workspace` 和 `--full-access` 只属于当前调用，从不写入或从日志恢复；
+- `--read-only`、`--full-access` 与 `--allow-write` 只属于当前调用，从不写入或从日志恢复；
 - 创建会话时会话 ID 打印到 stderr，让 stdout 保持为回答通道。
 
 恢复至多移除一个末尾不完整的物理行，校验所有完整事件，归约日志，然后按如下方式处理最终状态。
@@ -802,8 +802,8 @@ API 密钥的值只存在于宿主进程内存和请求头中。它们绝不会�
 - 每轮通过其存储的提示词和已解析配置档自包含。
 - 无需绑定注册表、配置档目录或绑定哈希。
 - API 密钥的值绝不出现在日志中。
-- 当前存储的工作根通过现有校验恢复；
-- 访问模式只属于当前调用，从不写入日志；
+- 当前存储的工作根通过身份解析重新校验；
+- 文件系统模式与写入范围只属于当前调用，从不写入日志；
 - 第二个写入者无法交错写入事件。
 
 ### 15.4 恢复
@@ -850,7 +850,7 @@ API 密钥的值只存在于宿主进程内存和请求头中。它们绝不会�
 ```text
 一次性配置供应商与配置档
 在定义会话工作根的目录启动 agent
-默认使用 workspace，也可为本次调用选择只读或 full 访问
+默认使用 planned-write，也可为本次调用选择只读、full access 或操作者写入范围
 按会话 ID 恢复，不改变工作根或恢复旧权限
 直接 JavaScript 只使用 terrarium run
 ```

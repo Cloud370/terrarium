@@ -33,67 +33,6 @@ pub const PROTOCOL_CHAT_COMPLETIONS: &str = "openai-chat-completions";
 pub const PROTOCOL_RESPONSES: &str = "openai-responses";
 pub const PROTOCOL_ANTHROPIC: &str = "anthropic-messages";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Modality {
-    Text,
-    Image,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ModelCapabilities {
-    pub id: &'static str,
-    pub input_modalities: &'static [Modality],
-    pub output_modalities: &'static [Modality],
-}
-
-const TEXT_INPUT: &[Modality] = &[Modality::Text];
-const TEXT_OUTPUT: &[Modality] = &[Modality::Text];
-const TEXT_IMAGE_INPUT: &[Modality] = &[Modality::Text, Modality::Image];
-const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
-    ModelCapabilities {
-        id: "deepseek-v4-flash",
-        input_modalities: TEXT_INPUT,
-        output_modalities: TEXT_OUTPUT,
-    },
-    ModelCapabilities {
-        id: "deepseek-v4-flash-vision-exp",
-        input_modalities: TEXT_IMAGE_INPUT,
-        output_modalities: TEXT_OUTPUT,
-    },
-];
-
-pub fn model_capabilities() -> &'static [ModelCapabilities] {
-    MODEL_CAPABILITIES
-}
-
-pub(crate) fn capability_text(model: &str) -> String {
-    let Some(capability) = model_capabilities().iter().find(|item| item.id == model) else {
-        return format!(
-            "model_id: {model} (capabilities are not declared locally; requests remain text-only)"
-        );
-    };
-    let inputs = capability
-        .input_modalities
-        .iter()
-        .map(|m| match m {
-            Modality::Text => "text",
-            Modality::Image => "image",
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let outputs = capability
-        .output_modalities
-        .iter()
-        .map(|m| match m {
-            Modality::Text => "text",
-            Modality::Image => "image",
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("model_id: {model} (declared input: {inputs}; declared output: {outputs}; current requests are text-only)")
-}
-
 // ---------------------------------------------------------------------------
 // Neutral message model
 // ---------------------------------------------------------------------------
@@ -495,26 +434,10 @@ pub(crate) fn test_profile(protocol: &str, base_url: &str, model: &str) -> Resol
 
 #[cfg(test)]
 mod tests {
-    use super::{capability_text, model_capabilities, Modality};
     #[test]
-    fn known_models_declare_input_capabilities() {
-        let text = model_capabilities()
-            .iter()
-            .find(|model| model.id == "deepseek-v4-flash")
-            .unwrap();
-        assert_eq!(text.input_modalities, &[Modality::Text]);
-        let vision = model_capabilities()
-            .iter()
-            .find(|model| model.id == "deepseek-v4-flash-vision-exp")
-            .unwrap();
-        assert_eq!(vision.input_modalities, &[Modality::Text, Modality::Image]);
-        assert_eq!(vision.output_modalities, &[Modality::Text]);
-    }
-    #[test]
-    fn capability_text_warns_that_image_payloads_are_not_implemented() {
-        let text = capability_text("deepseek-v4-flash-vision-exp");
-        assert!(text.contains("model_id: deepseek-v4-flash-vision-exp"));
-        assert!(text.contains("declared input: text, image"));
-        assert!(text.contains("requests are text-only"));
+    fn protocol_constants_cover_the_three_wire_shapes() {
+        assert_eq!(super::PROTOCOL_CHAT_COMPLETIONS, "openai-chat-completions");
+        assert_eq!(super::PROTOCOL_RESPONSES, "openai-responses");
+        assert_eq!(super::PROTOCOL_ANTHROPIC, "anthropic-messages");
     }
 }
