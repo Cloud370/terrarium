@@ -570,10 +570,30 @@ pub struct ProcTable {
 
 impl ProcTable {
     pub fn new(log_root: PathBuf) -> Self {
+        // a resumed session shares this log root with its predecessors while its table
+        // is fresh: seed the numbering past any existing handle so a new spawn never
+        // reuses a previous invocation's journal identity or appends to its log
+        let next = std::fs::read_dir(&log_root)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    // only regular files count: a directory named like a log (the
+                    // fixture for an unopenable log path) never occupied a handle
+                    .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+                    .filter_map(|entry| {
+                        let name = entry.file_name();
+                        let stem = name.to_string_lossy();
+                        let stem = stem.strip_suffix(".log")?;
+                        stem.strip_prefix('p')?.parse::<u64>().ok()
+                    })
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
         Self {
             root: log_root,
             inner: Arc::new(Mutex::new(TableInner {
-                next: 0,
+                next,
                 entries: Vec::new(),
                 exits: Arc::new(Mutex::new(Vec::new())),
             })),
@@ -1793,6 +1813,57 @@ mod tests {
                 assert_eq!(value["count"], serde_json::json!(MAX_LIVE));
                 assert!(value["err"].as_str().unwrap().contains("process_limit"));
                 env.table.shutdown().await;
+                let _ = std::fs::remove_dir_all(&root);
+            })
+    }
+
+    #[test]
+    fn a_resumed_session_never_reuses_a_handle_or_log() {
+        // forking tests serialize against session-journal tests: a child between fork
+        // and exec briefly holds every open description, including locked journals
+        let _journal_guard = crate::session::tests::STATE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                let root = tmp_root("resume-handles");
+                let (exe, argv) = echo_command();
+                let program = format!(
+                    "const p = await host.proc.spawn('{}', {});\n\
+                     await host.proc.wait(p.id);\n\
+                     return p.id",
+                    exe,
+                    serde_json::to_string(&argv).unwrap()
+                );
+                let env = proc_env(
+                    &root,
+                    allowed_for(&exe, &argv, &root.canonicalize().unwrap()),
+                );
+                let first = eval(&env, &program).await;
+                assert!(first.ok, "error: {:?}", first.error);
+                assert_eq!(first.value, Some(serde_json::json!("p1")));
+                env.table.shutdown().await;
+                let first_log = std::fs::read_to_string(root.join("procs/p1.log")).unwrap();
+                // a resumed invocation: a fresh in-memory table over the same session
+                // log root — its first handle and log file must not collide with p1
+                let resumed = proc_env(
+                    &root,
+                    allowed_for(&exe, &argv, &root.canonicalize().unwrap()),
+                );
+                let second = eval(&resumed, &program).await;
+                assert!(second.ok, "error: {:?}", second.error);
+                assert_eq!(second.value, Some(serde_json::json!("p2")));
+                assert_eq!(
+                    std::fs::read_to_string(root.join("procs/p1.log")).unwrap(),
+                    first_log
+                );
+                assert!(std::fs::read_to_string(root.join("procs/p2.log"))
+                    .unwrap()
+                    .contains("hi"));
+                resumed.table.shutdown().await;
                 let _ = std::fs::remove_dir_all(&root);
             })
     }

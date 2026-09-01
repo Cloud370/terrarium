@@ -69,7 +69,7 @@ host.proc.kill(id, {force: true})
 
 - `status` 只查当前会话的内存表。未知或来自 resume 前的句柄报 `process_lost`——表不持久,历史 journal 文本不是授权。
 - `wait` 阻塞到退出为止,受当前 run 的 deadline 约束。deadline 到时,死的是 run,不是进程。
-- `kill` 终止整个进程组(Unix)或 Job(Windows):默认优雅,`{force: true}` 强杀。杀死已退出的进程是幂等的,返回其最终记录。
+- `kill` 终止整个进程组(Unix)或 Job(Windows):默认优雅,`{force: true}` 强杀;Windows 上两种形式都是终止 Job 对象,该平台没有单独的优雅形式。杀死已退出的进程是幂等的,返回其最终记录。
 - 死条目留在表里供 `status`/`kill` 尸检。表最多容纳 8 个活进程、共 16 个条目(死条目 LRU);满了 `spawn` 以可见错误拒绝。host 永远不悄悄杀旧进程腾位子。
 
 ### 4.4 刻意缺席
@@ -117,7 +117,7 @@ for await (const chunk of res.body) { /* 字符串,lossy UTF-8 */ }
 - 任意方法(`GET`、`HEAD`、`POST`、`PUT`、`PATCH`、`DELETE`),任意 http/https URL,以操作系统用户身份执行——与文件系统读取"继承 OS 可读视图"是同一条信任决策。
 - header 值是字面字符串或 `{env: NAME}` 名字引用,host 侧解析;凭证值永远不进 cage。带 userinfo 或 fragment 的 URL 作为语法拒绝,不作为授权问题。
 - 重定向直接跟随(最多 5 次),最终 URL 入账。无 Cookie,无缓存。
-- 物理上限归 host 所有:每请求 60 秒(覆盖响应头与响应体消费);响应体上限 8 MiB,超出以可见错误拒绝;最多 4 个并发请求;header 名与值做 CRLF 拒绝;请求 URL 上限 8 KiB。`--offline` 为整个调用关闭该能力。
+- 物理上限归 host 所有:每请求 60 秒(覆盖响应头与响应体消费);响应体上限 8 MiB,超出以可见错误拒绝;请求体上限 1 MiB;最多 4 个并发请求;header 名与值做 CRLF 拒绝;请求 URL 上限 8 KiB。`--offline` 为整个调用关闭该能力。
 - 每个请求入账为 `net/request`:方法、最终 URL、状态码、字节数。
 
 为什么免同意:fetch 响应只进 cage 内存;触及本地磁盘必须走已授权的写入路径,本地变更回路由构造闭合。外泄回路*没有*闭合:OS 用户可读的任何东西都能在一个零同意请求里发往任何地方,journal 事后检测而非事前阻止。选择模型提供商早已为读数据做了同样的取舍;本提案把后果说透,而不是暗示安全。需要预防的操作者用 `--offline` 或出口防火墙——宿主关注点,不是 cage 能力。
@@ -134,7 +134,7 @@ for await (const chunk of res.body) { /* 字符串,lossy UTF-8 */ }
 
 空形态保持无条件习惯:`{"writes":[],"commands":[],"reason":""}`。
 
-- `commands` 是最多 8 条记录的数组;每条记录是 `{exe, argv, cwd?}`。`cwd` 缺省为会话工作根。整个块保持在 8 KiB 编码上限与 200 字符 reason 上限内;显示时超长参数截断加标记,journal 保留精确记录。
+- `commands` 是最多 8 条记录的数组;每条记录是 `{exe, argv, cwd?}`。`cwd` 缺省为会话工作根。整个块保持在 8 KiB 编码上限与 200 字符 reason 上限内;审批展示完整印出每个参数——8 KiB 上限已经约束了总量——journal 保留精确记录。
 - `exe` 由 host 在批准时与调用时各解析一次(PATH 查找、符号链接归一);匹配是解析后身份相等加 argv 逐元素相等加 cwd 相等。journal 记录解析后路径;声明在解析后去重。
 - `exec` 与 `spawn` 对照同一组记录检查。不匹配任何声明的调用以 `command_not_authorized` 失败,错误印出完整期望记录,下一轮自行纠正。
 - 请求是 run 局部的,作为一整个集合决策,永远不可部分批准,每个 run 重新声明。

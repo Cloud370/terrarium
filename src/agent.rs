@@ -128,7 +128,11 @@ impl Invocation<'_> {
     fn base_proc_authority(&self) -> ProcAuthority {
         match self.mode {
             FilesystemMode::FullAccess => ProcAuthority::Unrestricted,
-            _ => ProcAuthority::Denied,
+            // the empty-declaration path keeps operator exec grants, exactly as the
+            // write side keeps operator scopes: a grant must not depend on the model
+            // having declared something first
+            FilesystemMode::PlannedWrite => freeze_proc_authority(&self.operator_execs, &[]),
+            FilesystemMode::ReadOnly => ProcAuthority::Denied,
         }
     }
 }
@@ -2104,6 +2108,25 @@ mod tests {
             "{}",
             resolved.commands[0].display
         );
+        // the approval display shows every argument whole: the prompt is the boundary,
+        // so nothing of an argv element may be hidden behind a truncation marker
+        let long_arg = format!("{}VISIBLE-TAIL", "x".repeat(600));
+        let block = parse_access_block(
+            &serde_json::json!({
+                "writes": [],
+                "commands": [{"exe": exe_name, "argv": ["-c", long_arg]}],
+                "reason": "r",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let resolved =
+            resolve_access_request(&block, FilesystemMode::PlannedWrite, &working_root).unwrap();
+        assert!(
+            resolved.commands[0].display.contains("VISIBLE-TAIL"),
+            "{}",
+            resolved.commands[0].display
+        );
         // planned-write requires a reason when only commands are requested
         let reasonless = serde_json::json!({
             "writes": [],
@@ -2340,6 +2363,43 @@ mod tests {
             .contains("no interactive authorizer"));
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn exec_grants_survive_an_empty_declaration() {
+        let root = std::env::temp_dir().join("terrarium-auth-empty-grant");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let exe_name = if cfg!(windows) { "cmd" } else { "sh" };
+        let resolved_exe = crate::proc::resolve_executable(exe_name).unwrap();
+        let inv = invocation_exec_grant(
+            FilesystemMode::PlannedWrite,
+            Decision::Deny,
+            &root,
+            vec![resolved_exe],
+        );
+        // the empty unconditional block keeps operator grants, exactly as the write
+        // side keeps operator scopes: a granted executable runs without a declaration
+        let decision = authorize_run_access(&inv, &run_action(&[], ""), 1, 1);
+        let proc = decision.proc_authority.expect("base proc authority");
+        assert!(proc
+            .authorize(
+                exe_name,
+                &["-c".into(), "echo granted".into()],
+                None,
+                &root.canonicalize().unwrap()
+            )
+            .is_ok());
+        // a non-granted executable is still denied
+        assert!(proc
+            .authorize(
+                "definitely-not-a-real-tool-xyz",
+                &[],
+                None,
+                &root.canonicalize().unwrap()
+            )
+            .is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

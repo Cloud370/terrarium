@@ -69,7 +69,7 @@ host.proc.kill(id, {force: true})
 
 - `status` looks up the session's in-memory table only. An unknown or pre-resume handle is the error `process_lost` — the table is not durable and historical journal text is not authority.
 - `wait` blocks until exit, within the current run's deadline. When the deadline fires, the run dies and the process does not.
-- `kill` terminates the whole process group (Unix) or job (Windows): graceful by default, forced with `{force: true}`. Killing an already-exited process is idempotent and returns its final record.
+- `kill` terminates the whole process group (Unix) or job (Windows): graceful by default, forced with `{force: true}`; on Windows both forms terminate the job object, because the platform offers no separate graceful form. Killing an already-exited process is idempotent and returns its final record.
 - Dead entries stay in the table for post-mortem `status`/`kill` queries. The table holds at most 8 live processes and 16 entries total (LRU over dead ones); when full, `spawn` fails with a visible error. The host never silently kills an old process to make room.
 
 ### 4.4 Deliberately absent
@@ -117,7 +117,7 @@ for await (const chunk of res.body) { /* strings, lossy UTF-8 */ }
 - Any method (`GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`), any http/https URL, executed as the operating-system user — the same trust decision as filesystem reads inheriting the OS-readable view.
 - Header values are literal strings or `{env: NAME}` name references resolved host-side; credential values never enter the cage. URLs with userinfo or fragments are rejected as syntax, not as authorization.
 - Redirects are followed (at most 5) and the final URL is journaled. No cookies, no cache.
-- Physical limits are host-owned: 60 s per request covering the response head and its body consumption, an 8 MiB response-body cap that rejects with a visible error when exceeded, at most 4 concurrent requests, CRLF rejection in header names and values, and an 8 KiB request-URL cap. `--offline` disables the capability for the whole invocation.
+- Physical limits are host-owned: 60 s per request covering the response head and its body consumption, an 8 MiB response-body cap that rejects with a visible error when exceeded, a 1 MiB request-body cap, at most 4 concurrent requests, CRLF rejection in header names and values, and an 8 KiB request-URL cap. `--offline` disables the capability for the whole invocation.
 - Every request is journaled as `net/request` with method, final URL, status, and byte count. A request that fails, times out, or is cancelled after dispatch is journaled with status 0 — bytes may have left the machine. Receipt batches are capped per journaling pass, and a `receipts/truncated` marker counts any dropped receipts so the audit trail never truncates silently.
 
 Why no consent: a fetch response enters cage memory only; reaching local disk requires the already-authorized write path, so the local-mutation loop is closed by construction. The egress loop is *not* closed: anything the OS user can read can be sent anywhere in one zero-consent request, and the journal detects this after the fact rather than preventing it. Selecting a model provider already makes the same trade for read data; this proposal states the consequence instead of implying safety. Operators who need prevention run `--offline` or an egress firewall — a host concern, not a cage capability.
@@ -134,7 +134,7 @@ Why no consent: a fetch response enters cage memory only; reaching local disk re
 
 The empty form stays unconditional: `{"writes":[],"commands":[],"reason":""}`.
 
-- `commands` is an array of at most 8 records; each record is `{exe, argv, cwd?}`. `cwd` defaults to the session working root. The whole block stays within an 8 KiB encoded bound and the 200-character reason limit; per-argument display truncates long elements with a marker while the journal keeps the exact record.
+- `commands` is an array of at most 8 records; each record is `{exe, argv, cwd?}`. `cwd` defaults to the session working root. The whole block stays within an 8 KiB encoded bound and the 200-character reason limit; the approval display shows every argument whole — the 8 KiB bound already limits the total — and the journal keeps the exact record.
 - `exe` is resolved by the host (PATH lookup, symlink normalization) at approval time and again at call time; matching is resolved-identity equality plus element-wise argv equality plus cwd equality. The journal records the resolved path; declarations are deduplicated after resolution.
 - Both `exec` and `spawn` check against the same records. A call that matches no declared record fails with `command_not_authorized`, and the error prints the full expected record so the next run can correct itself.
 - The request is run-local, decided as one set, never partially approved, and re-declared every run.

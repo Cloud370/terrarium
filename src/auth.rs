@@ -26,12 +26,6 @@ pub(crate) const MAX_WRITE_TARGETS: usize = 32;
 pub(crate) const MAX_COMMANDS: usize = proc::MAX_COMMANDS;
 pub(crate) const ACCESS_ENCODED_CAP: usize = 8 * 1024;
 pub(crate) const ACCESS_REASON_CHARS: usize = 200;
-/// Per-argument display truncation; the journal keeps the exact record. High enough that
-/// an ordinary `sh -c` one-liner shows whole — the approval prompt is the security
-/// boundary, so truncating it aggressively hides exactly what needs reading. The 8 KiB
-/// access-block cap bounds the total regardless.
-const ARG_DISPLAY_CHARS: usize = 512;
-
 /// One command exactly as the model declared it, after strict JSON-shape checks.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub(crate) struct DeclaredCommand {
@@ -317,28 +311,19 @@ pub(crate) fn resolve_access_request(
     })
 }
 
-/// "What you read is what runs": the resolved executable, every argument in order, and
-/// the working directory. Long arguments truncate with a marker for display only.
+/// "What you read is what runs": the resolved executable, every argument in order and
+/// whole, and the working directory. Nothing is truncated — the approval prompt is the
+/// security boundary, and the 8 KiB access-block cap already bounds the display.
 fn display_command(exe: &Path, argv: &[String], cwd: &Path) -> String {
-    let shorten = |arg: &str| {
-        if arg.chars().count() > ARG_DISPLAY_CHARS {
-            format!(
-                "{}…",
-                arg.chars().take(ARG_DISPLAY_CHARS).collect::<String>()
-            )
+    let quoted = |arg: &str| {
+        if arg.is_empty() || arg.chars().any(|c| c.is_whitespace()) {
+            format!("{arg:?}")
         } else {
             arg.to_string()
         }
     };
-    let quoted = |arg: String| {
-        if arg.is_empty() || arg.chars().any(|c| c.is_whitespace()) {
-            format!("{arg:?}")
-        } else {
-            arg
-        }
-    };
     let mut parts = vec![exe.to_string_lossy().replace('\\', "/")];
-    parts.extend(argv.iter().map(|arg| quoted(shorten(arg))));
+    parts.extend(argv.iter().map(|arg| quoted(arg)));
     format!(
         "{} (in {})",
         parts.join(" "),
