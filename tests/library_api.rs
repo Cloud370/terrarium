@@ -61,8 +61,14 @@ fn operator_scopes_bound_a_planned_write_kernel() {
         "api payload"
     );
 
+    // a valid absolute path outside every scope: '/definitely/...' is not absolute on
+    // Windows and would fail path validation before the authorization check
+    let uncovered = std::env::temp_dir().join(format!(
+        "terrarium-api-uncovered-{}.txt",
+        std::process::id()
+    ));
     let outside = runtime().block_on(kernel.run(
-        "return host.fs.write('/definitely/not/covered.txt', 'x')",
+        &format!("return host.fs.write('{}', 'x')", display(&uncovered)),
         2_000,
     ));
     assert!(!outside.ok);
