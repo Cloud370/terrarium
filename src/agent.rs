@@ -1351,9 +1351,21 @@ async fn drive(journal: Journal, inv: &Invocation<'_>) -> i32 {
                             .unwrap_or_default();
                         // the session ends normally here: kill every live process and
                         // journal the exit receipts while the turn is still open
-                        let exits = inv.table.shutdown().await;
+                        let (exits, stranded) = inv.table.shutdown().await;
                         if let Err(e) = journal_exit_receipts(&mut journal, &exits) {
                             eprintln!("terrarium: {e}");
+                            return 1;
+                        }
+                        // exits the grace window could not observe are never lost
+                        // silently: the marker counts them like capped receipts
+                        if stranded > 0
+                            && journal
+                                .append(
+                                    "receipts/truncated",
+                                    serde_json::json!({"dropped": stranded}),
+                                )
+                                .is_err()
+                        {
                             return 1;
                         }
                         if journal
