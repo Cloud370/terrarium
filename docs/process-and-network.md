@@ -91,6 +91,10 @@ The host session owns the process table, in memory. Children are created in thei
 
 Crash cleanup is stated honestly rather than guaranteed: after a Unix crash outside Linux, a spawned process can survive its session. The journal records each process's pid, so the user can reap stragglers manually. What is guaranteed is the complement: resume never resurrects a process, and no historical text ever acts as authority.
 
+Session shutdown kills every live process and waits a bounded grace window (two seconds) for each exit to be observed; an exit the window cannot observe is counted by a `receipts/truncated` marker, so the audit trail never loses an exit silently.
+
+Descendants cannot outlive their anchor by detaching from its output pipes: when a spawned process exits and its pipes close, the host sweeps the remaining process group (Unix); the Windows job object does the same on handle close. There is no third lifetime.
+
 ## 6. Output model
 
 | Data | Channel | Bound | Lifetime |

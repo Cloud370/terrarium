@@ -12,7 +12,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rquickjs::function::{Async, Opt};
 use rquickjs::{Ctx, Function, Object, Value};
@@ -33,6 +33,8 @@ pub(crate) const MAX_ENTRIES: usize = 16;
 pub(crate) const EXIT_TAIL_CAP: usize = 1024;
 /// Pending exit receipts are forensics, bounded like every other queue.
 const EXIT_QUEUE_CAP: usize = 256;
+/// How long session shutdown waits after a forced kill for exits to be observed.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // Authority
@@ -298,6 +300,21 @@ impl ChildKill {
         }
     }
 
+    /// Best-effort sweep of a tree whose anchor exited while descendants may remain.
+    /// Unix signals the process group directly; on Windows dropping the job handle
+    /// fires KILL_ON_JOB_CLOSE, which already terminates any survivors.
+    fn sweep_after_exit(self) {
+        #[cfg(unix)]
+        {
+            let Self::Group(pid) = self;
+            unsafe {
+                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        #[cfg(windows)]
+        drop(self);
+    }
+
     /// Terminate the tree: graceful (SIGTERM) by default, forced (SIGKILL /
     /// TerminateJobObject) with `force`. Idempotent.
     fn kill(&self, force: bool) {
@@ -354,8 +371,12 @@ fn child_kill(child: &mut tokio::process::Child) -> Result<ChildKill, String> {
 struct KillGuard(Option<ChildKill>);
 
 impl KillGuard {
-    fn disarm(&mut self) {
-        self.0 = None;
+    /// Release a child that exited normally: descendants detached from its pipes may
+    /// still hold the process group, and no third lifetime may outlive the anchor.
+    fn disarm(mut self) {
+        if let Some(kill) = self.0.take() {
+            kill.sweep_after_exit();
+        }
     }
 }
 
@@ -748,11 +769,34 @@ impl ProcTable {
         std::mem::take(&mut queue)
     }
 
-    /// Give every pump a moment to observe forced exits, then drain the exit receipts.
-    pub async fn shutdown(&self) -> Vec<serde_json::Value> {
+    /// Terminate every live process, wait a bounded grace window for their exits to be
+    /// observed, then drain the exit receipts. Entries still running when the window
+    /// closes are returned as a count: their `proc/exit` receipts will never arrive,
+    /// and the journal must say so instead of losing them silently.
+    pub async fn shutdown(&self) -> (Vec<serde_json::Value>, usize) {
+        self.shutdown_with_grace(SHUTDOWN_GRACE).await
+    }
+
+    async fn shutdown_with_grace(&self, grace: Duration) -> (Vec<serde_json::Value>, usize) {
         self.kill_all(true);
-        let _ = tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        self.take_exit_receipts()
+        let deadline = Instant::now() + grace;
+        loop {
+            let live = self.live_count();
+            if live == 0 || Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        (self.take_exit_receipts(), self.live_count())
+    }
+
+    fn live_count(&self) -> usize {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .entries
+            .iter()
+            .filter(|entry| entry.is_running())
+            .count()
     }
 }
 
@@ -774,25 +818,34 @@ async fn pump_process(
     let status = child.wait().await;
     let code = status.ok().and_then(|status| status.code());
     let bytes = writer.lock().unwrap().bytes;
+    // the exit receipt lands before liveness flips, so any observer that sees the
+    // process dead — wait(), the shutdown grace window — can rely on the receipt
+    // already being queued
+    {
+        let mut queue = exits.lock().unwrap();
+        if queue.len() < EXIT_QUEUE_CAP {
+            queue.push(json!({
+                "handle": entry.id,
+                "code": code,
+                "tail": read_tail(&entry.log_path, EXIT_TAIL_CAP),
+            }));
+        }
+    }
     {
         let mut state = entry.state.lock().unwrap();
         state.running = false;
         state.code = code;
     }
-    // the job object / group kill handle has no further use once the process is gone
-    *entry.kill.lock().unwrap() = None;
+    // the anchor has exited and its pipes are closed: descendants detached from those
+    // pipes may still hold the process group — sweep it so the tree ends with its
+    // table entry, exactly as the Windows job object does on handle close
+    if let Some(kill) = entry.kill.lock().unwrap().take() {
+        kill.sweep_after_exit();
+    }
     entry.watch.send_replace(ProcSnap {
         bytes,
         running: false,
     });
-    let mut queue = exits.lock().unwrap();
-    if queue.len() < EXIT_QUEUE_CAP {
-        queue.push(json!({
-            "handle": entry.id,
-            "code": code,
-            "tail": read_tail(&entry.log_path, EXIT_TAIL_CAP),
-        }));
-    }
 }
 
 async fn pump_pipe<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
@@ -981,7 +1034,7 @@ async fn run_exec(
         let _ = child.start_kill();
         format!("cannot arm the kill handle for {exe:?}: {error}")
     })?;
-    let mut guard = KillGuard(Some(kill));
+    let guard = KillGuard(Some(kill));
     {
         let mut queue = receipts.borrow_mut();
         queue.push(json!({
@@ -1813,6 +1866,182 @@ mod tests {
                 assert_eq!(value["count"], serde_json::json!(MAX_LIVE));
                 assert!(value["err"].as_str().unwrap().contains("process_limit"));
                 env.table.shutdown().await;
+                let _ = std::fs::remove_dir_all(&root);
+            })
+    }
+
+    #[test]
+    fn an_exit_receipt_is_queued_before_liveness_flips() {
+        // forking tests serialize against session-journal tests: a child between fork
+        // and exec briefly holds every open description, including locked journals
+        let _journal_guard = crate::session::tests::STATE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                let root = tmp_root("exit-order");
+                let (exe, argv) = echo_command();
+                let env = proc_env(
+                    &root,
+                    allowed_for(&exe, &argv, &root.canonicalize().unwrap()),
+                );
+                // wait() returns only once the watch channel says the process is dead;
+                // by then the exit receipt must already be queued — no sleep allowed
+                let source = format!(
+                    "const p = await host.proc.spawn('{}', {});\n\
+                     await host.proc.wait(p.id);\n\
+                     return p.id",
+                    exe,
+                    serde_json::to_string(&argv).unwrap()
+                );
+                let out = eval(&env, &source).await;
+                assert!(out.ok, "error: {:?}", out.error);
+                let pending = env.table.take_exit_receipts();
+                assert!(
+                    pending
+                        .iter()
+                        .any(|receipt| receipt["handle"] == serde_json::json!("p1")),
+                    "exit receipt not queued when liveness flipped: {pending:?}"
+                );
+                let _ = env.table.shutdown().await;
+                let _ = std::fs::remove_dir_all(&root);
+            })
+    }
+
+    #[test]
+    fn shutdown_counts_exits_a_zero_grace_window_could_not_observe() {
+        // forking tests serialize against session-journal tests: a child between fork
+        // and exec briefly holds every open description, including locked journals
+        let _journal_guard = crate::session::tests::STATE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                let root = tmp_root("shutdown-grace");
+                let (exe, argv): (String, Vec<String>) = if cfg!(windows) {
+                    (
+                        "C:/Windows/System32/cmd.exe".into(),
+                        vec!["/c".into(), "ping -n 30 127.0.0.1 >nul".into()],
+                    )
+                } else {
+                    ("sh".into(), vec!["-c".into(), "sleep 30".into()])
+                };
+                let env = proc_env(
+                    &root,
+                    allowed_for(&exe, &argv, &root.canonicalize().unwrap()),
+                );
+                let source = format!(
+                    "const p = await host.proc.spawn('{}', {});\nreturn p.id",
+                    exe,
+                    serde_json::to_string(&argv).unwrap()
+                );
+                let out = eval(&env, &source).await;
+                assert!(out.ok, "error: {:?}", out.error);
+                // a zero grace window closes before the pump can observe the forced
+                // kill: the entry counts as stranded instead of vanishing silently
+                let (_, stranded) = env.table.shutdown_with_grace(Duration::ZERO).await;
+                assert!(stranded >= 1, "expected at least one stranded exit");
+                // a second, full-grace pass observes the kill: nothing stranded, and
+                // the exit receipt that the first pass could not see is journaled
+                let (receipts, settled) = env.table.shutdown().await;
+                assert_eq!(settled, 0);
+                assert!(
+                    receipts
+                        .iter()
+                        .any(|receipt| receipt["handle"] == serde_json::json!("p1")),
+                    "exit receipt missing after the grace window: {receipts:?}"
+                );
+                let _ = std::fs::remove_dir_all(&root);
+            })
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn detached_descendants_die_with_their_anchor() {
+        // forking tests serialize against session-journal tests: a child between fork
+        // and exec briefly holds every open description, including locked journals
+        let _journal_guard = crate::session::tests::STATE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                let root = tmp_root("group-sweep");
+                let (exe, argv): (String, Vec<String>) = (
+                    "sh".into(),
+                    vec![
+                        "-c".into(),
+                        "sleep 30 >/dev/null 2>&1 & echo started".into(),
+                    ],
+                );
+                let env = proc_env(
+                    &root,
+                    allowed_for(&exe, &argv, &root.canonicalize().unwrap()),
+                );
+                // the sleep detaches from both pipes: the pump completes when the
+                // shell exits, and the sweep must reach the detached descendant
+                let source = format!(
+                    "const p = await host.proc.spawn('{}', {});\nreturn p.id",
+                    exe,
+                    serde_json::to_string(&argv).unwrap()
+                );
+                let out = eval(&env, &source).await;
+                assert!(out.ok, "error: {:?}", out.error);
+                let entry = env.table.lookup("p1").expect("table entry");
+                let pgid = entry.pid as i32;
+                // wait for the anchor to be observed dead first: liveness flips only
+                // after the pump reaped the child and fired the sweep, so a scan that
+                // starts earlier can race the fork->setpgid window — the group not
+                // existing yet at the first scan and existing at the assert's second
+                // scan read as a spurious failure on loaded 2-core runners
+                let anchor_deadline = Instant::now() + Duration::from_secs(5);
+                while entry.is_running() && Instant::now() < anchor_deadline {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert!(
+                    !entry.is_running(),
+                    "the anchor did not exit within the deadline"
+                );
+                let group_member_alive = || {
+                    std::fs::read_dir("/proc").is_ok_and(|entries| {
+                        entries
+                            .filter_map(|entry| entry.ok())
+                            .filter_map(|entry| {
+                                entry.file_name().to_string_lossy().parse::<i32>().ok()
+                            })
+                            .any(|pid| {
+                                let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                                else {
+                                    return false;
+                                };
+                                let Some(rest) = stat.rsplit(')').next() else {
+                                    return false;
+                                };
+                                let mut fields = rest.split_whitespace();
+                                let state = fields.next().unwrap_or_default();
+                                let _ppid = fields.next();
+                                let pgrp = fields.next().unwrap_or_default();
+                                state != "Z" && pgrp.parse::<i32>() == Ok(pgid)
+                            })
+                    })
+                };
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while group_member_alive() && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert!(
+                    !group_member_alive(),
+                    "a descendant detached from the anchor's pipes outlived it"
+                );
+                let _ = env.table.shutdown().await;
                 let _ = std::fs::remove_dir_all(&root);
             })
     }
