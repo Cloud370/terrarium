@@ -10,6 +10,8 @@ mod config;
 mod fs;
 mod kernel;
 mod llm;
+mod net;
+mod proc;
 mod registry;
 mod session;
 
@@ -17,5 +19,6 @@ pub use auth::{Authorizer, Decision, ResolvedAccessRequest};
 pub use config::{Config, ProfileConfig, ProviderConfig, ResolvedProfile};
 pub use fs::{FilesystemMode, RunFilesystemAuthority, WriteScope};
 pub use kernel::{ErrorKind, Kernel, Outcome, RunError, Termination, WriteSummary};
+pub use proc::{CommandRecord, CommandSet, ProcAuthority, ProcTable};
 
-pub(crate) use kernel::{contract, eval_js, MAX_TIMEOUT_MS, MEM_LIMIT};
+pub(crate) use kernel::{contract, eval_js, RunEnv, MAX_TIMEOUT_MS, MEM_LIMIT};

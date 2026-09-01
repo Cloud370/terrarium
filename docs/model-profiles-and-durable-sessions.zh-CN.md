@@ -56,7 +56,7 @@ terrarium run -e 'return await host.fs.text("/work/project/Cargo.toml")'
 
 会话工作根目录是会话生命周期内稳定的资源身份。版本 1 不持久化附件注册表、写入范围、虚拟路径别名或目录级 ACL。根本属于另一个目录的任务应启动另一个会话。
 
-每次调用选择一个文件系统模式——`read-only`、`planned-write`（agent 默认）或 `full-access`——在 `planned-write` 下还可附加操作者 `--allow-write DIR|FILE` 范围。这些由可信宿主选择，在本次调用内固定不变，但不会写入日志。`planned-write` 中，每次运行的写入通过 `access` 块预授权，详见 `filesystem-authorization.zh-CN.md`。`--full-access` 允许模型使用当前操作系统用户可见的真实绝对路径，包括会话工作根之外的路径。JavaScript 不会展开 `~`；runtime state 会标明工作根。路径被拒绝时应将其视为授权结果，不得猜测其他路径或虚构范围。
+每次调用选择一个文件系统模式——`read-only`、`planned-write`（agent 默认）或 `full-access`——在 `planned-write` 下还可附加操作者 `--allow-write DIR|FILE` 范围与 `--allow-exec NAME` 可执行预授权，另有 `--offline` 可禁用 `host.net.fetch`。这些由可信宿主选择，在本次调用内固定不变，但不会写入日志。`planned-write` 中，每次运行的写入与命令通过 `access` 块预授权，详见 `filesystem-authorization.zh-CN.md` 与 `process-and-network.zh-CN.md`；被批准的命令本身就是写作用域的逃生口——子进程不受 Terrarium 作用域约束——因此进程创建属于写级别效应，由同一次一体预授权决定。`--full-access` 允许模型使用当前操作系统用户可见的真实绝对路径，包括会话工作根之外的路径。JavaScript 不会展开 `~`；runtime state 会标明工作根。路径被拒绝时应将其视为授权结果，不得猜测其他路径或虚构范围。
 
 生成的主机契约将 `host.fs.list(dir)` 暴露为按名称排序的对象数组，字段为 `name`、`type` 和 `size`。`type` 可以是 `file`、`directory`、`symlink` 或 `other`；普通文件的 `size` 是字节数，其他类型为 `null`。程序应直接检查这些字段，不要解析展示字符串。递归统计时一次列出一个目录；仅对 `type` 为 `directory` 的条目继续递归，并且只累加 `type` 为 `file` 的 `size`。应记录遍历错误；如果任何必要目录无法列出，就必须报告结果不完整，不得提交确定的完整总数。
 

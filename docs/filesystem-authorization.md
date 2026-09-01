@@ -312,12 +312,8 @@ The implementation direction is:
 
 For direct `terrarium run`, the minimal useful choices are read-only by default and explicit `--full-access` for trusted debugging; `--allow-write` scopes are equally available for operator-authored programs. It has no model access block to preauthorize paths.
 
-## 11. Explicit non-goals and future extension
+## 11. Process and network capabilities; non-goals
 
-This version does not implement or specify process execution, shell commands, child processes, independent network requests, persistent grants, per-directory policy, model-requestable wildcard or prefix write scopes, partial approval, content approval, transactions, rollback, or denial caching.
+Process execution and network fetch are specified and implemented in [process-and-network.md](process-and-network.md); that document is normative for `host.proc` and `host.net.fetch`. The boundary that belongs here: process creation is a write-class effect — a child process is not bound by Terrarium's write scopes — so `read-only` denies it, `planned-write` decides the requested writes and commands as one preauthorization, and `full-access` prompts for neither. The access block's `commands` field follows the same lifecycle as `writes`: declared by the model, resolved and frozen host-side before QuickJS starts, journaled as one decision, never partially approved, never restored from the journal. File paths, process spawns, and network requests remain non-interchangeable authorization objects: a command matches resolved executable identity, element-wise argv, and cwd; a network request needs no consent and is journaled per request.
 
-If a future version installs process or network capabilities, it may reuse the outer sequence of request, preauthorization, and deterministic host checking. It must add capability-specific runtime-state fields, request records, and matchers. File paths, process spawns, and network requests are not interchangeable authorization objects.
-
-A future process request would need to match at least the resolved executable, complete argv, cwd, and environment policy. A future network request would need to match at least scheme, host, port, method, path, redirect policy, and outbound data policy. Neither should inherit authority merely because filesystem mode is `full-access`.
-
-Such additions must preserve the existing stable prompt prefix or introduce a separately versioned successor. They should not add speculative fields to the current access block before the capabilities exist.
+Still explicit non-goals, for the filesystem contract and its successors: persistent grants, per-directory policy, model-requestable wildcard or prefix write scopes, partial approval, content approval, transactions, rollback, and denial caching.

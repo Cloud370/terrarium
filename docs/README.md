@@ -8,5 +8,6 @@ Maintained specifications live in this directory. They are the current project c
 - [`configuration.md`](configuration.md) - current TOML profiles, credential references, and legacy fallback
 - [`security.md`](security.md) - trust boundary and isolation claims
 - [`web-ui.md`](web-ui.md) - integration boundary for a future Web UI or service
+- [`process-and-network.md`](process-and-network.md) - implemented process execution (run-scoped `exec`, session-scoped `spawn` with host-owned logs) and journaled zero-consent `fetch`; normative for `host.proc` and `host.net.fetch` (Chinese: [`process-and-network.zh-CN.md`](process-and-network.zh-CN.md))
 - [`model-profiles-and-durable-sessions.md`](model-profiles-and-durable-sessions.md) - implemented model profiles, protocol binding, JSONL session, and recovery contract
 - Runtime prompts are not documentation. They live in `src/prompts/` because changing them changes agent behavior. The JavaScript runtime prelude lives in `src/runtime/`.

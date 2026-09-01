@@ -9,6 +9,25 @@ use serde_json::{Map, Value};
 use crate::config::{state_dir, ResolvedProfile};
 use crate::kernel::FACTS_CAP;
 
+/// Keep one journal handle out of every spawned process. `dup(2)` clears
+/// `FD_CLOEXEC`, and the flock follows the open file description: without this a
+/// `host.proc` child would hold the session lock alive past its own host.
+fn set_cloexec(file: &File) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            let fd = file.as_raw_fd();
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkingRoot {
@@ -89,6 +108,7 @@ impl Journal {
             .map_err(|e| format!("cannot create session {id}: {e}"))?;
         file.try_lock_exclusive()
             .map_err(|e| format!("cannot lock session {id}: {e}"))?;
+        set_cloexec(&file);
         let header = SessionHeader {
             kind: "session".into(),
             version: 1,
@@ -118,7 +138,10 @@ impl Journal {
             .map_err(|e| format!("cannot open session {id}: {e}"))?;
         file.try_lock_exclusive()
             .map_err(|e| format!("cannot lock session {id}: {e}"))?;
-        let mut reader = BufReader::new(file.try_clone().map_err(|e| e.to_string())?);
+        set_cloexec(&file);
+        let clone = file.try_clone().map_err(|e| e.to_string())?;
+        set_cloexec(&clone);
+        let mut reader = BufReader::new(clone);
         let mut lines = Vec::new();
         loop {
             let mut line = String::new();
@@ -449,6 +472,53 @@ fn previous_request(prior: &[Event], seq: u64) -> Option<&Event> {
         .find(|event| event.kind == "model/request" && event.seq == seq)
 }
 
+/// Command records as journaled in a model-result action: at most 8 objects with exactly
+/// `exe` (string), `argv` (array of strings), and optional `cwd` (string).
+fn validate_command_records(commands: &Value, seq: u64, label: &str) -> Result<(), String> {
+    let commands = commands.as_array().ok_or_else(|| {
+        format!("event {seq} {label} commands must be an array of {{exe, argv, cwd?}} records")
+    })?;
+    if commands.len() > crate::proc::MAX_COMMANDS {
+        return Err(format!(
+            "event {seq} {label} commands exceeds the {}-record limit",
+            crate::proc::MAX_COMMANDS
+        ));
+    }
+    for record in commands {
+        let record = record
+            .as_object()
+            .ok_or_else(|| format!("event {seq} {label} commands entries must be objects"))?;
+        if !record.contains_key("exe") || !record.contains_key("argv") {
+            return Err(format!(
+                "event {seq} {label} command needs at least the fields exe and argv"
+            ));
+        }
+        if record.len() > 3 || (record.len() == 3 && !record.contains_key("cwd")) {
+            return Err(format!(
+                "event {seq} {label} command records take exactly exe, argv, and cwd"
+            ));
+        }
+        if record.get("exe").and_then(Value::as_str).is_none() {
+            return Err(format!("event {seq} {label} command exe must be a string"));
+        }
+        let argv = record
+            .get("argv")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                format!("event {seq} {label} command argv must be an array of strings")
+            })?;
+        if argv.iter().any(|arg| arg.as_str().is_none()) {
+            return Err(format!(
+                "event {seq} {label} command argv must contain only strings"
+            ));
+        }
+        if record.get("cwd").is_some_and(|cwd| cwd.as_str().is_none()) {
+            return Err(format!("event {seq} {label} command cwd must be a string"));
+        }
+    }
+    Ok(())
+}
+
 fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
     let open = has_open(prior);
     if event.kind != "turn/start" && !open {
@@ -627,10 +697,12 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
                             event.seq,
                             "run action access",
                         )?;
+                        // journals written before commands existed carry the two-field form;
+                        // a missing commands field reads as empty
                         exact_keys(
                             access,
                             &["writes", "reason"],
-                            &[],
+                            &["commands"],
                             event.seq,
                             "run action access",
                         )?;
@@ -657,6 +729,9 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
                                     event.seq
                                 ));
                             }
+                        }
+                        if let Some(commands) = access.get("commands") {
+                            validate_command_records(commands, event.seq, "run action access")?;
                         }
                         let reason =
                             string_field(access, "reason", event.seq, "run action access")?;
@@ -791,10 +866,11 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
         }
         "run/access" => {
             let data = object(&event.data, event.seq, "run/access data")?;
+            // journals written before commands existed carry the no-commands form
             exact_keys(
                 data,
                 &["decision", "writes", "reason", "modelResultSeq"],
-                &["observation"],
+                &["observation", "commands"],
                 event.seq,
                 "run/access data",
             )?;
@@ -869,6 +945,27 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
                 if entry.as_str().is_none() {
                     return Err(format!(
                         "event {} run/access writes must contain only strings",
+                        event.seq
+                    ));
+                }
+            }
+            if let Some(commands) = data.get("commands") {
+                let commands = commands.as_array().ok_or_else(|| {
+                    format!(
+                        "event {} run/access commands must be an array of display strings",
+                        event.seq
+                    )
+                })?;
+                if commands.len() > crate::proc::MAX_COMMANDS {
+                    return Err(format!(
+                        "event {} run/access commands exceeds the {}-record limit",
+                        event.seq,
+                        crate::proc::MAX_COMMANDS
+                    ));
+                }
+                if commands.iter().any(|entry| entry.as_str().is_none()) {
+                    return Err(format!(
+                        "event {} run/access commands must contain only strings",
                         event.seq
                     ));
                 }
@@ -1106,6 +1203,181 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
                 }
             }
         }
+        "run/spawn" => {
+            let data = object(&event.data, event.seq, "run/spawn data")?;
+            // an exec receipt records the one-shot launch; a spawn receipt also carries the
+            // session handle and its log path
+            exact_keys(
+                data,
+                &["runSeq", "exe", "argv", "cwd", "pid"],
+                &["handle", "log"],
+                event.seq,
+                "run/spawn data",
+            )?;
+            let run_seq = positive_u64(data, "runSeq", event.seq, "run/spawn data")?;
+            let current_turn_seq = prior
+                .iter()
+                .rfind(|item| item.kind == "turn/start")
+                .map(|item| item.seq)
+                .unwrap_or(0);
+            if run_seq <= current_turn_seq {
+                return Err(format!(
+                    "event {} references a run from another turn",
+                    event.seq
+                ));
+            }
+            if !prior
+                .iter()
+                .any(|item| item.kind == "run/start" && item.seq == run_seq)
+            {
+                return Err(format!(
+                    "event {} references missing run {run_seq}",
+                    event.seq
+                ));
+            }
+            string_field(data, "exe", event.seq, "run/spawn data")?;
+            let argv = data.get("argv").and_then(Value::as_array).ok_or_else(|| {
+                format!(
+                    "event {} run/spawn argv must be an array of strings",
+                    event.seq
+                )
+            })?;
+            if argv.iter().any(|arg| arg.as_str().is_none()) {
+                return Err(format!(
+                    "event {} run/spawn argv must contain only strings",
+                    event.seq
+                ));
+            }
+            string_field(data, "cwd", event.seq, "run/spawn data")?;
+            positive_u64(data, "pid", event.seq, "run/spawn data")?;
+            for field in ["handle", "log"] {
+                if data
+                    .get(field)
+                    .is_some_and(|value| value.as_str().is_none())
+                {
+                    return Err(format!(
+                        "event {} run/spawn {field} must be a string",
+                        event.seq
+                    ));
+                }
+            }
+        }
+        "proc/exit" => {
+            let data = object(&event.data, event.seq, "proc/exit data")?;
+            exact_keys(
+                data,
+                &["code", "tail"],
+                &["handle"],
+                event.seq,
+                "proc/exit data",
+            )?;
+            if !data["code"].is_null() && data["code"].as_i64().is_none() {
+                return Err(format!(
+                    "event {} proc/exit code must be an integer or null",
+                    event.seq
+                ));
+            }
+            let tail = string_field(data, "tail", event.seq, "proc/exit data")?;
+            // ~1 KiB tail plus truncation markers
+            if tail.len() > 2 * crate::proc::EXIT_TAIL_CAP {
+                return Err(format!(
+                    "event {} proc/exit tail exceeds the {}-byte limit",
+                    event.seq,
+                    crate::proc::EXIT_TAIL_CAP
+                ));
+            }
+            if let Some(handle) = data.get("handle") {
+                let handle = handle.as_str().ok_or_else(|| {
+                    format!("event {} proc/exit handle must be a string", event.seq)
+                })?;
+                if !prior.iter().any(|item| {
+                    item.kind == "run/spawn" && item.data["handle"].as_str() == Some(handle)
+                }) {
+                    return Err(format!(
+                        "event {} proc/exit references missing spawn handle {handle:?}",
+                        event.seq
+                    ));
+                }
+            }
+        }
+        "net/request" => {
+            let data = object(&event.data, event.seq, "net/request data")?;
+            exact_keys(
+                data,
+                &["runSeq", "method", "url", "status", "bytes"],
+                &[],
+                event.seq,
+                "net/request data",
+            )?;
+            let run_seq = positive_u64(data, "runSeq", event.seq, "net/request data")?;
+            let current_turn_seq = prior
+                .iter()
+                .rfind(|item| item.kind == "turn/start")
+                .map(|item| item.seq)
+                .unwrap_or(0);
+            if run_seq <= current_turn_seq {
+                return Err(format!(
+                    "event {} references a run from another turn",
+                    event.seq
+                ));
+            }
+            if !prior
+                .iter()
+                .any(|item| item.kind == "run/start" && item.seq == run_seq)
+            {
+                return Err(format!(
+                    "event {} references missing run {run_seq}",
+                    event.seq
+                ));
+            }
+            string_field(data, "method", event.seq, "net/request data")?;
+            string_field(data, "url", event.seq, "net/request data")?;
+            if data["status"].as_u64().is_none() {
+                return Err(format!(
+                    "event {} net/request status must be an integer",
+                    event.seq
+                ));
+            }
+            if data["bytes"].as_u64().is_none() {
+                return Err(format!(
+                    "event {} net/request bytes must be a non-negative integer",
+                    event.seq
+                ));
+            }
+        }
+        "receipts/truncated" => {
+            let data = object(&event.data, event.seq, "receipts/truncated data")?;
+            exact_keys(
+                data,
+                &["dropped"],
+                &["runSeq"],
+                event.seq,
+                "receipts/truncated data",
+            )?;
+            positive_u64(data, "dropped", event.seq, "receipts/truncated data")?;
+            if let Some(run_seq) = data.get("runSeq").and_then(Value::as_u64) {
+                let current_turn_seq = prior
+                    .iter()
+                    .rfind(|item| item.kind == "turn/start")
+                    .map(|item| item.seq)
+                    .unwrap_or(0);
+                if run_seq <= current_turn_seq {
+                    return Err(format!(
+                        "event {} references a run from another turn",
+                        event.seq
+                    ));
+                }
+                if !prior
+                    .iter()
+                    .any(|item| item.kind == "run/start" && item.seq == run_seq)
+                {
+                    return Err(format!(
+                        "event {} references missing run {run_seq}",
+                        event.seq
+                    ));
+                }
+            }
+        }
         "turn/end" => {
             let data = object(&event.data, event.seq, "turn/end data")?;
             exact_keys(
@@ -1126,9 +1398,13 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
                 ));
             }
             if reason == "handed_off" {
-                let run_seq = data["handoffRunSeq"].as_u64().ok_or_else(|| {
-                    format!("event {} handed_off turn needs handoffRunSeq", event.seq)
-                })?;
+                // Map indexing panics on missing keys; the boundary must return errors
+                let run_seq = data
+                    .get("handoffRunSeq")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        format!("event {} handed_off turn needs handoffRunSeq", event.seq)
+                    })?;
                 let run = prior
                     .iter()
                     .find(|item| {
@@ -1147,9 +1423,12 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
                     return Err(format!("event {} handoff has no message", event.seq));
                 }
             } else if reason == "answered" {
-                let run_seq = data["answerRunSeq"].as_u64().ok_or_else(|| {
-                    format!("event {} answered turn needs answerRunSeq", event.seq)
-                })?;
+                let run_seq = data
+                    .get("answerRunSeq")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        format!("event {} answered turn needs answerRunSeq", event.seq)
+                    })?;
                 let run = prior
                     .iter()
                     .find(|item| {
@@ -1276,7 +1555,10 @@ pub fn project(events: &[Event], before_seq: u64) -> Vec<crate::llm::NeutralMess
 }
 
 #[cfg(test)]
-mod tests {
+// pub(crate): the fork-heavy proc tests share this lock — between fork and exec a
+// child briefly holds every open description in this process, including locked
+// session journals of concurrently running tests
+pub(crate) mod tests {
     use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::sync::Mutex;
@@ -1284,7 +1566,7 @@ mod tests {
 
     use super::*;
 
-    static STATE_LOCK: Mutex<()> = Mutex::new(());
+    pub(crate) static STATE_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_profile() -> ResolvedProfile {
         crate::llm::test_profile(
@@ -1419,6 +1701,173 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.contains("disposition"), "{error}");
+        drop(journal);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn process_and_network_receipts_validate_against_their_runs() {
+        let _guard = STATE_LOCK.lock().unwrap();
+        let (mut journal, state) = test_journal();
+        start(&mut journal);
+        journal
+            .append("model/request", serde_json::json!({"step":1,"attempt":1}))
+            .unwrap();
+        journal
+            .append(
+                "model/result",
+                serde_json::json!({"requestSeq":2,"ok":true,"content":"```run\nreturn 1\n```","action":{"kind":"run","source":"return 1\n","timeoutMs":1,"access":{"writes":[],"commands":[{"exe":"sh","argv":["-c","echo hi"]}],"reason":"run the suite"}}}),
+            )
+            .unwrap();
+        journal
+            .append("run/start", serde_json::json!({"modelResultSeq":3}))
+            .unwrap();
+        // an exec receipt records the one-shot launch; a spawn receipt carries handle + log
+        journal
+            .append(
+                "run/spawn",
+                serde_json::json!({"runSeq":4,"exe":"/bin/sh","argv":["-c","echo hi"],"cwd":"/tmp","pid":4242}),
+            )
+            .unwrap();
+        journal
+            .append(
+                "run/spawn",
+                serde_json::json!({"runSeq":4,"exe":"/bin/sh","argv":["-c","watch"],"cwd":"/tmp","pid":4243,"handle":"p1","log":"/state/terrarium/sessions/s/procs/p1.log"}),
+            )
+            .unwrap();
+        journal
+            .append("proc/exit", serde_json::json!({"code":0,"tail":"hi\n"}))
+            .unwrap();
+        journal
+            .append(
+                "proc/exit",
+                serde_json::json!({"code":null,"tail":"","handle":"p1"}),
+            )
+            .unwrap();
+        journal
+            .append(
+                "net/request",
+                serde_json::json!({"runSeq":4,"method":"GET","url":"https://example.test/x","status":200,"bytes":5}),
+            )
+            .unwrap();
+        // truncation is visible: a marker counts dropped receipts and, when the
+        // receipts were run-scoped, references the run they belonged to
+        journal
+            .append(
+                "receipts/truncated",
+                serde_json::json!({"runSeq":4,"dropped":131}),
+            )
+            .unwrap();
+        journal
+            .append("receipts/truncated", serde_json::json!({"dropped":3}))
+            .unwrap();
+        let error = journal
+            .append(
+                "receipts/truncated",
+                serde_json::json!({"runSeq":4,"dropped":0}),
+            )
+            .map(|_| ())
+            .unwrap_err();
+        assert!(error.contains("dropped"), "{error}");
+        let error = journal
+            .append(
+                "receipts/truncated",
+                serde_json::json!({"runSeq":99,"dropped":2}),
+            )
+            .map(|_| ())
+            .unwrap_err();
+        assert!(error.contains("missing run"), "{error}");
+        // dangling references are rejected: an unknown handle, an unknown run
+        let error = journal
+            .append(
+                "proc/exit",
+                serde_json::json!({"code":1,"tail":"","handle":"p404"}),
+            )
+            .unwrap_err();
+        assert!(error.contains("missing spawn handle"), "{error}");
+        let error = journal
+            .append(
+                "net/request",
+                serde_json::json!({"runSeq":99,"method":"GET","url":"https://x/","status":200,"bytes":1}),
+            )
+            .unwrap_err();
+        assert!(error.contains("missing run"), "{error}");
+        // run/spawn must reference a run of the current turn: after the turn ends, the
+        // old run sequence belongs to history
+        // an answered turn without its answer run is a clean validation error, not a panic
+        let error = journal
+            .append("turn/end", serde_json::json!({"reason":"answered"}))
+            .map(|_| ())
+            .unwrap_err();
+        assert!(error.contains("answerRunSeq"), "{error}");
+        journal
+            .append("turn/end", serde_json::json!({"reason":"cancelled"}))
+            .unwrap();
+        start(&mut journal);
+        let error = journal
+            .append(
+                "run/spawn",
+                serde_json::json!({"runSeq":4,"exe":"/bin/sh","argv":[],"cwd":"/tmp","pid":1}),
+            )
+            .map(|_| ())
+            .unwrap_err();
+        assert!(error.contains("another turn"), "{error}");
+        drop(journal);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn legacy_access_actions_still_validate_and_new_ones_are_checked() {
+        let _guard = STATE_LOCK.lock().unwrap();
+        let (mut journal, state) = test_journal();
+        start(&mut journal);
+        journal
+            .append("model/request", serde_json::json!({"step":1,"attempt":1}))
+            .unwrap();
+        // journals written before commands existed carry the two-field access form
+        journal
+            .append(
+                "model/result",
+                serde_json::json!({"requestSeq":2,"ok":true,"content":"```run\nreturn 1\n```","action":{"kind":"run","source":"return 1\n","timeoutMs":1,"access":{"writes":[],"reason":""}}}),
+            )
+            .unwrap();
+        journal
+            .append(
+                "run/access",
+                serde_json::json!({"modelResultSeq":3,"decision":"declared","writes":[],"reason":""}),
+            )
+            .unwrap();
+        // a commands declaration that is not {exe, argv, cwd?} is a protocol error
+        journal
+            .append("model/request", serde_json::json!({"step":2,"attempt":1}))
+            .unwrap();
+        let error = journal
+            .append(
+                "model/result",
+                serde_json::json!({"requestSeq":5,"ok":true,"content":"```run\nreturn 1\n```","action":{"kind":"run","source":"return 1\n","timeoutMs":1,"access":{"writes":[],"commands":[{"exe":"sh"}],"reason":"r"}}}),
+            )
+            .unwrap_err();
+        assert!(error.contains("exe and argv"), "{error}");
+        // the journaled decision carries display strings, and non-strings are rejected
+        journal
+            .append(
+                "model/result",
+                serde_json::json!({"requestSeq":5,"ok":true,"content":"```run\nreturn 1\n```","action":{"kind":"run","source":"return 1\n","timeoutMs":1,"access":{"writes":[],"commands":[{"exe":"sh","argv":["-c","ok"]}],"reason":"r"}}}),
+            )
+            .unwrap();
+        let error = journal
+            .append(
+                "run/access",
+                serde_json::json!({"modelResultSeq":6,"decision":"allow","writes":[],"reason":"r","commands":[42]}),
+            )
+            .unwrap_err();
+        assert!(error.contains("strings"), "{error}");
+        journal
+            .append(
+                "run/access",
+                serde_json::json!({"modelResultSeq":6,"decision":"allow","writes":[],"reason":"r","commands":["sh -c ok (in /tmp)"]}),
+            )
+            .unwrap();
         drop(journal);
         fs::remove_dir_all(state).unwrap();
     }

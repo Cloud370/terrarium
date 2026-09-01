@@ -49,19 +49,23 @@ The binary does not load `.env` files. Credentials must already be present in th
 
 One diagnostic variable is supported across both configuration paths: setting `TERRARIUM_LLM_DEBUG` to any value other than `0` dumps every request body and each decoded SSE event to stderr. The dump shows no credential values — headers stay out of the log — but it does contain the full prompt and reasoning payloads, so it is a local debugging tool, not something to leave on or paste into shared logs.
 
-## Filesystem modes
+## Filesystem and process modes
 
 The model-driven agent is the default command:
 
 ```sh
-terrarium [--config PATH] [--profile NAME] [--read-only | --full-access | --allow-write DIR|FILE]... [--max-steps N] [--run-timeout-ms N] [message...]
-terrarium --resume SESSION_ID [--read-only | --full-access | --allow-write DIR|FILE]... [message...]
-terrarium run [-e SOURCE | FILE] [--read-only | --full-access | --allow-write DIR|FILE]... [--timeout-ms N]
+terrarium [--config PATH] [--profile NAME] [--read-only | --full-access | --allow-write DIR|FILE]... [--allow-exec NAME]... [--offline] [--max-steps N] [--run-timeout-ms N] [message...]
+terrarium --resume SESSION_ID [--read-only | --full-access | --allow-write DIR|FILE]... [--allow-exec NAME]... [--offline] [message...]
+terrarium run [-e SOURCE | FILE] [--read-only | --full-access | --allow-write DIR|FILE]... [--allow-exec NAME]... [--offline] [--timeout-ms N]
 ```
 
-`planned-write` is the agent default: each run's writes require preauthorization through the `access` block (see [protocol.md](protocol.md)), with targets already covered by an `--allow-write` scope never prompting. `--read-only` denies every write. `--full-access` removes the scope check, keeping only path validation and the current operating-system user's own permissions — it is the explicit trusted path for debugging, not a privilege escalation; it does not bypass OS permissions. `--allow-write` may be repeated and accepts one existing absolute directory (recursive prefix) or file (exact target) per flag; it cannot be combined with `--read-only` or `--full-access`, and combining those two is itself an error. Mode and write scopes apply only to the current invocation; they are never written to the session journal or restored from it.
+`planned-write` is the agent default: each run's writes and commands require preauthorization through the `access` block (see [protocol.md](protocol.md)), with targets already covered by an `--allow-write` scope or executables covered by an `--allow-exec` name never prompting. `--read-only` denies every write and every process launch. `--full-access` removes the scope check, keeping only path validation and the current operating-system user's own permissions — it is the explicit trusted path for debugging, not a privilege escalation; it does not bypass OS permissions. `--allow-write` may be repeated and accepts one existing absolute directory (recursive prefix) or file (exact target) per flag; it cannot be combined with `--read-only` or `--full-access`, and combining those two is itself an error. Mode, write scopes, and exec grants apply only to the current invocation; they are never written to the session journal or restored from it.
 
-Direct `terrarium run` defaults to `read-only`: `--full-access` is the explicit trusted path, and `--allow-write DIR|FILE` scopes switch the invocation to `planned-write` with writes confined to those scopes — there is no model access block in direct mode.
+`--allow-exec NAME` may be repeated, applies in `planned-write` (and direct `terrarium run` under `--allow-write` scopes), and matches the resolved executable identity — a bare name resolves through `PATH`, an absolute path through canonicalization — covering any argv for both `host.proc.exec` and `host.proc.spawn`. One warning belongs here: an executable that loads project code — build tools (`cargo`, `npm`, `make`) as much as interpreters (`sh`, `node`, `python`) — turns the workspace into its program, and the model can write into the workspace through authorized writes; allowing such an executable approaches full trust for it. There is no blacklist; the approval display and this rule are the defense.
+
+`--offline` disables `host.net.fetch` for the whole invocation: every request fails closed with a visible error. It composes with every mode.
+
+Direct `terrarium run` defaults to `read-only`: `--full-access` is the explicit trusted path, and `--allow-write DIR|FILE` scopes — or `--allow-exec NAME` grants alone — switch the invocation to `planned-write` with writes confined to those scopes (denied entirely without `--allow-write`) and commands confined to `--allow-exec` grants; there is no model access block in direct mode.
 
 ## Request payload
 

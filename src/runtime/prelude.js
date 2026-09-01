@@ -60,6 +60,8 @@ host.fs.replace = (path, oldText, newText, options = {}) => {
 
 // scan()/walk(): flatten host chunks into per-item async iterators — for-await over scan
 // yields {file, no, text} lines, over walk yields {file, size} entries, one by one.
+// The same flattening turns spawn's `output` and fetch's `body` raw iterators into
+// async iterables of {no, text} lines and string chunks.
 {
   const __streamify = (rawFn, name) => (path, opts) => {
     let raw;
@@ -81,4 +83,57 @@ host.fs.replace = (path, oldText, newText, options = {}) => {
   };
   host.fs.scan = __streamify(host.fs.scan, 'scan');
   host.fs.walk = __streamify(host.fs.walk, 'walk');
+
+  const __iterate = (raw) => ({
+    [Symbol.asyncIterator]: async function* () {
+      while (true) {
+        const items = await raw.next();
+        if (!items.length) return;
+        for (const it of items) yield it;
+      }
+    },
+  });
+  const __spawn = host.proc.spawn;
+  host.proc.spawn = (...a) => __spawn(...a).then((p) => {
+    p.output = __iterate(p.output);
+    return p;
+  });
+  const __fetch = host.net.fetch;
+  host.net.fetch = (...a) => __fetch(...a).then((res) => {
+    res.body = __iterate(res.body);
+    return res;
+  });
+}
+
+// QuickJS is not Node. Capability-shaped globals throw with the host replacement named,
+// so a Node-shaped program fails loudly at the seam instead of silently missing data.
+// Cheap spec pieces (TextEncoder) are the exception: pure computation stays local.
+{
+  const __notAvailable = (name, advice) => { throw new Error(`${name} is not available in Terrarium; ${advice}`); };
+  Object.defineProperty(globalThis, 'require', {
+    get: () => __notAvailable('require', 'use host.fs / host.net.fetch for data access and a declared host.proc command for toolchains'),
+  });
+  Object.defineProperty(globalThis, 'process', {
+    get: () => __notAvailable('process', 'there is no process global; external commands are host.proc.exec / host.proc.spawn'),
+  });
+  Object.defineProperty(globalThis, 'Buffer', {
+    get: () => __notAvailable('Buffer', 'use strings, Array, or Uint8Array — byte decoding belongs to host APIs'),
+  });
+
+  globalThis.TextEncoder = function TextEncoder() {};
+  TextEncoder.prototype.encode = function encode(text) {
+    const escaped = encodeURIComponent(String(text));
+    const bytes = [];
+    for (let i = 0; i < escaped.length; i++) {
+      if (escaped[i] === '%') {
+        bytes.push(parseInt(escaped.slice(i + 1, i + 3), 16));
+        i += 2;
+      } else {
+        bytes.push(escaped.charCodeAt(i));
+      }
+    }
+    const view = new Uint8Array(bytes.length);
+    for (let i = 0; i < bytes.length; i++) view[i] = bytes[i];
+    return view;
+  };
 }

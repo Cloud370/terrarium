@@ -163,11 +163,12 @@ fn account_usage(usage: &Usage) {
 // Transport
 // ---------------------------------------------------------------------------
 
-fn http_client() -> &'static reqwest::Client {
+pub(crate) fn http_client() -> &'static reqwest::Client {
     static C: OnceLock<reqwest::Client> = OnceLock::new();
     C.get_or_init(|| {
         reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::limited(5))
             .build()
             .expect("http client")
     })

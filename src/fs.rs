@@ -1459,6 +1459,22 @@ mod tests {
         RunFilesystemAuthority::ReadOnly
     }
 
+    /// Test runs get the default (denied) process authority; fs tests never exercise
+    /// host.proc or host.net.
+    fn eval_env(authority: RunFilesystemAuthority) -> crate::RunEnv {
+        let root = std::env::temp_dir()
+            .join(format!("terrarium-fs-env-{}", std::process::id()))
+            .join("procs");
+        crate::RunEnv {
+            fs: authority,
+            proc: crate::proc::ProcAuthority::default(),
+            net_offline: false,
+            table: std::rc::Rc::new(crate::proc::ProcTable::new(root)),
+            working_root: std::env::temp_dir().canonicalize().unwrap(),
+            receipts: crate::RunEnv::receipts(),
+        }
+    }
+
     #[test]
     fn list_returns_structured_entries() {
         let root = tmp_root("list-structured");
@@ -1490,7 +1506,7 @@ mod tests {
         let out = crate::kernel::eval_js(
             &format!("return host.fs.list('{}')", display(&root)),
             5_000,
-            &read_only(),
+            &eval_env(read_only()),
             tx,
         )
         .await;
@@ -1644,7 +1660,7 @@ mod tests {
                 display(&root)
             ),
             5_000,
-            &read_only(),
+            &eval_env(read_only()),
             tx,
         )
         .await;
@@ -1671,7 +1687,7 @@ mod tests {
                 display(&root)
             ),
             5_000,
-            &read_only(),
+            &eval_env(read_only()),
             tx,
         )
         .await;
@@ -1687,7 +1703,7 @@ mod tests {
         let out = crate::kernel::eval_js(
             &format!("host.fs.walk('{}', {{contains: 'keep'}})", display(&root)),
             5_000,
-            &read_only(),
+            &eval_env(read_only()),
             tx,
         )
         .await;
@@ -1704,7 +1720,7 @@ mod tests {
         let out = crate::kernel::eval_js(
             &format!("host.fs.scan('{}', {{hidden: 'yes'}})", display(&root)),
             5_000,
-            &read_only(),
+            &eval_env(read_only()),
             tx,
         )
         .await;
@@ -1928,7 +1944,7 @@ mod tests {
                 display(&root.join("d"))
             ),
             5_000,
-            &read_only(),
+            &eval_env(read_only()),
             tx,
         )
         .await;
@@ -2273,7 +2289,7 @@ mod tests {
                 display(&root.join("file.txt"))
             ),
             5_000,
-            &scoped_at(&root),
+            &eval_env(scoped_at(&root)),
             tx,
         )
         .await;
@@ -2311,7 +2327,7 @@ mod tests {
                 display(&root.join("file.txt"))
             ),
             5_000,
-            &read_only(),
+            &eval_env(read_only()),
             tx,
         )
         .await;
@@ -2334,7 +2350,7 @@ mod tests {
                 display(&root.join("file.txt"))
             ),
             5_000,
-            &scoped_at(&root),
+            &eval_env(scoped_at(&root)),
             tx,
         )
         .await;
@@ -2379,7 +2395,8 @@ mod tests {
             ),
         ] {
             let (tx, _rx) = tokio::sync::watch::channel(false);
-            let out = crate::kernel::eval_js(&source, 5_000, &authority, tx).await;
+            let out =
+                crate::kernel::eval_js(&source, 5_000, &eval_env(authority.clone()), tx).await;
             assert!(!out.ok, "source unexpectedly succeeded: {source}");
             let message = out.error.expect("edit error").message;
             assert!(message.contains(expected), "{message}");
@@ -2401,7 +2418,7 @@ mod tests {
                 display(&root.join("file.txt"))
             ),
             5_000,
-            &scoped_at(&root),
+            &eval_env(scoped_at(&root)),
             tx,
         )
         .await;
@@ -2423,7 +2440,7 @@ mod tests {
                 display(&root.join("file.txt"))
             ),
             5_000,
-            &scoped_at(&root),
+            &eval_env(scoped_at(&root)),
             tx,
         )
         .await;

@@ -4,19 +4,25 @@
 //! operator scopes, and — in `planned-write` — decided through an `Authorizer` before
 //! QuickJS starts. The kernel only ever receives the frozen per-run authority.
 
+use std::path::PathBuf;
+use std::rc::Rc;
+
 use tokio::sync::watch;
 
 use crate::{
     auth::{
-        covered_by_scopes, freeze_authority, parse_access_block, resolve_access_request,
-        AccessBlock, Authorizer, Decision, ResolvedAccessRequest,
+        covered_by_exec_grants, covered_by_scopes, freeze_authority, freeze_proc_authority,
+        operator_exec_grant, parse_access_block, resolve_access_request, AccessBlock, Authorizer,
+        Decision, DeclaredCommand, ResolvedAccessRequest,
     },
     config, eval_js,
     fs::{FilesystemMode, RunFilesystemAuthority, WriteScope},
     kernel::FACTS_CAP,
-    llm, registry,
+    llm,
+    proc::{ProcAuthority, ProcTable},
+    registry,
     session::{project, turn_data, Event, Journal},
-    ErrorKind, Outcome, MAX_TIMEOUT_MS,
+    ErrorKind, Outcome, RunEnv, MAX_TIMEOUT_MS,
 };
 
 const COMMON: &str = include_str!("prompts/common.md");
@@ -24,6 +30,8 @@ const ROLE_TEMPLATE: &str = include_str!("prompts/main.md");
 const RUN_TIMEOUT_DEFAULT_MS: u64 = 10_000;
 const DEFAULT_MAX_STEPS: u64 = 256;
 const FEEDBACK_CAP: usize = 24 * 1024;
+/// One run journals at most this many capability receipts; later ones are dropped.
+const RUN_RECEIPT_CAP: usize = 128;
 
 /// The invocation-local facts rendered at the head of every newly emitted user-role message.
 /// Deterministic by construction: same inputs, same bytes, so an unchanged state renders a
@@ -33,6 +41,8 @@ pub(crate) struct RuntimeState {
     mode: FilesystemMode,
     default_run_timeout_ms: u64,
     capabilities: String,
+    platform: String,
+    procs: Rc<ProcTable>,
 }
 
 impl RuntimeState {
@@ -42,18 +52,27 @@ impl RuntimeState {
             mode,
             default_run_timeout_ms,
             capabilities: registry::capability_namespaces(),
+            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            procs: Rc::new(ProcTable::new(proc_log_root_for("stateless"))),
         }
+    }
+
+    fn with_procs(mut self, procs: Rc<ProcTable>) -> Self {
+        self.procs = procs;
+        self
     }
 
     fn block(&self) -> String {
         format!(
-            "<terrarium-runtime-state>\n### Current runtime\n- Working root: `{}`\n- \
-             Filesystem mode: `{}`\n- Default run timeout: {} ms (hard cap {} ms)\n- Installed \
-             host capabilities: `{}`\n</terrarium-runtime-state>",
+            "<terrarium-runtime-state>\n### Current runtime\n- Working root: `{}`\n- Platform: \
+             `{}`\n- Filesystem mode: `{}`\n- Default run timeout: {} ms (hard cap {} ms)\n- Live \
+             processes: `{}`\n- Installed host capabilities: `{}`\n</terrarium-runtime-state>",
             escape_state_text(&self.working_root),
+            escape_state_text(&self.platform),
             self.mode.as_str(),
             self.default_run_timeout_ms,
             MAX_TIMEOUT_MS,
+            escape_state_text(&self.procs.live_summary()),
             escape_state_text(&self.capabilities),
         )
     }
@@ -64,17 +83,31 @@ impl RuntimeState {
     }
 }
 
+/// The spawn-log directory for one invocation: host-owned session state, never rendered
+/// as a writable root.
+fn proc_log_root_for(session_id: &str) -> PathBuf {
+    config::state_dir()
+        .unwrap_or_else(|_| std::env::temp_dir().join("terrarium/sessions"))
+        .join(session_id)
+        .join("procs")
+}
+
 /// The host owns every state value; escaping keeps a value from closing the wrapper.
 fn escape_state_text(text: &str) -> String {
     text.replace('<', "&lt;").replace('>', "&gt;")
 }
 
 /// Everything one agent invocation freezes at launch: the filesystem mode, the
-/// operator-declared write scopes, the runtime-state renderer, and the authorizer the
-/// adapter supplied for user decisions.
+/// operator-declared write scopes and exec grants, the runtime-state renderer, the
+/// process table, the network switch, and the authorizer the adapter supplied for user
+/// decisions.
 pub(crate) struct Invocation<'a> {
     mode: FilesystemMode,
     operator_scopes: Vec<WriteScope>,
+    operator_execs: Vec<PathBuf>,
+    offline: bool,
+    working_root: PathBuf,
+    table: Rc<ProcTable>,
     state: RuntimeState,
     authorizer: &'a dyn Authorizer,
 }
@@ -87,6 +120,13 @@ impl Invocation<'_> {
                 RunFilesystemAuthority::Scoped(self.operator_scopes.clone())
             }
             FilesystemMode::FullAccess => RunFilesystemAuthority::FullAccess,
+        }
+    }
+
+    fn base_proc_authority(&self) -> ProcAuthority {
+        match self.mode {
+            FilesystemMode::FullAccess => ProcAuthority::Unrestricted,
+            _ => ProcAuthority::Denied,
         }
     }
 }
@@ -342,15 +382,19 @@ fn authorization_observation(
     request: &ResolvedAccessRequest,
     guidance: impl Into<String>,
 ) -> String {
+    let mut authorization = serde_json::json!({
+        "status": status,
+        "writes": request.displays(),
+        "reason": request.reason,
+    });
+    if !request.commands.is_empty() {
+        authorization["commands"] = serde_json::json!(request.command_displays());
+    }
     serde_json::json!({
         "turn": turn,
         "step": step,
         "to": "model",
-        "authorization": {
-            "status": status,
-            "writes": request.displays(),
-            "reason": request.reason,
-        },
+        "authorization": authorization,
         "error": {"kind": ErrorKind::Protocol, "message": guidance.into()},
     })
     .to_string()
@@ -455,14 +499,16 @@ fn copy_turn(
 
 async fn execute_run(
     journal: &mut Journal,
+    inv: &Invocation<'_>,
     run_seq: u64,
     at: (u64, u64),
     action: &serde_json::Value,
-    authority: &RunFilesystemAuthority,
+    authorities: (&RunFilesystemAuthority, &ProcAuthority),
     limits: (u64, u64),
-    state: &RuntimeState,
 ) -> Result<(), String> {
     let (turn, step) = at;
+    let (authority, proc_authority) = authorities;
+    let state = &inv.state;
     let source = action["source"]
         .as_str()
         .ok_or_else(|| "run action has no source".to_string())?;
@@ -471,8 +517,20 @@ async fn execute_run(
         .unwrap_or(limits.0)
         .min(limits.1)
         .min(MAX_TIMEOUT_MS);
+    let receipts = RunEnv::receipts();
+    let env = RunEnv {
+        fs: authority.clone(),
+        proc: proc_authority.clone(),
+        net_offline: inv.offline,
+        table: inv.table.clone(),
+        working_root: inv.working_root.clone(),
+        receipts: receipts.clone(),
+    };
     let (cancel_tx, _cancel_rx) = watch::channel(false);
-    let outcome = eval_js(source, timeout, authority, cancel_tx).await;
+    let outcome = eval_js(source, timeout, &env, cancel_tx).await;
+    journal_receipts(journal, Some(run_seq), &outcome.receipts)?;
+    let pending = inv.table.take_exit_receipts();
+    journal_exit_receipts(journal, &pending)?;
     let returned = outcome.value.clone();
     let mut data = serde_json::json!({
         "runSeq": run_seq,
@@ -514,10 +572,80 @@ async fn execute_run(
     Ok(())
 }
 
-/// One preauthorization decision: the frozen authority for the run (or none when JavaScript
-/// must not start) plus the bounded `run/access` journal event.
+/// Stamp and append the receipts a run collected: `run/spawn` and `net/request` carry the
+/// runSeq; `proc/exit` records are run-independent. The journal never stores stream data
+/// beyond the bounded receipt tails. Truncation is never silent: a `receipts/truncated`
+/// event counts what was dropped, because the journal is the audit trail (and the only
+/// detection mechanism for `net/request` egress).
+fn journal_receipts(
+    journal: &mut Journal,
+    run_seq: Option<u64>,
+    receipts: &[serde_json::Value],
+) -> Result<(), String> {
+    let dropped = receipts.len().saturating_sub(RUN_RECEIPT_CAP);
+    for receipt in receipts.iter().take(RUN_RECEIPT_CAP) {
+        let (kind, mut data) = match (
+            receipt.get("handle"),
+            receipt.get("status"),
+            receipt.get("exe"),
+        ) {
+            (_, Some(_), _) => ("net/request", receipt.clone()),
+            (Some(_), _, _) => ("run/spawn", receipt.clone()),
+            (None, _, Some(_)) => ("run/spawn", receipt.clone()),
+            (None, _, None) => ("proc/exit", receipt.clone()),
+        };
+        if let Some(run_seq) = run_seq {
+            if matches!(kind, "run/spawn" | "net/request") {
+                data["runSeq"] = serde_json::json!(run_seq);
+                // keep field order deterministic in the journal line
+                let mut ordered = serde_json::Map::new();
+                ordered.insert("runSeq".into(), data["runSeq"].clone());
+                if let Some(fields) = data.as_object() {
+                    for (key, value) in fields {
+                        if key != "runSeq" {
+                            ordered.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+                data = serde_json::Value::Object(ordered);
+            }
+        }
+        journal.append(kind, data)?;
+    }
+    if dropped > 0 {
+        let mut data = serde_json::json!({"dropped": dropped});
+        if let Some(run_seq) = run_seq {
+            data["runSeq"] = serde_json::json!(run_seq);
+        }
+        journal.append("receipts/truncated", data)?;
+    }
+    Ok(())
+}
+
+/// Append `proc/exit` receipts observed outside any run (a process that died while the
+/// model was thinking, or at session shutdown).
+fn journal_exit_receipts(
+    journal: &mut Journal,
+    receipts: &[serde_json::Value],
+) -> Result<(), String> {
+    let dropped = receipts.len().saturating_sub(RUN_RECEIPT_CAP);
+    for receipt in receipts.iter().take(RUN_RECEIPT_CAP) {
+        journal.append("proc/exit", receipt.clone())?;
+    }
+    if dropped > 0 {
+        journal.append(
+            "receipts/truncated",
+            serde_json::json!({"dropped": dropped}),
+        )?;
+    }
+    Ok(())
+}
+
+/// One preauthorization decision: the frozen authorities for the run (or none when
+/// JavaScript must not start) plus the bounded `run/access` journal event.
 struct AccessDecision {
     authority: Option<RunFilesystemAuthority>,
+    proc_authority: Option<ProcAuthority>,
     event: serde_json::Value,
 }
 
@@ -531,16 +659,42 @@ fn access_block_of(action: &serde_json::Value) -> AccessBlock {
                 .collect()
         })
         .unwrap_or_default();
+    let commands = action["access"]["commands"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let record = entry.as_object()?;
+                    Some(DeclaredCommand {
+                        exe: record.get("exe")?.as_str()?.to_string(),
+                        argv: record
+                            .get("argv")?
+                            .as_array()?
+                            .iter()
+                            .filter_map(|arg| arg.as_str().map(str::to_string))
+                            .collect(),
+                        cwd: record
+                            .get("cwd")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let reason = action["access"]["reason"].as_str().unwrap_or_default();
     AccessBlock {
         writes,
+        commands,
         reason: reason.to_string(),
     }
 }
 
 /// The complete planned-write lifecycle plus the mode-specific meaning of a declaration:
-/// resolve → subtract operator scopes → decide → freeze. An empty request runs directly
-/// under the invocation's base authority and journals nothing.
+/// resolve → subtract operator scopes and exec grants → decide → freeze. Writes and
+/// commands are one request and one decision. An empty request runs directly under the
+/// invocation's base authority and journals nothing.
 fn authorize_run_access(
     inv: &Invocation,
     action: &serde_json::Value,
@@ -548,9 +702,10 @@ fn authorize_run_access(
     step: u64,
 ) -> AccessDecision {
     let block = access_block_of(action);
-    if block.writes.is_empty() {
+    if block.writes.is_empty() && block.commands.is_empty() {
         return AccessDecision {
             authority: Some(inv.base_authority()),
+            proc_authority: Some(inv.base_proc_authority()),
             event: serde_json::Value::Null,
         };
     }
@@ -563,16 +718,20 @@ fn authorize_run_access(
             "writes": request.displays(),
             "reason": request.reason,
         });
+        if !request.commands.is_empty() {
+            event["commands"] = serde_json::json!(request.command_displays());
+        }
         if let Some(text) = observation {
             event["observation"] = serde_json::Value::String(text);
         }
         event
     };
-    let resolved = match resolve_access_request(&block, inv.mode) {
+    let resolved = match resolve_access_request(&block, inv.mode, &inv.working_root) {
         Ok(resolved) => resolved,
         Err(error) => {
             let request = ResolvedAccessRequest {
                 targets: Vec::new(),
+                commands: Vec::new(),
                 reason: block.reason.clone(),
             };
             let observation = authorization_observation(
@@ -581,11 +740,13 @@ fn authorize_run_access(
                 "authorization_invalid",
                 &request,
                 format!(
-                    "no program was executed; the access request is invalid: {error}. Fix the access block and resend one complete program"
+                    "no program was executed; the access request is invalid: {error}. Fix the \
+                     access block and resend one complete program"
                 ),
             );
             return AccessDecision {
                 authority: None,
+                proc_authority: None,
                 event: access_event("invalid", &request, Some(observation)),
             };
         }
@@ -593,6 +754,7 @@ fn authorize_run_access(
     match inv.mode {
         FilesystemMode::FullAccess => AccessDecision {
             authority: Some(RunFilesystemAuthority::FullAccess),
+            proc_authority: Some(ProcAuthority::Unrestricted),
             event: access_event("declared", &resolved, None),
         },
         FilesystemMode::ReadOnly => {
@@ -602,29 +764,39 @@ fn authorize_run_access(
                 "authorization_denied",
                 &resolved,
                 "no program was executed; the current invocation is read-only and every write \
-                 is denied. Do not request writes again in this invocation; continue with \
-                 read-only work or hand off to the user.",
+                 and every process launch is denied. Do not request writes or commands again in \
+                 this invocation; continue with read-only work, host.net.fetch, or hand off to \
+                 the user.",
             );
             AccessDecision {
                 authority: None,
+                proc_authority: None,
                 event: access_event("deny", &resolved, Some(observation)),
             }
         }
         FilesystemMode::PlannedWrite => {
-            let remainder: Vec<_> = resolved
+            let remainder_writes: Vec<_> = resolved
                 .targets
                 .iter()
                 .filter(|target| !covered_by_scopes(&inv.operator_scopes, target))
                 .cloned()
                 .collect();
-            if remainder.is_empty() {
+            let remainder_commands: Vec<_> = resolved
+                .commands
+                .iter()
+                .filter(|command| !covered_by_exec_grants(&inv.operator_execs, command))
+                .cloned()
+                .collect();
+            if remainder_writes.is_empty() && remainder_commands.is_empty() {
                 return AccessDecision {
                     authority: Some(freeze_authority(&inv.operator_scopes, &[])),
+                    proc_authority: Some(freeze_proc_authority(&inv.operator_execs, &[])),
                     event: access_event("covered", &resolved, None),
                 };
             }
             let prompt_request = ResolvedAccessRequest {
-                targets: remainder,
+                targets: remainder_writes,
+                commands: remainder_commands,
                 reason: resolved.reason.clone(),
             };
             match inv.authorizer.decide(&prompt_request) {
@@ -633,10 +805,15 @@ fn authorize_run_access(
                         &inv.operator_scopes,
                         &prompt_request.targets,
                     )),
+                    proc_authority: Some(freeze_proc_authority(
+                        &inv.operator_execs,
+                        &prompt_request.commands,
+                    )),
                     event: access_event("allow", &prompt_request, None),
                 },
                 Decision::Deny => AccessDecision {
                     authority: None,
+                    proc_authority: None,
                     event: access_event(
                         "deny",
                         &prompt_request,
@@ -645,14 +822,15 @@ fn authorize_run_access(
                             step,
                             "authorization_denied",
                             &prompt_request,
-                            "no program was executed; the user denied the requested write set. \
-                             Do not re-request the same set within this turn; continue read-only \
-                             or hand off to the user",
+                            "no program was executed; the user denied the requested write and \
+                             command set. Do not re-request the same set within this turn; \
+                             continue read-only or hand off to the user",
                         )),
                     ),
                 },
                 Decision::Cancel => AccessDecision {
                     authority: None,
+                    proc_authority: None,
                     event: access_event(
                         "cancel",
                         &prompt_request,
@@ -669,6 +847,7 @@ fn authorize_run_access(
                 },
                 Decision::Unavailable => AccessDecision {
                     authority: None,
+                    proc_authority: None,
                     event: access_event(
                         "unavailable",
                         &prompt_request,
@@ -678,8 +857,8 @@ fn authorize_run_access(
                             "authorization_unavailable",
                             &prompt_request,
                             "no program was executed; no interactive authorizer is available in \
-                             this invocation, so no write can be authorized here. Continue \
-                             read-only or hand off to the user",
+                             this invocation, so no write or command can be authorized here. \
+                             Continue read-only or hand off to the user",
                         )),
                     ),
                 },
@@ -740,14 +919,24 @@ fn process_model_result(
     let action = if let Some(message) = observation_for_extract(turn, step, &extracted) {
         serde_json::json!({"kind":"observation","message":state.prepend(&message)})
     } else if let Extracted::Run { program, access } = extracted {
+        let mut access_json = serde_json::json!({
+            "writes": access.as_ref().map(|b| b.writes.clone()).unwrap_or_default(),
+            "reason": access.as_ref().map(|b| b.reason.clone()).unwrap_or_default(),
+        });
+        let commands = access
+            .as_ref()
+            .map(|b| b.commands.clone())
+            .unwrap_or_default();
+        if !commands.is_empty() {
+            // the journal keeps the exact declared records; display truncation happens
+            // only in prompts and run/access events
+            access_json["commands"] = serde_json::to_value(&commands).unwrap_or_default();
+        }
         serde_json::json!({
             "kind": "run",
             "source": program.code,
             "timeoutMs": program.timeout_ms.unwrap_or(limits.0).min(limits.1),
-            "access": {
-                "writes": access.as_ref().map(|b| b.writes.clone()).unwrap_or_default(),
-                "reason": access.as_ref().map(|b| b.reason.clone()).unwrap_or_default(),
-            },
+            "access": access_json,
         })
     } else {
         unreachable!()
@@ -903,34 +1092,40 @@ fn interrupted_model_result(request: &Event) -> serde_json::Value {
     })
 }
 
-/// Rebuild the frozen authority for a run whose decision was already journaled — the
+/// Rebuild the frozen authorities for a run whose decision was already journaled — the
 /// crash-resume path between a durable `run/access` and its missing `run/start`. Historical
 /// decisions are not authority by themselves: the reconstructed set is re-resolved from the
-/// journaled request against the current invocation's mode and operator scopes. A journaled
-/// decision only carries when the resumed invocation runs the mode that produced it — a
-/// read-only resume never executes an approved planned-write run, and a full-access resume
-/// does not inherit a scoped decision; a mode change drops the pending run to a fresh model
-/// step.
+/// journaled request against the current invocation's mode, operator scopes, and exec
+/// grants. A journaled decision only carries when the resumed invocation runs the mode that
+/// produced it — a read-only resume never executes an approved planned-write run, and a
+/// full-access resume does not inherit a scoped decision; a mode change drops the pending
+/// run to a fresh model step.
 fn authority_from_journaled_decision(
     inv: &Invocation,
     action: &serde_json::Value,
     decision: &str,
-) -> Option<RunFilesystemAuthority> {
+) -> Option<(RunFilesystemAuthority, ProcAuthority)> {
+    let resolved = resolve_access_request(&access_block_of(action), inv.mode, &inv.working_root);
     match (inv.mode, decision) {
-        (FilesystemMode::FullAccess, "declared") => Some(RunFilesystemAuthority::FullAccess),
-        (FilesystemMode::PlannedWrite, "covered") => {
-            Some(freeze_authority(&inv.operator_scopes, &[]))
-        }
-        (FilesystemMode::PlannedWrite, "allow") => {
-            resolve_access_request(&access_block_of(action), inv.mode)
-                .ok()
-                .map(|resolved| freeze_authority(&inv.operator_scopes, &resolved.targets))
-        }
+        (FilesystemMode::FullAccess, "declared") => Some((
+            RunFilesystemAuthority::FullAccess,
+            ProcAuthority::Unrestricted,
+        )),
+        (FilesystemMode::PlannedWrite, "covered") => Some((
+            freeze_authority(&inv.operator_scopes, &[]),
+            freeze_proc_authority(&inv.operator_execs, &[]),
+        )),
+        (FilesystemMode::PlannedWrite, "allow") => resolved.ok().map(|resolved| {
+            (
+                freeze_authority(&inv.operator_scopes, &resolved.targets),
+                freeze_proc_authority(&inv.operator_execs, &resolved.commands),
+            )
+        }),
         _ => None,
     }
 }
 
-/// Append `run/start` and execute the program under the frozen authority. Shared by the
+/// Append `run/start` and execute the program under the frozen authorities. Shared by the
 /// fresh-decision path and the crash-resume path; the journal keeps them indistinguishable.
 async fn start_and_execute_run(
     journal: &mut Journal,
@@ -938,6 +1133,7 @@ async fn start_and_execute_run(
     inv: &Invocation<'_>,
     result: &Event,
     authority: RunFilesystemAuthority,
+    proc_authority: ProcAuthority,
 ) -> Result<(), String> {
     let run_seq = journal.append(
         "run/start",
@@ -957,12 +1153,12 @@ async fn start_and_execute_run(
         .unwrap_or(1);
     execute_run(
         journal,
+        inv,
         run_seq,
         (turn_number, step),
         &result.data["action"],
-        &authority,
+        (&authority, &proc_authority),
         limits,
-        &inv.state,
     )
     .await
 }
@@ -976,6 +1172,11 @@ async fn drive(journal: Journal, inv: &Invocation<'_>) -> i32 {
         let Some(last) = journal.events.last().cloned() else {
             return 1;
         };
+        // processes that died while no run was active still owe their exit receipts
+        if let Err(e) = journal_exit_receipts(&mut journal, &inv.table.take_exit_receipts()) {
+            eprintln!("terrarium: {e}");
+            return 1;
+        }
         match last.kind.as_str() {
             "model/request" => {
                 if journal.events.iter().any(|event| {
@@ -1059,10 +1260,12 @@ async fn drive(journal: Journal, inv: &Invocation<'_>) -> i32 {
                         return 1;
                     }
                 }
-                let Some(authority) = decision.authority else {
+                let (Some(authority), Some(proc_authority)) =
+                    (decision.authority, decision.proc_authority)
+                else {
                     continue;
                 };
-                if start_and_execute_run(&mut journal, &turn, inv, &last, authority)
+                if start_and_execute_run(&mut journal, &turn, inv, &last, authority, proc_authority)
                     .await
                     .is_err()
                 {
@@ -1090,14 +1293,21 @@ async fn drive(journal: Journal, inv: &Invocation<'_>) -> i32 {
                         .find(|event| Some(event.seq) == result_seq && event.kind == "model/result")
                         .cloned()
                     {
-                        if let Some(authority) = authority_from_journaled_decision(
+                        if let Some((authority, proc_authority)) = authority_from_journaled_decision(
                             inv,
                             &result.data["action"],
                             last.data["decision"].as_str().unwrap_or_default(),
                         ) {
-                            if start_and_execute_run(&mut journal, &turn, inv, &result, authority)
-                                .await
-                                .is_err()
+                            if start_and_execute_run(
+                                &mut journal,
+                                &turn,
+                                inv,
+                                &result,
+                                authority,
+                                proc_authority,
+                            )
+                            .await
+                            .is_err()
                             {
                                 return 1;
                             }
@@ -1121,6 +1331,13 @@ async fn drive(journal: Journal, inv: &Invocation<'_>) -> i32 {
                         let message = last.data["disposition"]["message"]
                             .as_str()
                             .unwrap_or_default();
+                        // the session ends normally here: kill every live process and
+                        // journal the exit receipts while the turn is still open
+                        let exits = inv.table.shutdown().await;
+                        if let Err(e) = journal_exit_receipts(&mut journal, &exits) {
+                            eprintln!("terrarium: {e}");
+                            return 1;
+                        }
                         if journal
                             .append(
                                 "turn/end",
@@ -1189,17 +1406,35 @@ fn read_message(args: &[String]) -> Result<String, String> {
 /// Flag-conflict check plus operator-scope resolution: everything about an invocation that
 /// can fail. Runs before any durable state exists, so a rejected launch leaves no session
 /// behind.
+/// Everything the launch flags decide before any session exists: the filesystem mode,
+/// the operator write scopes, the operator exec grants, and the offline switch.
+pub(crate) struct LaunchOptions {
+    mode: FilesystemMode,
+    scopes: Vec<WriteScope>,
+    execs: Vec<PathBuf>,
+    offline: bool,
+}
+
 fn resolve_invocation(
     read_only: bool,
     full_access: bool,
     allow_write: &[String],
-) -> Result<(FilesystemMode, Vec<WriteScope>), String> {
+    allow_exec: &[String],
+    offline: bool,
+) -> Result<LaunchOptions, String> {
     if read_only && full_access {
         return Err("--read-only and --full-access are mutually exclusive".into());
     }
     if (read_only || full_access) && !allow_write.is_empty() {
         return Err(
             "--allow-write is valid only in planned-write mode; it cannot be combined with \
+             --read-only or --full-access"
+                .into(),
+        );
+    }
+    if (read_only || full_access) && !allow_exec.is_empty() {
+        return Err(
+            "--allow-exec is valid only in planned-write mode; it cannot be combined with \
              --read-only or --full-access"
                 .into(),
         );
@@ -1215,20 +1450,35 @@ fn resolve_invocation(
     for spec in allow_write {
         operator_scopes.push(WriteScope::from_operator_spec(spec)?);
     }
-    Ok((mode, operator_scopes))
+    let mut execs = Vec::with_capacity(allow_exec.len());
+    for name in allow_exec {
+        execs.push(operator_exec_grant(name)?);
+    }
+    Ok(LaunchOptions {
+        mode,
+        scopes: operator_scopes,
+        execs,
+        offline,
+    })
 }
 
 fn invocation<'a>(
-    mode: FilesystemMode,
-    operator_scopes: Vec<WriteScope>,
+    launch: LaunchOptions,
     working_root: String,
+    canonical_root: PathBuf,
+    session_id: &str,
     timeout: u64,
     authorizer: &'a dyn Authorizer,
 ) -> Invocation<'a> {
+    let table = Rc::new(ProcTable::new(proc_log_root_for(session_id)));
     Invocation {
-        mode,
-        operator_scopes,
-        state: RuntimeState::new(working_root, mode, timeout),
+        mode: launch.mode,
+        operator_scopes: launch.scopes,
+        operator_execs: launch.execs,
+        offline: launch.offline,
+        working_root: canonical_root,
+        table: table.clone(),
+        state: RuntimeState::new(working_root, launch.mode, timeout).with_procs(table),
         authorizer,
     }
 }
@@ -1240,6 +1490,8 @@ pub async fn run_cli(args: &[String], authorizer: &dyn Authorizer) -> i32 {
     let mut read_only = false;
     let mut full = false;
     let mut allow_write: Vec<String> = Vec::new();
+    let mut allow_exec: Vec<String> = Vec::new();
+    let mut offline = false;
     let mut max_steps = DEFAULT_MAX_STEPS;
     let mut timeout = RUN_TIMEOUT_DEFAULT_MS;
     let mut message = Vec::new();
@@ -1273,6 +1525,18 @@ pub async fn run_cli(args: &[String], authorizer: &dyn Authorizer) -> i32 {
             "--allow-write" => {
                 eprintln!("terrarium: --allow-write expects an absolute DIR or FILE path");
                 return 2;
+            }
+            "--allow-exec" if i + 1 < args.len() => {
+                allow_exec.push(args[i + 1].clone());
+                i += 2;
+            }
+            "--allow-exec" => {
+                eprintln!("terrarium: --allow-exec expects an executable NAME or absolute path");
+                return 2;
+            }
+            "--offline" => {
+                offline = true;
+                i += 1;
             }
             "--max-steps" if i + 1 < args.len() => {
                 max_steps = args[i + 1].parse().ok().filter(|v| *v >= 1).unwrap_or(0);
@@ -1329,8 +1593,8 @@ pub async fn run_cli(args: &[String], authorizer: &dyn Authorizer) -> i32 {
         }
     }
     // validate the launch before touching durable state: a bad flag combination or an
-    // unresolvable --allow-write scope must not leave a fresh session behind
-    let (mode, operator_scopes) = match resolve_invocation(read_only, full, &allow_write) {
+    // unresolvable --allow-write / --allow-exec grant must not leave a fresh session behind
+    let launch = match resolve_invocation(read_only, full, &allow_write, &allow_exec, offline) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("terrarium: {e}");
@@ -1362,7 +1626,16 @@ pub async fn run_cli(args: &[String], authorizer: &dyn Authorizer) -> i32 {
         }
     };
     let root = journal.header.working_root.display_path.clone();
-    let inv = invocation(mode, operator_scopes, root, timeout, authorizer);
+    let canonical_root = PathBuf::from(journal.header.working_root.canonical_path.clone());
+    let session_id = journal.id.clone();
+    let inv = invocation(
+        launch,
+        root,
+        canonical_root,
+        &session_id,
+        timeout,
+        authorizer,
+    );
     if journal.open_turn().is_some() {
         if !message.is_empty() || profile.is_some() || config_path.is_some() {
             eprintln!(
@@ -1447,7 +1720,10 @@ pub async fn run_cli(args: &[String], authorizer: &dyn Authorizer) -> i32 {
             eprintln!("{}", journal.id);
         }
     }
-    drive(journal, &inv).await
+    let code = drive(journal, &inv).await;
+    // any drive exit ends the invocation: no live spawned process outlives it
+    inv.table.kill_all(true);
+    code
 }
 
 #[cfg(test)]
@@ -1478,7 +1754,16 @@ mod tests {
             "{block}"
         );
         assert!(
-            block.contains("- Installed host capabilities: `host.fs`"),
+            block.contains(&format!(
+                "- Platform: `{}-{}`",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )),
+            "{block}"
+        );
+        assert!(block.contains("- Live processes: `none`"), "{block}");
+        assert!(
+            block.contains("- Installed host capabilities: `host.fs, host.net, host.proc`"),
             "{block}"
         );
         assert_eq!(block, state(FilesystemMode::PlannedWrite).block());
@@ -1595,7 +1880,12 @@ mod tests {
         let access = access.expect("access block");
         assert_eq!(access.writes, vec![file_display.clone()]);
         assert_eq!(access.reason, "update the file");
-        let resolved = resolve_access_request(&access, FilesystemMode::PlannedWrite).unwrap();
+        let resolved = resolve_access_request(
+            &access,
+            FilesystemMode::PlannedWrite,
+            &root.canonicalize().unwrap(),
+        )
+        .unwrap();
         assert_eq!(resolved.targets.len(), 1);
         assert_eq!(resolved.targets[0].display, file_display);
         assert!(!resolved.targets[0].parents_missing);
@@ -1632,6 +1922,7 @@ mod tests {
         let root = std::env::temp_dir().join("terrarium-access-rules");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        let working_root = root.canonicalize().unwrap();
         let existing = root.join("existing.txt");
         std::fs::write(&existing, "x").unwrap();
         let existing_display = existing.to_string_lossy().replace('\\', "/");
@@ -1640,9 +1931,11 @@ mod tests {
             resolve_access_request(
                 &AccessBlock {
                     writes: writes.to_vec(),
+                    commands: Vec::new(),
                     reason: reason.into(),
                 },
                 mode,
+                &working_root,
             )
         };
         // planned-write requires a reason for non-empty requests
@@ -1740,8 +2033,102 @@ mod tests {
         )
         .unwrap_err()
         .contains("200"));
-        let oversized = serde_json::json!({"writes": [format!("/tmp/{}.txt", "x".repeat(5000))], "reason": "r"}).to_string();
-        assert!(parse_access_block(&oversized).unwrap_err().contains("4096"));
+        let oversized = serde_json::json!({"writes": [format!("/tmp/{}.txt", "x".repeat(9000))], "reason": "r"}).to_string();
+        assert!(parse_access_block(&oversized).unwrap_err().contains("8192"));
+    }
+
+    #[test]
+    fn command_records_parse_resolve_and_deduplicate() {
+        let root = std::env::temp_dir().join("terrarium-auth-commands");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let working_root = root.canonicalize().unwrap();
+        let subdir = root.join("sub");
+        std::fs::create_dir(&subdir).unwrap();
+        let sh = if cfg!(windows) {
+            crate::proc::resolve_executable("C:/Windows/System32/cmd.exe").unwrap()
+        } else {
+            crate::proc::resolve_executable("sh").unwrap()
+        };
+        let exe_name = if cfg!(windows) {
+            "C:/Windows/System32/cmd.exe"
+        } else {
+            "sh"
+        };
+        let body = serde_json::json!({
+            "writes": [],
+            "commands": [
+                {"exe": exe_name, "argv": ["/c", "echo hi"],
+                 "cwd": subdir.to_string_lossy().replace('\\', "/")},
+                {"exe": exe_name, "argv": ["/c", "echo hi"]},
+                {"exe": exe_name, "argv": ["/c", "echo hi"],
+                 "cwd": root.to_string_lossy().replace('\\', "/")},
+            ],
+            "reason": "run the suite",
+        })
+        .to_string();
+        let block = parse_access_block(&body).unwrap();
+        assert_eq!(block.commands.len(), 3);
+        let resolved =
+            resolve_access_request(&block, FilesystemMode::PlannedWrite, &working_root).unwrap();
+        // the explicit working-root cwd resolves to the same identity as the cwd-less
+        // default, so records two and three deduplicate; the subdir record stays distinct
+        assert_eq!(resolved.commands.len(), 2);
+        assert_eq!(resolved.commands[0].record.exe, sh);
+        assert_eq!(
+            resolved.commands[0].record.cwd,
+            subdir.canonicalize().unwrap()
+        );
+        assert_eq!(resolved.commands[1].record.cwd, working_root);
+        assert!(
+            resolved.commands[0].display.contains("/c"),
+            "{}",
+            resolved.commands[0].display
+        );
+        assert!(
+            resolved.commands[0].display.contains("(in "),
+            "{}",
+            resolved.commands[0].display
+        );
+        // planned-write requires a reason when only commands are requested
+        let reasonless = serde_json::json!({
+            "writes": [],
+            "commands": [{"exe": "sh", "argv": ["-c"]}],
+            "reason": "",
+        })
+        .to_string();
+        let block = parse_access_block(&reasonless).unwrap();
+        assert!(
+            resolve_access_request(&block, FilesystemMode::PlannedWrite, &working_root)
+                .unwrap_err()
+                .contains("reason")
+        );
+        // bad shapes are protocol errors
+        for bad in [
+            serde_json::json!({"writes": [], "commands": [{"exe": "sh"}], "reason": "r"})
+                .to_string(),
+            serde_json::json!({"writes": [], "commands": [{"argv": []}], "reason": "r"})
+                .to_string(),
+            serde_json::json!({"writes": [], "commands": ["sh"], "reason": "r"}).to_string(),
+            serde_json::json!({"writes": [], "commands": [], "reason": "r", "extra": 1})
+                .to_string(),
+        ] {
+            assert!(parse_access_block(&bad).is_err(), "{bad}");
+        }
+        // unresolvable executables fail at resolution with a teachable error
+        let missing = serde_json::json!({
+            "writes": [],
+            "commands": [{"exe": "definitely-not-a-real-tool-xyz", "argv": []}],
+            "reason": "r",
+        })
+        .to_string();
+        let block = parse_access_block(&missing).unwrap();
+        assert!(
+            resolve_access_request(&block, FilesystemMode::PlannedWrite, &working_root)
+                .unwrap_err()
+                .contains("definitely-not-a-real-tool-xyz")
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     struct FixedAuthorizer(Decision);
@@ -1752,17 +2139,65 @@ mod tests {
         }
     }
 
+    fn launch(mode: FilesystemMode) -> LaunchOptions {
+        LaunchOptions {
+            mode,
+            scopes: Vec::new(),
+            execs: Vec::new(),
+            offline: false,
+        }
+    }
+
     fn invocation_with(mode: FilesystemMode, decision: Decision) -> Invocation<'static> {
         let authorizer: &'static FixedAuthorizer = Box::leak(Box::new(FixedAuthorizer(decision)));
-        let root = std::env::temp_dir().join("terrarium-auth-inv");
-        std::fs::create_dir_all(&root).unwrap();
-        let scopes = vec![WriteScope::from_operator_spec(&root.to_string_lossy()).unwrap()];
-        Invocation {
-            mode,
-            operator_scopes: scopes,
-            state: RuntimeState::new(root.to_string_lossy().into_owned(), mode, 10_000),
+        invocation(
+            launch(mode),
+            "/tmp/terrarium-auth-inv".into(),
+            PathBuf::from("/tmp/terrarium-auth-inv"),
+            "terrarium-auth-inv",
+            10_000,
             authorizer,
-        }
+        )
+    }
+
+    fn invocation_at(
+        mode: FilesystemMode,
+        decision: Decision,
+        root: &std::path::Path,
+        scopes: Vec<WriteScope>,
+    ) -> Invocation<'static> {
+        let authorizer: &'static FixedAuthorizer = Box::leak(Box::new(FixedAuthorizer(decision)));
+        invocation(
+            LaunchOptions {
+                scopes,
+                ..launch(mode)
+            },
+            root.to_string_lossy().into_owned(),
+            root.canonicalize().unwrap(),
+            "terrarium-auth-inv",
+            10_000,
+            authorizer,
+        )
+    }
+
+    fn invocation_exec_grant(
+        mode: FilesystemMode,
+        decision: Decision,
+        root: &std::path::Path,
+        grants: Vec<PathBuf>,
+    ) -> Invocation<'static> {
+        let authorizer: &'static FixedAuthorizer = Box::leak(Box::new(FixedAuthorizer(decision)));
+        invocation(
+            LaunchOptions {
+                execs: grants,
+                ..launch(mode)
+            },
+            root.to_string_lossy().into_owned(),
+            root.canonicalize().unwrap(),
+            "terrarium-auth-inv",
+            10_000,
+            authorizer,
+        )
     }
 
     fn run_action(writes: &[String], reason: &str) -> serde_json::Value {
@@ -1771,6 +2206,15 @@ mod tests {
             "source": "return 1",
             "timeoutMs": 100,
             "access": {"writes": writes, "reason": reason}
+        })
+    }
+
+    fn command_action(commands: serde_json::Value, reason: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "run",
+            "source": "return 1",
+            "timeoutMs": 100,
+            "access": {"writes": [], "commands": commands, "reason": reason}
         })
     }
 
@@ -1787,17 +2231,16 @@ mod tests {
         std::fs::write(&outside, "x").unwrap();
         let root_display = root.to_string_lossy().replace('\\', "/");
         let scope = WriteScope::from_operator_spec(&root_display).unwrap();
-        let state = RuntimeState::new(root_display.clone(), FilesystemMode::PlannedWrite, 10_000);
         let inside_display = inside.to_string_lossy().replace('\\', "/");
         let outside_display = outside.to_string_lossy().replace('\\', "/");
 
         // covered: operator scope absorbs the request, no prompt, no approved exacts
-        let inv = Invocation {
-            mode: FilesystemMode::PlannedWrite,
-            operator_scopes: vec![scope.clone()],
-            state: RuntimeState::new(root_display.clone(), FilesystemMode::PlannedWrite, 10_000),
-            authorizer: &FixedAuthorizer(Decision::Deny),
-        };
+        let inv = invocation_at(
+            FilesystemMode::PlannedWrite,
+            Decision::Deny,
+            &root,
+            vec![scope.clone()],
+        );
         let covered = authorize_run_access(
             &inv,
             &run_action(std::slice::from_ref(&inside_display), "edit"),
@@ -1825,17 +2268,17 @@ mod tests {
             "{observation}"
         );
         assert!(
-            observation.contains("denied the requested write set"),
+            observation.contains("denied the requested write and command set"),
             "{observation}"
         );
 
         // approval freezes operator scopes plus the approved exact path
-        let allowing_inv = Invocation {
-            mode: FilesystemMode::PlannedWrite,
-            operator_scopes: vec![scope.clone()],
-            state: RuntimeState::new(root_display.clone(), FilesystemMode::PlannedWrite, 10_000),
-            authorizer: &FixedAuthorizer(Decision::Allow),
-        };
+        let allowing_inv = invocation_at(
+            FilesystemMode::PlannedWrite,
+            Decision::Allow,
+            &root,
+            vec![scope.clone()],
+        );
         let allowed = authorize_run_access(
             &allowing_inv,
             &run_action(
@@ -1863,12 +2306,12 @@ mod tests {
             .is_err());
 
         // unavailable: no interactive authorizer in this invocation
-        let unavailable_inv = Invocation {
-            mode: FilesystemMode::PlannedWrite,
-            operator_scopes: vec![scope],
-            state,
-            authorizer: &FixedAuthorizer(Decision::Unavailable),
-        };
+        let unavailable_inv = invocation_at(
+            FilesystemMode::PlannedWrite,
+            Decision::Unavailable,
+            &root,
+            vec![scope],
+        );
         let unavailable = authorize_run_access(
             &unavailable_inv,
             &run_action(std::slice::from_ref(&outside_display), "edit"),
@@ -1883,6 +2326,115 @@ mod tests {
             .contains("no interactive authorizer"));
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn command_lifecycle_grants_subtract_and_freeze() {
+        let root = std::env::temp_dir().join("terrarium-auth-cmd");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let working_root = root.canonicalize().unwrap();
+        let exe_name = if cfg!(windows) {
+            "C:/Windows/System32/cmd.exe"
+        } else {
+            "sh"
+        };
+        let resolved_exe = crate::proc::resolve_executable(exe_name).unwrap();
+        let action = command_action(
+            serde_json::json!([{ "exe": exe_name, "argv": ["/c", "echo hi"] }]),
+            "run the suite",
+        );
+
+        // planned-write prompts for the undeclared remainder and freezes the approved record
+        let inv = invocation_at(
+            FilesystemMode::PlannedWrite,
+            Decision::Allow,
+            &root,
+            Vec::new(),
+        );
+        let approved = authorize_run_access(&inv, &action, 1, 1);
+        assert_eq!(approved.event["decision"], "allow");
+        assert!(approved.event["commands"].is_array());
+        assert!(approved.event["commands"][0]
+            .as_str()
+            .unwrap()
+            .contains("echo hi"));
+        let proc = approved.proc_authority.expect("frozen process authority");
+        assert!(proc
+            .authorize(
+                exe_name,
+                &["/c".into(), "echo hi".into()],
+                None,
+                &working_root
+            )
+            .is_ok());
+        // a different argv or cwd is not the approved command
+        assert!(proc
+            .authorize(
+                exe_name,
+                &["/c".into(), "echo bye".into()],
+                None,
+                &working_root
+            )
+            .is_err());
+
+        // an operator --allow-exec grant absorbs the request without a prompt
+        let granted = invocation_exec_grant(
+            FilesystemMode::PlannedWrite,
+            Decision::Deny,
+            &root,
+            vec![resolved_exe.clone()],
+        );
+        let covered = authorize_run_access(&granted, &action, 1, 2);
+        assert_eq!(covered.event["decision"], "covered");
+        let proc = covered.proc_authority.expect("grants freeze as records");
+        assert!(proc
+            .authorize(
+                exe_name,
+                &["/c".into(), "anything".into()],
+                None,
+                &working_root
+            )
+            .is_ok());
+
+        // denial ends the run with corrective feedback
+        let denied_inv = invocation_at(
+            FilesystemMode::PlannedWrite,
+            Decision::Deny,
+            &root,
+            Vec::new(),
+        );
+        let denied = authorize_run_access(&denied_inv, &action, 1, 3);
+        assert!(denied.authority.is_none() && denied.proc_authority.is_none());
+        assert_eq!(denied.event["decision"], "deny");
+        assert!(denied.event["observation"]
+            .as_str()
+            .unwrap()
+            .contains("command set"));
+
+        // read-only denies commands as write-class effects
+        let read_only = invocation_at(FilesystemMode::ReadOnly, Decision::Allow, &root, Vec::new());
+        let denied = authorize_run_access(&read_only, &action, 1, 4);
+        assert!(denied.authority.is_none());
+        assert!(denied.event["observation"]
+            .as_str()
+            .unwrap()
+            .contains("process launch"));
+
+        // full-access journals the declaration and freezes unrestricted commands
+        let full = invocation_at(
+            FilesystemMode::FullAccess,
+            Decision::Deny,
+            &root,
+            Vec::new(),
+        );
+        let declared = authorize_run_access(&full, &action, 1, 5);
+        assert_eq!(declared.event["decision"], "declared");
+        assert_eq!(
+            declared.proc_authority.expect("unrestricted"),
+            ProcAuthority::Unrestricted
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2019,6 +2571,7 @@ mod tests {
             elapsed_ms: 1,
             writes: Vec::new(),
             writes_truncated: false,
+            receipts: Vec::new(),
         };
         let observation = model_observation_with_writes(
             2,
@@ -2046,6 +2599,7 @@ mod tests {
         };
         let request = ResolvedAccessRequest {
             targets: vec![target],
+            commands: Vec::new(),
             reason: "why".into(),
         };
         assert_eq!(request.displays(), vec!["/tmp/terrarium-target.txt"]);
@@ -2054,11 +2608,31 @@ mod tests {
 
     #[test]
     fn resolve_invocation_rejects_flag_combinations() {
-        assert!(resolve_invocation(true, true, &[]).is_err());
-        assert!(resolve_invocation(true, false, &["/tmp".into()]).is_err());
-        assert!(resolve_invocation(false, true, &["/tmp".into()]).is_err());
-        assert!(resolve_invocation(false, false, &[]).is_ok());
-        assert!(resolve_invocation(false, false, &["/definitely/not/a/real/path".into()]).is_err());
+        assert!(resolve_invocation(true, true, &[], &[], false).is_err());
+        assert!(resolve_invocation(true, false, &["/tmp".into()], &[], false).is_err());
+        assert!(resolve_invocation(false, true, &["/tmp".into()], &[], false).is_err());
+        assert!(resolve_invocation(false, false, &[], &[], false).is_ok());
+        assert!(resolve_invocation(false, false, &[], &[], true).is_ok());
+        assert!(resolve_invocation(
+            false,
+            false,
+            &["/definitely/not/a/real/path".into()],
+            &[],
+            false
+        )
+        .is_err());
+        // --allow-exec is likewise a planned-write-only grant
+        assert!(resolve_invocation(true, false, &[], &["sh".into()], false).is_err());
+        assert!(resolve_invocation(false, true, &[], &["sh".into()], false).is_err());
+        assert!(resolve_invocation(false, false, &[], &["sh".into()], false).is_ok());
+        assert!(resolve_invocation(
+            false,
+            false,
+            &[],
+            &["definitely-not-a-real-tool-xyz".into()],
+            false
+        )
+        .is_err());
     }
 
     #[test]
@@ -2083,13 +2657,14 @@ mod tests {
         );
         assert!(matches!(
             authority_from_journaled_decision(&inv, &action, "covered"),
-            Some(RunFilesystemAuthority::Scoped(_))
+            Some((RunFilesystemAuthority::Scoped(_), ProcAuthority::Allowed(_)))
         ));
-        let allowed = authority_from_journaled_decision(&inv, &action, "allow")
+        let (allowed, procs) = authority_from_journaled_decision(&inv, &action, "allow")
             .expect("allow rebuilds the frozen authority");
         assert!(allowed
             .authorize_write("display", &file.canonicalize().unwrap())
             .is_ok());
+        assert_eq!(procs, ProcAuthority::Allowed(Default::default()));
         // a mode change on resume never rebuilds authority from the journal: read-only
         // executes no pending run regardless of the recorded decision, and full-access does
         // not inherit a scoped planned-write decision
@@ -2102,7 +2677,10 @@ mod tests {
         assert!(authority_from_journaled_decision(&read_only, &action, "declared").is_none());
         assert_eq!(
             authority_from_journaled_decision(&full_access, &action, "declared"),
-            Some(RunFilesystemAuthority::FullAccess)
+            Some((
+                RunFilesystemAuthority::FullAccess,
+                ProcAuthority::Unrestricted
+            ))
         );
         // blocking decisions never rebuild
         for decision in ["deny", "cancel", "unavailable", "invalid"] {
@@ -2114,5 +2692,77 @@ mod tests {
         std::fs::create_dir(&file).unwrap();
         assert!(authority_from_journaled_decision(&inv, &action, "allow").is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn journaling_more_receipts_than_the_cap_leaves_a_visible_marker() {
+        // a journal is opened: serialize against other journal-holding tests
+        let _journal_guard = crate::session::tests::STATE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let state =
+            std::env::temp_dir().join(format!("terrarium-agent-receipts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let root = state.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("XDG_STATE_HOME", &state);
+        let mut journal = crate::session::Journal::create(&root).unwrap();
+        journal
+            .append(
+                "turn/start",
+                crate::session::turn_data(
+                    "test",
+                    "system",
+                    &crate::llm::test_profile(
+                        "openai-chat-completions",
+                        "https://example.test",
+                        "test-model",
+                    ),
+                    2,
+                    100,
+                    300,
+                ),
+            )
+            .unwrap();
+        journal
+            .append("model/request", serde_json::json!({"step":1,"attempt":1}))
+            .unwrap();
+        journal
+            .append(
+                "model/result",
+                serde_json::json!({"requestSeq":2,"ok":true,"content":"```run\nreturn 1\n```","action":{"kind":"run","source":"return 1\n","timeoutMs":1,"access":{"writes":[],"reason":""}}}),
+            )
+            .unwrap();
+        journal
+            .append("run/start", serde_json::json!({"modelResultSeq":3}))
+            .unwrap();
+        let receipts: Vec<serde_json::Value> = (0..RUN_RECEIPT_CAP + 5)
+            .map(|index| {
+                serde_json::json!({
+                    "method": "GET",
+                    "url": format!("https://example.test/{index}"),
+                    "status": 200,
+                    "bytes": 1,
+                })
+            })
+            .collect();
+        journal_receipts(&mut journal, Some(4), &receipts).unwrap();
+        let journaled = journal
+            .events
+            .iter()
+            .filter(|event| event.kind == "net/request")
+            .count();
+        assert_eq!(journaled, RUN_RECEIPT_CAP);
+        // the audit trail stays honest: what was dropped is counted, not hidden
+        let marker = journal
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "receipts/truncated")
+            .expect("truncation marker");
+        assert_eq!(marker.data["dropped"], serde_json::json!(5));
+        assert_eq!(marker.data["runSeq"], serde_json::json!(4));
+        drop(journal);
+        let _ = std::fs::remove_dir_all(&state);
     }
 }

@@ -23,29 +23,30 @@ A reply must contain exactly one closed `run` block. A missing block, an unclose
 
 ### The access block
 
-The `access` block is the write-preauthorization request. Its body is one strict JSON object with exactly two fields:
+The `access` block is the preauthorization request for writes and process creation. Its body is one strict JSON object with exactly three fields:
 
 ```json
-{"writes": ["/abs/path/file.md"], "reason": "why this run must write those files"}
+{"writes": ["/abs/path/file.md"], "commands": [{"exe": "cargo", "argv": ["test"]}], "reason": "why this run must write those files and run those commands"}
 ```
 
 - `writes` is an array of at most 32 absolute file paths. A target must be an exact file path: relative paths, `.`, `..`, empty or ambiguous `//` segments, trailing slashes, glob characters, directories, existing symbolic-link targets, and paths that duplicate an earlier entry after normalization are all rejected. Missing files are valid targets — approving one includes creating its missing parent directories.
-- `reason` is at most 200 characters. A non-empty `writes` array requires a non-empty `reason` in `planned-write` mode.
-- The whole encoded block is at most 4 KiB.
+- `commands` is an array of at most 8 records of the form `{"exe": NAME, "argv": [...], "cwd": "/abs/dir"}`. `argv` is an exact element-wise argument array — there is no shell in the spawn path — and `cwd` defaults to the session working root. The host resolves `exe` (PATH lookup for a bare name, canonicalization for a path) at approval time and again at call time; matching is resolved-identity equality plus argv equality plus cwd equality. Declarations that resolve to the same record are deduplicated. Both `host.proc.exec` and `host.proc.spawn` check against the same records.
+- `reason` is at most 200 characters. A non-empty `writes` or `commands` array requires a non-empty `reason` in `planned-write` mode.
+- The whole encoded block is at most 8 KiB.
 
-A run that will not write sends an empty request (or omits the block entirely):
+A run that will neither write nor launch a process sends an empty request (or omits the block entirely):
 
 ```json
-{"writes": [], "reason": ""}
+{"writes": [], "commands": [], "reason": ""}
 ```
 
-The block declares paths, not content: it is never a prompt to review what the program writes, and declaring a path grants nothing outside the current run. See [security.md](security.md) for the decision lifecycle.
+The block declares paths and command identities, not content: it is never a prompt to review what the program writes or what the process prints, and declaring either grants nothing outside the current run. See [security.md](security.md) for the decision lifecycle and [process-and-network.md](process-and-network.md) for the process capability contract.
 
 ### Authorization outcomes
 
-When an `access` block requests writes, one decision is made before any JavaScript starts, and it is journaled as a bounded `run/access` event carrying the resolved paths, the reason, and the decision:
+When an `access` block requests writes or commands, one decision covering the whole set is made before any JavaScript starts, and it is journaled as a bounded `run/access` event carrying the resolved write paths, the resolved command records, the reason, and the decision:
 
-- `covered` — every requested target already matches an operator `--allow-write` scope; no prompt, JavaScript runs.
+- `covered` — every requested write target already matches an operator `--allow-write` scope and every requested command's resolved executable matches an operator `--allow-exec` name; no prompt, JavaScript runs.
 - `allow` — the user approved the set as one decision; JavaScript runs.
 - `deny` / `cancel` — the user denied or cancelled the set; no JavaScript runs.
 - `unavailable` — no interactive authorizer exists (pipe, CI, background run); no JavaScript runs.
@@ -69,7 +70,18 @@ A run has two data channels. Program-provided data enters the next model context
 
 Every program is wrapped and evaluated as one async function body. Top-level `return` and `await` are therefore legal in every run. The kernel does not infer execution mode from source shape and does not use an implicit last-expression result.
 
-Each run uses a fresh QuickJS runtime with a 64 MiB heap, 1 MiB stack, bounded stdout, bounded host reads, and a validated deadline. There is no virtual path namespace: every path in a program is one absolute path in the operating-system user's filesystem view. Reads see exactly what the current OS user can read. Writes are checked against the invocation's frozen `RunFilesystemAuthority` — `read-only` denies every write, `planned-write` requires the resolved target identity to match an approved exact file or an operator-declared prefix, `full-access` keeps only path validation and the OS user's own permissions. That authority is fixed before QuickJS starts and cannot widen during the run.
+Each run uses a fresh QuickJS runtime with a 64 MiB heap, 1 MiB stack, bounded stdout, bounded host reads, and a validated deadline. There is no virtual path namespace: every path in a program is one absolute path in the operating-system user's filesystem view. Reads see exactly what the current OS user can read. Writes are checked against the invocation's frozen `RunFilesystemAuthority` and process creation against the frozen `ProcAuthority` — `read-only` denies every write and every process launch, `planned-write` requires the resolved write target to match an approved exact file or an operator-declared prefix and each command to match one of the run's approved records, `full-access` keeps only path validation and the OS user's own permissions. Both authorities are fixed before QuickJS starts and cannot widen during the run.
+
+## Processes and network
+
+`host.proc` and `host.net.fetch` are specified in [process-and-network.md](process-and-network.md). What belongs to this protocol is the journal surface: the host appends receipts as they happen, never stream data.
+
+- `run/spawn` — one per process creation through either `exec` or `spawn`: the resolved executable, argv, cwd, pid, and for `spawn` the handle and log path. It carries the creating run's `runSeq`.
+- `proc/exit` — one per process exit: handle (when the process had one), exit code, and a bounded output tail. Exits can arrive after their creating run ends.
+- `net/request` — one per fetch: method, final URL after redirects, response status, and response byte count, with the creating run's `runSeq`. A request that fails, times out, or is cancelled after dispatch is still journaled with status 0 — bytes may have left the machine. The request URL itself is capped at 8 KiB.
+- `receipts/truncated` — when a batch of receipts exceeds the per-batch journal cap (128), one marker counts the dropped receipts and names the run they belonged to. Truncation is never silent: the journal is the audit trail, and for fetch it is the only detection mechanism.
+
+The session table behind `host.proc` handles lives in host memory and never survives a restart: a handle that predates the current session reports `process_lost`, while its log file remains an ordinary readable session file. Session validators accept pre-existing `run/access` events without a `commands` field (it reads as empty) so existing journals replay unchanged.
 
 ## Runtime state
 
@@ -79,13 +91,15 @@ The system prompt begins with a byte-stable prefix: the same role text and host 
 <terrarium-runtime-state>
 ### Current runtime
 - Working root: `/home/me/proj`
+- Platform: `linux-x86_64`
 - Filesystem mode: `planned-write`
 - Default run timeout: 10000 ms (hard cap 300000 ms)
-- Installed host capabilities: `host.fs`
+- Live processes: `none`
+- Installed host capabilities: `host.fs, host.net, host.proc`
 </terrarium-runtime-state>
 ```
 
-Field names, order, and formatting are fixed. Values that could close the wrapper are escaped by the host. The block is historical text in the journal, never authority: a resumed session gets a fresh block for the current invocation's mode.
+Field names, order, and formatting are fixed. `Live processes` lists the handles and executables of currently running spawned processes, capped to one line and never their output. Values that could close the wrapper are escaped by the host. The block is historical text in the journal, never authority: a resumed session gets a fresh block for the current invocation's mode.
 
 ## Run result
 
@@ -125,6 +139,6 @@ The main model request is owned by the trusted outer agent loop. Each request us
 
 Requests stream over server-sent events under three wire protocols — `openai-chat-completions`, `openai-responses`, and `anthropic-messages` — with a per-attempt total timeout and an inter-chunk idle timeout. Assistant reasoning (DeepSeek-style `reasoning_content`, Responses encrypted reasoning items, or Anthropic signed thinking blocks) is journaled with each successful `model/result` and replayed on every later request in the shape its protocol requires; foreign payloads are skipped when a session resumes under a different protocol. Per-request token usage (net input, output, cache read, cache write, reasoning) is journaled alongside it and reported as a context-budget line against the profile's declared `context_window`.
 
-JavaScript has no `host.llm.call` or other in-program model-call primitive. The host surface is filesystem capabilities plus the tagged return protocol for continuing or handing off a turn. The configured model ID is sent unchanged to the provider endpoint. Requests are text-only; image file reading, encoding, and multimodal content parts are not implemented.
+JavaScript has no `host.llm.call` or other in-program model-call primitive. The host surface is filesystem capabilities, preauthorized process execution, and journaled network fetch, plus the tagged return protocol for continuing or handing off a turn. The configured model ID is sent unchanged to the provider endpoint. Requests are text-only; image file reading, encoding, and multimodal content parts are not implemented.
 
 TOML provider/profile configuration and durable JSONL sessions are implemented. The session stores no credential value and no authority: the filesystem mode and write scopes are selected by the current invocation and are never restored from the journal.
