@@ -1525,10 +1525,15 @@ mod tests {
         assert!(wrong.contains("\"argv\""), "{wrong}");
 
         assert!(ProcAuthority::Denied
-            .authorize("/bin/sh", &[], None, &root)
+            .authorize(&exe_alias(&exe), &[], None, &root)
             .is_err());
         assert!(ProcAuthority::Unrestricted
-            .authorize("/bin/sh", &["-c".into(), "anything".into()], None, &root)
+            .authorize(
+                &exe_alias(&exe),
+                &[switch.into(), "anything".into()],
+                None,
+                &root
+            )
             .is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
