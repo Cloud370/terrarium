@@ -1370,6 +1370,15 @@ mod tests {
         path
     }
 
+    /// The display spelling a model would use for a resolved executable: strips the
+    /// verbatim `\\?\` prefix Windows canonicalize() adds and normalizes separators.
+    fn exe_alias(exe: &std::path::Path) -> String {
+        let text = exe.to_string_lossy();
+        text.strip_prefix(r"\\?\")
+            .unwrap_or(&text)
+            .replace('\\', "/")
+    }
+
     #[test]
     fn head_tail_keeps_head_and_tail_with_omitted_count() {
         let mut cap = HeadTail::new();
@@ -1450,15 +1459,15 @@ mod tests {
 
     #[test]
     fn resolve_cwd_defaults_to_working_root() {
-        // production always passes an already-canonical working root; macOS temp
-        // dirs (/var -> /private/var) would otherwise differ from canonicalize()
-        let root = tmp_root("cwd").canonicalize().unwrap();
-        let dir = root.join("sub");
+        let raw_root = tmp_root("cwd");
+        let dir = raw_root.join("sub");
         std::fs::create_dir(&dir).unwrap();
-        assert_eq!(
-            resolve_cwd(None, &root).unwrap(),
-            root.canonicalize().unwrap()
-        );
+        // production always passes an already-canonical working root; macOS temp
+        // dirs (/var -> /private/var) would otherwise differ from canonicalize().
+        // The user-supplied cwd stays in display form: verbatim \\?\ paths are a
+        // canonicalize() output on Windows, not a valid model-side spelling.
+        let root = raw_root.canonicalize().unwrap();
+        assert_eq!(resolve_cwd(None, &root).unwrap(), root);
         assert_eq!(
             resolve_cwd(Some(&dir.to_string_lossy()), &root).unwrap(),
             dir.canonicalize().unwrap()
@@ -1475,27 +1484,25 @@ mod tests {
     fn authority_matching_is_identity_argv_and_cwd() {
         let root = tmp_root("authority").canonicalize().unwrap();
         #[cfg(unix)]
-        let exe = resolve_executable("/bin/sh").unwrap();
+        let (exe, switch) = (resolve_executable("/bin/sh").unwrap(), "-c");
         #[cfg(windows)]
-        let exe = resolve_executable("C:/Windows/System32/cmd.exe").unwrap();
+        let (exe, switch) = (
+            resolve_executable("C:/Windows/System32/cmd.exe").unwrap(),
+            "/c",
+        );
         let records = vec![CommandRecord {
             exe: exe.clone(),
-            argv: vec!["-c".into(), "echo hi".into()],
+            argv: vec![switch.into(), "echo hi".into()],
             cwd: root.clone(),
         }];
         let authority = ProcAuthority::Allowed(CommandSet {
             grants: Vec::new(),
             records,
         });
-        #[cfg(unix)]
-        let (ok_exe, ok_cwd) = authority
-            .authorize("/bin/sh", &["-c".into(), "echo hi".into()], None, &root)
-            .unwrap();
-        #[cfg(windows)]
         let (ok_exe, ok_cwd) = authority
             .authorize(
-                "C:/Windows/System32/cmd.exe",
-                &["/c".into(), "echo hi".into()],
+                &exe_alias(&exe),
+                &[switch.into(), "echo hi".into()],
                 None,
                 &root,
             )
@@ -1505,15 +1512,10 @@ mod tests {
 
         // argv mismatch, cwd mismatch, and undeclared executables all fail with the
         // corrective error carrying the expected record
-        #[cfg(unix)]
-        let wrong = authority
-            .authorize("/bin/sh", &["-c".into(), "echo bye".into()], None, &root)
-            .unwrap_err();
-        #[cfg(windows)]
         let wrong = authority
             .authorize(
-                "C:/Windows/System32/cmd.exe",
-                &["/c".into(), "echo bye".into()],
+                &exe_alias(&exe),
+                &[switch.into(), "echo bye".into()],
                 None,
                 &root,
             )
