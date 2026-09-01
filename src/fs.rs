@@ -75,6 +75,16 @@ impl WriteScope {
     /// an existing file an exact scope. Symlinked operands resolve to their target identity —
     /// the operator argument is trusted, unlike a model-declared target.
     pub fn from_operator_spec(spec: &str) -> Result<Self, String> {
+        // a DIR operand may carry the trailing separator that temp-dir APIs hand out
+        // (`--allow-write /tmp/`); strip it, but keep a bare root (`/`, `C:\`) — stripping
+        // that would leave a drive-relative path. Model-declared targets keep the strict
+        // exact-file form.
+        let stripped = spec.trim_end_matches(['/', '\\']);
+        let spec = if stripped.is_empty() || stripped.ends_with(':') {
+            spec
+        } else {
+            stripped
+        };
         let path = validate_user_path(spec, true)
             .map_err(|error| format!("--allow-write {spec}: {error}"))?;
         let (base, tail) =
@@ -253,13 +263,24 @@ pub(crate) fn validate_user_path(raw: &str, exact_file: bool) -> Result<PathBuf,
 
 /// Canonical identity for scope decisions: canonicalize the deepest existing ancestor, then
 /// rejoin the missing tail. Symlinked ancestors, macOS `/tmp` aliases, and Windows drive-letter
-/// and separator spellings collapse into one comparable form.
+/// and separator spellings collapse into one comparable form. Resolving through a file
+/// component is an error on every platform: Windows classifies it as `NotFound`, which would
+/// otherwise let the file itself canonicalize as the missing tail's anchor.
 pub(crate) fn resolve_existing(path: &Path) -> Result<(PathBuf, Vec<OsString>), String> {
     let mut probe = path.to_path_buf();
     let mut tail: Vec<OsString> = Vec::new();
     loop {
         match std::fs::canonicalize(&probe) {
-            Ok(canonical) => return Ok((canonical, tail)),
+            Ok(canonical) => {
+                if !tail.is_empty() && !canonical.is_dir() {
+                    return Err(format!(
+                        "cannot resolve {}: {} is not a directory",
+                        path.display(),
+                        canonical.display()
+                    ));
+                }
+                return Ok((canonical, tail));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let Some(name) = probe.file_name().map(OsString::from) else {
                     return Err(format!("cannot resolve {}: {error}", path.display()));
@@ -1490,25 +1511,28 @@ mod tests {
 
     #[test]
     fn user_paths_reject_ambiguous_and_relative_forms() {
-        assert!(validate_user_path("/tmp/x.txt", false).is_ok());
-        assert!(validate_user_path("/tmp/x.txt", true).is_ok());
+        // `/tmp/...` is not absolute on Windows; anchor the same lexical rules on the
+        // platform's own prefix shape
+        let base = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
+        assert!(validate_user_path(&format!("{base}/x.txt"), false).is_ok());
+        assert!(validate_user_path(&format!("{base}/x.txt"), true).is_ok());
         assert!(validate_user_path("rel/x.txt", false).is_err());
         assert!(validate_user_path("~/x.txt", false).is_err());
-        assert!(validate_user_path("/tmp/../x.txt", false).is_err());
-        assert!(validate_user_path("/tmp/./x.txt", false).is_err());
-        assert!(validate_user_path("/tmp//x.txt", false).is_err());
+        assert!(validate_user_path(&format!("{base}/../x.txt"), false).is_err());
+        assert!(validate_user_path(&format!("{base}/./x.txt"), false).is_err());
+        assert!(validate_user_path(&format!("{base}//x.txt"), false).is_err());
         #[cfg(not(windows))]
         assert!(validate_user_path(r"/tmp\x.txt", false).is_err());
         assert!(validate_user_path("", false).is_err());
         // exact-file rules: no trailing slash, no globs, not the root
-        assert!(validate_user_path("/tmp/dir/", true).is_err());
-        assert!(validate_user_path("/tmp/*.txt", true).is_err());
-        assert!(validate_user_path("/tmp/x?.txt", true).is_err());
-        assert!(validate_user_path("/", true).is_err());
+        assert!(validate_user_path(&format!("{base}/dir/"), true).is_err());
+        assert!(validate_user_path(&format!("{base}/*.txt"), true).is_err());
+        assert!(validate_user_path(&format!("{base}/x?.txt"), true).is_err());
+        assert!(validate_user_path(if cfg!(windows) { "C:/" } else { "/" }, true).is_err());
         // reads tolerate a trailing slash (directories are read roots)
         assert_eq!(
-            validate_user_path("/tmp/dir/", false).unwrap(),
-            PathBuf::from("/tmp/dir")
+            validate_user_path(&format!("{base}/dir/"), false).unwrap(),
+            PathBuf::from(format!("{base}/dir"))
         );
         // tildes and relative paths are named in the error the model sees
         let error = validate_user_path("~/x", false).unwrap_err();
@@ -1545,6 +1569,11 @@ mod tests {
         std::fs::write(root.join("f.txt"), "x").unwrap();
         let dir_scope = WriteScope::from_operator_spec(&display(&root.join("d"))).unwrap();
         let file_scope = WriteScope::from_operator_spec(&display(&root.join("f.txt"))).unwrap();
+        // a DIR operand may carry the trailing separator temp-dir APIs hand out
+        assert_eq!(
+            WriteScope::from_operator_spec(&format!("{}/", display(&root.join("d")))).unwrap(),
+            dir_scope
+        );
         match (&dir_scope, &file_scope) {
             (WriteScope::Prefix(dir), WriteScope::Exact(file)) => {
                 assert_eq!(*dir, root.join("d").canonicalize().unwrap());

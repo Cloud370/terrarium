@@ -297,7 +297,12 @@ mod tests {
         scoped.allow_write.push(root_display.clone());
         let authority = direct_run_authority(&scoped).unwrap();
         assert_eq!(authority.mode(), crate::fs::FilesystemMode::PlannedWrite);
-        let probe = root.join("terrarium-cli-scope-probe.txt");
+        // authorize_write takes the resolved identity: temp_dir() is symlinked on macOS
+        // (/var -> /private/var) and canonicalize() returns \\?\ forms on Windows
+        let probe = root
+            .canonicalize()
+            .unwrap()
+            .join("terrarium-cli-scope-probe.txt");
         assert!(authority
             .authorize_write(&probe.display().to_string(), &probe)
             .is_ok());
