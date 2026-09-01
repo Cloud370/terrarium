@@ -247,10 +247,18 @@ enum ChildKill {
     #[cfg(unix)]
     Group(u32),
     #[cfg(windows)]
-    Job(windows_sys::core::HANDLE),
+    Job(windows_sys::Win32::Foundation::HANDLE),
     #[allow(dead_code)]
     None,
 }
+
+// A HANDLE is an opaque kernel-object reference; job-object calls are thread-safe and
+// the guard discipline gives one owner, so moving it across threads is sound. Without
+// this, the raw pointer would make every table entry (and the pump future) !Send.
+#[cfg(windows)]
+unsafe impl Send for ChildKill {}
+#[cfg(windows)]
+unsafe impl Sync for ChildKill {}
 
 impl ChildKill {
     #[cfg(unix)]
@@ -305,6 +313,9 @@ impl ChildKill {
         #[cfg(windows)]
         if let Self::Job(job) = self {
             use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+            // job-object termination is already tree-wide; there is no separate
+            // graceful form to honor `force` with
+            let _ = force;
             unsafe {
                 TerminateJobObject(*job, 1);
             }
@@ -1439,7 +1450,9 @@ mod tests {
 
     #[test]
     fn resolve_cwd_defaults_to_working_root() {
-        let root = tmp_root("cwd");
+        // production always passes an already-canonical working root; macOS temp
+        // dirs (/var -> /private/var) would otherwise differ from canonicalize()
+        let root = tmp_root("cwd").canonicalize().unwrap();
         let dir = root.join("sub");
         std::fs::create_dir(&dir).unwrap();
         assert_eq!(
