@@ -187,7 +187,7 @@ Agent 程序使用上文的 tagged return 协议来继续交给模型或交还�
 - [文件系统授权](docs/filesystem-authorization.zh-CN.md)
 - [配置](docs/configuration.md)
 - [安全边界](docs/security.md)
-- [模型配置档与持久会话](docs/model-profiles-and-durable-sessions.md)
+- [模型配置档与持久会话](docs/model-profiles-and-durable-sessions.zh-CN.md)
 - [Web UI 集成边界](docs/web-ui.md)
 
 ## 许可证

@@ -31,7 +31,8 @@ Library core with thin presentation adapters:
 
 - `src/kernel.rs` — cage boundary: one fresh QuickJS cage per run, resource limits, `eval_js`. `src/lib.rs` exports `Kernel`, `RunFilesystemAuthority`, `Outcome` etc. for non-CLI callers.
 - `src/agent.rs` — outer agent loop, access/run fence parser (at most one `access` plus one `run` fence per model response), and the write-preauthorization lifecycle (`Authorizer` decision, frozen authority).
-- `src/fs.rs` — host filesystem capabilities over absolute OS-user paths and the frozen `RunFilesystemAuthority` write check. `host.fs.walk` and `host.fs.scan` share one traversal engine. `src/auth.rs` — access-block parsing/resolution, the `Authorizer` trait, operator-scope subtraction and freezing.
+- `src/fs.rs` — host filesystem capabilities over absolute OS-user paths and the frozen `RunFilesystemAuthority` write check. `host.fs.walk` and `host.fs.scan` share one traversal engine.
+- `src/auth.rs` — access-block parsing/resolution, the `Authorizer` trait, operator-scope subtraction and freezing.
 - `src/llm/` — streaming model transport for three wire protocols: `openai-chat-completions`, `openai-responses`, `anthropic-messages` (SSE in `sse.rs`, reasoning replay per protocol shape).
 - `src/session.rs` — durable append-only JSONL sessions; uncertain runs are never replayed.
 - `src/config.rs` — TOML model profiles.
@@ -70,7 +71,7 @@ Ground rules:
 
 ## Documentation
 
-Maintained specs live in `docs/` and are the project contract — update them in place when behavior changes: `protocol.md` (wire/execution protocol), `configuration.md` (TOML profiles), `security.md` (trust boundary), `model-profiles-and-durable-sessions.md`, `web-ui.md` (integration boundary). Read the relevant doc before touching the agent loop, protocol, session format, or host API surface.
+Maintained specs live in `docs/` and are the project contract — update them in place when behavior changes: `protocol.md` (wire/execution protocol), `filesystem-authorization.md` (normative filesystem access and write preauthorization; `protocol.md` and `security.md` summarize it), `configuration.md` (TOML profiles), `security.md` (trust boundary), `model-profiles-and-durable-sessions.md`, `web-ui.md` (integration boundary). Read the relevant doc before touching the agent loop, protocol, session format, filesystem authorization, or host API surface.
 
 ## Conventions
 
