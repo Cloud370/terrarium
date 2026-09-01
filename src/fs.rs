@@ -189,6 +189,15 @@ fn identity_under_prefix(identity: &Path, prefix: &Path) -> bool {
     }
 }
 
+/// A Windows drive-root spelling: one prefix letter, `:`, and the root separator (`C:/`).
+/// That separator is the root itself — stripping it leaves the drive-relative `C:`, which is
+/// never absolute on Windows. Recognized as a plain string shape on every platform, so the
+/// lexical rules stay testable where drive letters are ordinary file names.
+fn is_drive_root(normalized: &str) -> bool {
+    let bytes = normalized.as_bytes();
+    bytes.len() == 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
+}
+
 /// Lexical contract for every host.fs path: one absolute user path, unambiguous. Relative
 /// paths, `~`, `.`/`..` segments, `//`, and — where `\` is not a separator — backslashes are
 /// rejected before any filesystem access. `exact_file` additionally rejects trailing slashes
@@ -219,15 +228,18 @@ pub(crate) fn validate_user_path(raw: &str, exact_file: bool) -> Result<PathBuf,
         ));
     }
     // a single trailing slash is tolerated on read paths and normalized away; write targets
-    // reject it outright below
-    let trimmed = if normalized.len() > 1 {
+    // reject it outright below. A drive root keeps its separator (`C:/`): stripping it would
+    // leave the drive-relative `C:`, which is never absolute on Windows; elsewhere the shape
+    // still fails the absolute check below
+    let trimmed = if normalized.len() > 1 && !is_drive_root(&normalized) {
         normalized.trim_end_matches('/').to_string()
     } else {
         normalized.clone()
     };
+    let root_form = trimmed == "/" || is_drive_root(&trimmed);
     // string-level segment rules: `Path::components` silently normalizes `.` away, but the
-    // contract rejects dot segments outright
-    if trimmed != "/"
+    // contract rejects dot segments outright; a root form has no segments to check
+    if !root_form
         && trimmed
             .split('/')
             .skip(1)
@@ -242,7 +254,7 @@ pub(crate) fn validate_user_path(raw: &str, exact_file: bool) -> Result<PathBuf,
         return Err(format!("{raw}: not an absolute path"));
     }
     if exact_file {
-        if normalized.ends_with('/') && normalized.len() > 1 {
+        if normalized.ends_with('/') && normalized.len() > 1 && !is_drive_root(&normalized) {
             return Err(format!(
                 "{raw}: a write target must be an exact file path, not a directory"
             ));
@@ -252,7 +264,7 @@ pub(crate) fn validate_user_path(raw: &str, exact_file: bool) -> Result<PathBuf,
                 "{raw}: glob patterns are not write targets; declare the exact file path"
             ));
         }
-        if path.components().next().is_none() || trimmed == "/" {
+        if path.components().next().is_none() || root_form {
             return Err(format!(
                 "{raw}: a write target must be a file, not the filesystem root"
             ));
@@ -1539,6 +1551,27 @@ mod tests {
         assert!(error.contains("~"), "{error}");
         let error = validate_user_path("x/y", false).unwrap_err();
         assert!(error.contains("absolute"), "{error}");
+    }
+
+    #[test]
+    fn drive_roots_keep_their_separator_and_are_never_write_scopes() {
+        assert!(is_drive_root("C:/"));
+        assert!(is_drive_root("z:/"));
+        for shape in ["C:", "/", "/c:/", "C://", "CC:/", "1:/", "C:/x", ""] {
+            assert!(!is_drive_root(shape), "{shape:?}");
+        }
+        // the drive root is a readable root exactly on Windows; the bare drive-relative
+        // spelling is accepted nowhere
+        if cfg!(windows) {
+            assert!(validate_user_path("C:/", false).is_ok());
+            assert!(validate_user_path("C:\\", false).is_ok());
+        }
+        assert!(validate_user_path("C:", false).is_err());
+        // a bare root is not a write scope on any platform, and the error names the root —
+        // `--allow-write C:\` must not degrade into a "not an absolute path" confusion
+        let root = if cfg!(windows) { "C:\\" } else { "/" };
+        let error = WriteScope::from_operator_spec(root).unwrap_err();
+        assert!(error.contains("filesystem root"), "{error}");
     }
 
     #[test]
