@@ -903,8 +903,9 @@ fn interrupted_model_result(request: &Event) -> serde_json::Value {
     })
 }
 
-/// Rebuild the frozen authority for a run whose decision was already journaled. Historical
-/// decisions are not authority by themselves — the reconstructed set is re-resolved from the
+/// Rebuild the frozen authority for a run whose decision was already journaled — the
+/// crash-resume path between a durable `run/access` and its missing `run/start`. Historical
+/// decisions are not authority by themselves: the reconstructed set is re-resolved from the
 /// journaled request against the current invocation's operator scopes.
 fn authority_from_journaled_decision(
     inv: &Invocation,
@@ -920,6 +921,43 @@ fn authority_from_journaled_decision(
         },
         _ => None,
     }
+}
+
+/// Append `run/start` and execute the program under the frozen authority. Shared by the
+/// fresh-decision path and the crash-resume path; the journal keeps them indistinguishable.
+async fn start_and_execute_run(
+    journal: &mut Journal,
+    turn: &Event,
+    inv: &Invocation<'_>,
+    result: &Event,
+    authority: RunFilesystemAuthority,
+) -> Result<(), String> {
+    let run_seq = journal.append(
+        "run/start",
+        serde_json::json!({"modelResultSeq": result.seq}),
+    )?;
+    let limits = turn_timeouts(turn);
+    let turn_number = journal
+        .events
+        .iter()
+        .filter(|event| event.kind == "turn/start" && event.seq <= turn.seq)
+        .count() as u64;
+    let step = journal
+        .events
+        .iter()
+        .find(|event| event.seq == result.data["requestSeq"].as_u64().unwrap_or(0))
+        .and_then(|event| event.data["step"].as_u64())
+        .unwrap_or(1);
+    execute_run(
+        journal,
+        run_seq,
+        (turn_number, step),
+        &result.data["action"],
+        &authority,
+        limits,
+        &inv.state,
+    )
+    .await
 }
 
 async fn drive(journal: Journal, inv: &Invocation<'_>) -> i32 {
@@ -985,76 +1023,8 @@ async fn drive(journal: Journal, inv: &Invocation<'_>) -> i32 {
                 if last.data["ok"].as_bool() == Some(true)
                     && last.data["action"]["kind"] == "run" =>
             {
-                let existing_seq = journal.events.iter().find_map(|event| {
-                    (event.kind == "run/start"
-                        && event.data["modelResultSeq"].as_u64() == Some(last.seq))
-                    .then_some(event.seq)
-                });
-                if let Some(run_start_seq) = existing_seq {
-                    if !journal.events.iter().any(|event| {
-                        event.kind == "run/result"
-                            && event.data["runSeq"].as_u64() == Some(run_start_seq)
-                    }) && recover_unknown_run(&mut journal, run_start_seq).is_err()
-                    {
-                        return 1;
-                    }
-                    continue;
-                }
-                // a journaled decision is replay-aware: blocking decisions are final for
-                // this response, permissive ones rebuild the frozen authority
-                let authority = if let Some(access) = journal.events.iter().rev().find(|event| {
-                    event.kind == "run/access"
-                        && event.data["modelResultSeq"].as_u64() == Some(last.seq)
-                }) {
-                    match authority_from_journaled_decision(
-                        inv,
-                        &last.data["action"],
-                        access.data["decision"].as_str().unwrap_or_default(),
-                    ) {
-                        Some(authority) => authority,
-                        None => continue,
-                    }
-                } else {
-                    let turn_number = journal
-                        .events
-                        .iter()
-                        .filter(|event| event.kind == "turn/start" && event.seq <= turn.seq)
-                        .count() as u64;
-                    let step = journal
-                        .events
-                        .iter()
-                        .find(|event| event.seq == last.data["requestSeq"].as_u64().unwrap_or(0))
-                        .and_then(|event| event.data["step"].as_u64())
-                        .unwrap_or(1);
-                    let decision =
-                        authorize_run_access(inv, &last.data["action"], turn_number, step);
-                    let mut event = decision.event;
-                    if !event.is_null() {
-                        event["modelResultSeq"] = serde_json::json!(last.seq);
-                        if event.get("observation").and_then(|o| o.as_str()).is_some() {
-                            let observation = event["observation"]
-                                .as_str()
-                                .expect("observation string")
-                                .to_string();
-                            event["observation"] =
-                                serde_json::Value::String(inv.state.prepend(&observation));
-                        }
-                        if journal.append("run/access", event).is_err() {
-                            return 1;
-                        }
-                    }
-                    match decision.authority {
-                        Some(authority) => authority,
-                        None => continue,
-                    }
-                };
-                let run_seq = match journal
-                    .append("run/start", serde_json::json!({"modelResultSeq":last.seq}))
-                {
-                    Ok(seq) => seq,
-                    Err(_) => return 1,
-                };
-                let limits = turn_timeouts(&turn);
+                // the model result is the last event, so no run/access or run/start for it
+                // exists yet: decide now, journal the decision, then start the run
                 let turn_number = journal
                     .events
                     .iter()
@@ -1066,21 +1036,67 @@ async fn drive(journal: Journal, inv: &Invocation<'_>) -> i32 {
                     .find(|event| event.seq == last.data["requestSeq"].as_u64().unwrap_or(0))
                     .and_then(|event| event.data["step"].as_u64())
                     .unwrap_or(1);
-                match execute_run(
-                    &mut journal,
-                    run_seq,
-                    (turn_number, step),
-                    &last.data["action"],
-                    &authority,
-                    limits,
-                    &inv.state,
-                )
-                .await
+                let decision = authorize_run_access(inv, &last.data["action"], turn_number, step);
+                let mut event = decision.event;
+                if !event.is_null() {
+                    event["modelResultSeq"] = serde_json::json!(last.seq);
+                    if event.get("observation").and_then(|o| o.as_str()).is_some() {
+                        let observation = event["observation"]
+                            .as_str()
+                            .expect("observation string")
+                            .to_string();
+                        event["observation"] =
+                            serde_json::Value::String(inv.state.prepend(&observation));
+                    }
+                    if journal.append("run/access", event).is_err() {
+                        return 1;
+                    }
+                }
+                let Some(authority) = decision.authority else {
+                    continue;
+                };
+                if start_and_execute_run(&mut journal, &turn, inv, &last, authority)
+                    .await
+                    .is_err()
                 {
-                    Ok(()) => {}
-                    Err(_) => return 1,
+                    return 1;
                 }
                 continue;
+            }
+            // A durable decision is the resume point for a crash between approval and
+            // run/start. Blocking decisions already carry their observation — the next
+            // model step proceeds from it. A permissive decision rebuilds the frozen
+            // authority and starts the run here: its first and only execution, because no
+            // run/start exists. Paths that no longer resolve fall through to the next
+            // model step, whose fresh decision surfaces the changed filesystem state.
+            "run/access" => {
+                let blocking = matches!(
+                    last.data["decision"].as_str(),
+                    Some("deny" | "cancel" | "unavailable" | "invalid")
+                );
+                let result_seq = last.data["modelResultSeq"].as_u64();
+                if !blocking {
+                    if let Some(result) = journal
+                        .events
+                        .iter()
+                        .find(|event| Some(event.seq) == result_seq && event.kind == "model/result")
+                        .cloned()
+                    {
+                        if let Some(authority) = authority_from_journaled_decision(
+                            inv,
+                            &result.data["action"],
+                            last.data["decision"].as_str().unwrap_or_default(),
+                        ) {
+                            if start_and_execute_run(&mut journal, &turn, inv, &result, authority)
+                                .await
+                                .is_err()
+                            {
+                                return 1;
+                            }
+                            continue;
+                        }
+                    }
+                }
             }
             "run/start" => {
                 if !journal.events.iter().any(|event| {
@@ -1162,14 +1178,14 @@ fn read_message(args: &[String]) -> Result<String, String> {
     Ok(args.join(" "))
 }
 
-fn parse_invocation<'a>(
+/// Flag-conflict check plus operator-scope resolution: everything about an invocation that
+/// can fail. Runs before any durable state exists, so a rejected launch leaves no session
+/// behind.
+fn resolve_invocation(
     read_only: bool,
     full_access: bool,
     allow_write: &[String],
-    working_root: String,
-    timeout: u64,
-    authorizer: &'a dyn Authorizer,
-) -> Result<Invocation<'a>, String> {
+) -> Result<(FilesystemMode, Vec<WriteScope>), String> {
     if read_only && full_access {
         return Err("--read-only and --full-access are mutually exclusive".into());
     }
@@ -1191,12 +1207,22 @@ fn parse_invocation<'a>(
     for spec in allow_write {
         operator_scopes.push(WriteScope::from_operator_spec(spec)?);
     }
-    Ok(Invocation {
+    Ok((mode, operator_scopes))
+}
+
+fn invocation<'a>(
+    mode: FilesystemMode,
+    operator_scopes: Vec<WriteScope>,
+    working_root: String,
+    timeout: u64,
+    authorizer: &'a dyn Authorizer,
+) -> Invocation<'a> {
+    Invocation {
         mode,
         operator_scopes,
         state: RuntimeState::new(working_root, mode, timeout),
         authorizer,
-    })
+    }
 }
 
 pub async fn run_cli(args: &[String], authorizer: &dyn Authorizer) -> i32 {
@@ -1294,6 +1320,15 @@ pub async fn run_cli(args: &[String], authorizer: &dyn Authorizer) -> i32 {
             return 0;
         }
     }
+    // validate the launch before touching durable state: a bad flag combination or an
+    // unresolvable --allow-write scope must not leave a fresh session behind
+    let (mode, operator_scopes) = match resolve_invocation(read_only, full, &allow_write) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("terrarium: {e}");
+            return 2;
+        }
+    };
     let mut journal = if let Some(id) = &resume {
         match Journal::open(id) {
             Ok(j) => j,
@@ -1319,13 +1354,7 @@ pub async fn run_cli(args: &[String], authorizer: &dyn Authorizer) -> i32 {
         }
     };
     let root = journal.header.working_root.display_path.clone();
-    let inv = match parse_invocation(read_only, full, &allow_write, root, timeout, authorizer) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("terrarium: {e}");
-            return 2;
-        }
-    };
+    let inv = invocation(mode, operator_scopes, root, timeout, authorizer);
     if journal.open_turn().is_some() {
         if !message.is_empty() || profile.is_some() || config_path.is_some() {
             eprintln!(
@@ -2016,36 +2045,49 @@ mod tests {
     }
 
     #[test]
-    fn parse_invocation_rejects_flag_combinations() {
-        let authorizer = FixedAuthorizer(Decision::Deny);
-        assert!(parse_invocation(true, true, &[], "/tmp".into(), 10_000, &authorizer).is_err());
-        assert!(parse_invocation(
-            true,
-            false,
-            &["/tmp".into()],
-            "/tmp".into(),
-            10_000,
-            &authorizer
-        )
-        .is_err());
-        assert!(parse_invocation(
-            false,
-            true,
-            &["/tmp".into()],
-            "/tmp".into(),
-            10_000,
-            &authorizer
-        )
-        .is_err());
-        assert!(parse_invocation(false, false, &[], "/tmp".into(), 10_000, &authorizer).is_ok());
-        assert!(parse_invocation(
-            false,
-            false,
-            &["/definitely/not/a/real/path".into()],
-            "/tmp".into(),
-            10_000,
-            &authorizer
-        )
-        .is_err());
+    fn resolve_invocation_rejects_flag_combinations() {
+        assert!(resolve_invocation(true, true, &[]).is_err());
+        assert!(resolve_invocation(true, false, &["/tmp".into()]).is_err());
+        assert!(resolve_invocation(false, true, &["/tmp".into()]).is_err());
+        assert!(resolve_invocation(false, false, &[]).is_ok());
+        assert!(resolve_invocation(false, false, &["/definitely/not/a/real/path".into()]).is_err());
+    }
+
+    #[test]
+    fn journaled_decisions_rebuild_authority_or_block_on_resume() {
+        let root = std::env::temp_dir().join("terrarium-auth-resume");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("f.txt");
+        std::fs::write(&file, "x").unwrap();
+        let display = file.to_string_lossy().replace('\\', "/");
+        // the invocation's operator scopes cover a different tree, so an "allow" rebuild
+        // must add the approved exact path itself
+        let inv = invocation_with(FilesystemMode::PlannedWrite, Decision::Allow);
+        let action = run_action(std::slice::from_ref(&display), "edit");
+
+        assert_eq!(
+            authority_from_journaled_decision(&inv, &action, "declared"),
+            Some(RunFilesystemAuthority::FullAccess)
+        );
+        assert!(matches!(
+            authority_from_journaled_decision(&inv, &action, "covered"),
+            Some(RunFilesystemAuthority::Scoped(_))
+        ));
+        let allowed = authority_from_journaled_decision(&inv, &action, "allow")
+            .expect("allow rebuilds the frozen authority");
+        assert!(allowed
+            .authorize_write("display", &file.canonicalize().unwrap())
+            .is_ok());
+        // blocking decisions never rebuild
+        for decision in ["deny", "cancel", "unavailable", "invalid"] {
+            assert!(authority_from_journaled_decision(&inv, &action, decision).is_none());
+        }
+        // a target that no longer resolves (it became a directory) rebuilds nothing —
+        // the resume path falls through to a fresh decision instead
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(authority_from_journaled_decision(&inv, &action, "allow").is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
