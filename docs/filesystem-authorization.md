@@ -259,7 +259,7 @@ The host continues to own regular-file checks, decoding rules, bounded reads, tr
 
 ## 9. Sessions, recovery, and authority
 
-A runtime-state snapshot may appear in durable model-visible history so later requests can preserve the exact message prefix. It remains historical text, not authority. On resume, the trusted caller selects a fresh invocation mode and the next user-role message carries that current state.
+A runtime-state snapshot may appear in durable model-visible history so later requests can preserve the exact message prefix. It remains historical text, not authority. On resume, the trusted caller selects a fresh invocation mode and the next user-role message carries that current state. A journaled permissive decision takes effect only when the resumed invocation runs the mode that produced it; changing the mode drops any pending decision to a fresh model step.
 
 Each access request and its decision are journaled as one bounded `run/access` event carrying the resolved paths, the reason, and the decision — including declarations accepted and ignored under `full-access`. The journal is an audit record, never authority.
 

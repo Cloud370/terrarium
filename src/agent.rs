@@ -906,19 +906,26 @@ fn interrupted_model_result(request: &Event) -> serde_json::Value {
 /// Rebuild the frozen authority for a run whose decision was already journaled — the
 /// crash-resume path between a durable `run/access` and its missing `run/start`. Historical
 /// decisions are not authority by themselves: the reconstructed set is re-resolved from the
-/// journaled request against the current invocation's operator scopes.
+/// journaled request against the current invocation's mode and operator scopes. A journaled
+/// decision only carries when the resumed invocation runs the mode that produced it — a
+/// read-only resume never executes an approved planned-write run, and a full-access resume
+/// does not inherit a scoped decision; a mode change drops the pending run to a fresh model
+/// step.
 fn authority_from_journaled_decision(
     inv: &Invocation,
     action: &serde_json::Value,
     decision: &str,
 ) -> Option<RunFilesystemAuthority> {
-    match decision {
-        "declared" => Some(RunFilesystemAuthority::FullAccess),
-        "covered" => Some(freeze_authority(&inv.operator_scopes, &[])),
-        "allow" => match resolve_access_request(&access_block_of(action), inv.mode) {
-            Ok(resolved) => Some(freeze_authority(&inv.operator_scopes, &resolved.targets)),
-            Err(_) => None,
-        },
+    match (inv.mode, decision) {
+        (FilesystemMode::FullAccess, "declared") => Some(RunFilesystemAuthority::FullAccess),
+        (FilesystemMode::PlannedWrite, "covered") => {
+            Some(freeze_authority(&inv.operator_scopes, &[]))
+        }
+        (FilesystemMode::PlannedWrite, "allow") => {
+            resolve_access_request(&access_block_of(action), inv.mode)
+                .ok()
+                .map(|resolved| freeze_authority(&inv.operator_scopes, &resolved.targets))
+        }
         _ => None,
     }
 }
@@ -1067,8 +1074,9 @@ async fn drive(journal: Journal, inv: &Invocation<'_>) -> i32 {
             // run/start. Blocking decisions already carry their observation — the next
             // model step proceeds from it. A permissive decision rebuilds the frozen
             // authority and starts the run here: its first and only execution, because no
-            // run/start exists. Paths that no longer resolve fall through to the next
-            // model step, whose fresh decision surfaces the changed filesystem state.
+            // run/start exists. Paths that no longer resolve, and decisions journaled under
+            // a mode other than the current invocation's, fall through to the next model
+            // step, whose fresh decision surfaces the changed state.
             "run/access" => {
                 let blocking = matches!(
                     last.data["decision"].as_str(),
@@ -2066,9 +2074,12 @@ mod tests {
         let inv = invocation_with(FilesystemMode::PlannedWrite, Decision::Allow);
         let action = run_action(std::slice::from_ref(&display), "edit");
 
+        // "declared" is journaled only under full-access: it rebuilds nothing in a
+        // planned-write invocation — the mode gate blocks the scoped-to-full escalation in
+        // both directions
         assert_eq!(
             authority_from_journaled_decision(&inv, &action, "declared"),
-            Some(RunFilesystemAuthority::FullAccess)
+            None
         );
         assert!(matches!(
             authority_from_journaled_decision(&inv, &action, "covered"),
@@ -2079,6 +2090,20 @@ mod tests {
         assert!(allowed
             .authorize_write("display", &file.canonicalize().unwrap())
             .is_ok());
+        // a mode change on resume never rebuilds authority from the journal: read-only
+        // executes no pending run regardless of the recorded decision, and full-access does
+        // not inherit a scoped planned-write decision
+        let read_only = invocation_with(FilesystemMode::ReadOnly, Decision::Deny);
+        let full_access = invocation_with(FilesystemMode::FullAccess, Decision::Deny);
+        for other in [&read_only, &full_access] {
+            assert!(authority_from_journaled_decision(other, &action, "allow").is_none());
+            assert!(authority_from_journaled_decision(other, &action, "covered").is_none());
+        }
+        assert!(authority_from_journaled_decision(&read_only, &action, "declared").is_none());
+        assert_eq!(
+            authority_from_journaled_decision(&full_access, &action, "declared"),
+            Some(RunFilesystemAuthority::FullAccess)
+        );
         // blocking decisions never rebuild
         for decision in ["deny", "cancel", "unavailable", "invalid"] {
             assert!(authority_from_journaled_decision(&inv, &action, decision).is_none());
