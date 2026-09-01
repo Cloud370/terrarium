@@ -248,8 +248,6 @@ enum ChildKill {
     Group(u32),
     #[cfg(windows)]
     Job(windows_sys::Win32::Foundation::HANDLE),
-    #[allow(dead_code)]
-    None,
 }
 
 // A HANDLE is an opaque kernel-object reference; job-object calls are thread-safe and
@@ -303,15 +301,20 @@ impl ChildKill {
     /// Terminate the tree: graceful (SIGTERM) by default, forced (SIGKILL /
     /// TerminateJobObject) with `force`. Idempotent.
     fn kill(&self, force: bool) {
+        // the enum carries exactly one variant per platform, so the binding is direct
         #[cfg(unix)]
-        if let Self::Group(pid) = self {
+        let Self::Group(pid) = self;
+        #[cfg(windows)]
+        let Self::Job(job) = self;
+        #[cfg(unix)]
+        {
             let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
             unsafe {
                 libc::killpg(*pid as libc::pid_t, sig);
             }
         }
         #[cfg(windows)]
-        if let Self::Job(job) = self {
+        {
             use windows_sys::Win32::System::JobObjects::TerminateJobObject;
             // job-object termination is already tree-wide; there is no separate
             // graceful form to honor `force` with
@@ -327,10 +330,9 @@ impl ChildKill {
 impl Drop for ChildKill {
     fn drop(&mut self) {
         use windows_sys::Win32::Foundation::CloseHandle;
-        if let Self::Job(job) = *self {
-            unsafe {
-                CloseHandle(job);
-            }
+        let Self::Job(job) = *self;
+        unsafe {
+            CloseHandle(job);
         }
     }
 }
@@ -363,15 +365,6 @@ impl Drop for KillGuard {
             kill.kill(true);
         }
     }
-}
-
-/// Resolves to true once the run's cancellation flag is set. `watch::Receiver::changed`
-/// is cancel-safe, so host futures can race it against their own completion.
-pub(crate) async fn cancelled(cancel: &mut watch::Receiver<bool>) {
-    if *cancel.borrow() {
-        return;
-    }
-    let _ = cancel.changed().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -927,7 +920,7 @@ async fn output_next(
                     let _ = changed.borrow_and_update();
                 }
             }
-            _ = cancelled(cancel) => return Ok(Vec::new()),
+            _ = crate::kernel::cancelled(cancel) => return Ok(Vec::new()),
         }
     }
 }
@@ -990,7 +983,7 @@ async fn run_exec(
             );
             child.wait().await
         } => status,
-        _ = cancelled(cancel) => {
+        _ = crate::kernel::cancelled(cancel) => {
             return Err(
                 "the run ended before the command completed; the child's process group was \
                  killed"
@@ -1113,7 +1106,7 @@ async fn run_wait<'js>(
                     let _ = watch_rx.borrow_and_update();
                 }
             }
-            _ = cancelled(cancel) => {
+            _ = crate::kernel::cancelled(cancel) => {
                 return Err(format!(
                     "the run deadline expired while waiting for process {id}; the process \
                      keeps running"

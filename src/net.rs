@@ -47,13 +47,6 @@ fn js_err(msg: String) -> rquickjs::Error {
     }
 }
 
-pub(crate) async fn cancelled(cancel: &mut watch::Receiver<bool>) {
-    if *cancel.borrow() {
-        return;
-    }
-    let _ = cancel.changed().await;
-}
-
 fn validate_url(raw: &str) -> Result<url::Url, String> {
     if raw.len() > URL_CAP {
         return Err(format!("the URL exceeds the {URL_CAP}-byte limit"));
@@ -190,7 +183,7 @@ fn body_next<'a>(
                     Ok(Ok(chunk)) => chunk,
                 }
             }
-            _ = cancelled(cancel) => return Ok(Vec::new()),
+            _ = crate::kernel::cancelled(cancel) => return Ok(Vec::new()),
         };
         let Some(bytes) = chunk else {
             state.borrow_mut().done = true;
@@ -354,7 +347,7 @@ async fn run_fetch<'js>(
                 Ok(Ok(response)) => response,
             }
         }
-        _ = cancelled(&mut cancel_rx) => {
+        _ = crate::kernel::cancelled(&mut cancel_rx) => {
             push_failed_request(receipts, &method, url.as_str());
             return Err("the run ended before the response arrived".into());
         }

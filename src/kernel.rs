@@ -174,6 +174,16 @@ fn value_to_json<'js>(
 }
 
 /// One call = one fresh cage. Conversation state stays outside so a dead run never takes the session with it.
+/// Resolves once the run's cancellation flag is set. `watch::Receiver::changed` is
+/// cancel-safe, so host capabilities race it against their own completion instead of
+/// blocking the run's teardown past the grace window.
+pub(crate) async fn cancelled(cancel: &mut watch::Receiver<bool>) {
+    if *cancel.borrow() {
+        return;
+    }
+    let _ = cancel.changed().await;
+}
+
 pub(crate) async fn eval_js(
     code: &str,
     timeout_ms: u64,

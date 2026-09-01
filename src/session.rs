@@ -519,6 +519,26 @@ fn validate_command_records(commands: &Value, seq: u64, label: &str) -> Result<(
     Ok(())
 }
 
+/// A receipt that names a run must reference a `run/start` of the current turn: receipts
+/// cannot be attributed to a finished turn's run, and the referenced run must exist.
+fn ensure_run_of_current_turn(prior: &[Event], run_seq: u64, seq: u64) -> Result<(), String> {
+    let current_turn_seq = prior
+        .iter()
+        .rfind(|item| item.kind == "turn/start")
+        .map(|item| item.seq)
+        .unwrap_or(0);
+    if run_seq <= current_turn_seq {
+        return Err(format!("event {seq} references a run from another turn",));
+    }
+    if !prior
+        .iter()
+        .any(|item| item.kind == "run/start" && item.seq == run_seq)
+    {
+        return Err(format!("event {seq} references missing run {run_seq}"));
+    }
+    Ok(())
+}
+
 fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
     let open = has_open(prior);
     if event.kind != "turn/start" && !open {
@@ -1001,26 +1021,7 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
             if run_seq == 0 {
                 return Err(format!("event {} runSeq must be positive", event.seq));
             }
-            let current_turn_seq = prior
-                .iter()
-                .rfind(|item| item.kind == "turn/start")
-                .map(|item| item.seq)
-                .unwrap_or(0);
-            if run_seq <= current_turn_seq {
-                return Err(format!(
-                    "event {} references a run from another turn",
-                    event.seq
-                ));
-            }
-            if !prior
-                .iter()
-                .any(|item| item.kind == "run/start" && item.seq == run_seq)
-            {
-                return Err(format!(
-                    "event {} references missing run {run_seq}",
-                    event.seq
-                ));
-            }
+            ensure_run_of_current_turn(prior, run_seq, event.seq)?;
             if prior.iter().any(|item| {
                 item.kind == "run/result" && item.data["runSeq"].as_u64() == Some(run_seq)
             }) {
@@ -1215,26 +1216,7 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
                 "run/spawn data",
             )?;
             let run_seq = positive_u64(data, "runSeq", event.seq, "run/spawn data")?;
-            let current_turn_seq = prior
-                .iter()
-                .rfind(|item| item.kind == "turn/start")
-                .map(|item| item.seq)
-                .unwrap_or(0);
-            if run_seq <= current_turn_seq {
-                return Err(format!(
-                    "event {} references a run from another turn",
-                    event.seq
-                ));
-            }
-            if !prior
-                .iter()
-                .any(|item| item.kind == "run/start" && item.seq == run_seq)
-            {
-                return Err(format!(
-                    "event {} references missing run {run_seq}",
-                    event.seq
-                ));
-            }
+            ensure_run_of_current_turn(prior, run_seq, event.seq)?;
             string_field(data, "exe", event.seq, "run/spawn data")?;
             let argv = data.get("argv").and_then(Value::as_array).ok_or_else(|| {
                 format!(
@@ -1310,26 +1292,7 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
                 "net/request data",
             )?;
             let run_seq = positive_u64(data, "runSeq", event.seq, "net/request data")?;
-            let current_turn_seq = prior
-                .iter()
-                .rfind(|item| item.kind == "turn/start")
-                .map(|item| item.seq)
-                .unwrap_or(0);
-            if run_seq <= current_turn_seq {
-                return Err(format!(
-                    "event {} references a run from another turn",
-                    event.seq
-                ));
-            }
-            if !prior
-                .iter()
-                .any(|item| item.kind == "run/start" && item.seq == run_seq)
-            {
-                return Err(format!(
-                    "event {} references missing run {run_seq}",
-                    event.seq
-                ));
-            }
+            ensure_run_of_current_turn(prior, run_seq, event.seq)?;
             string_field(data, "method", event.seq, "net/request data")?;
             string_field(data, "url", event.seq, "net/request data")?;
             if data["status"].as_u64().is_none() {
@@ -1355,27 +1318,14 @@ fn validate_event(event: &Event, prior: &[Event]) -> Result<(), String> {
                 "receipts/truncated data",
             )?;
             positive_u64(data, "dropped", event.seq, "receipts/truncated data")?;
-            if let Some(run_seq) = data.get("runSeq").and_then(Value::as_u64) {
-                let current_turn_seq = prior
-                    .iter()
-                    .rfind(|item| item.kind == "turn/start")
-                    .map(|item| item.seq)
-                    .unwrap_or(0);
-                if run_seq <= current_turn_seq {
-                    return Err(format!(
-                        "event {} references a run from another turn",
+            if let Some(run_seq) = data.get("runSeq") {
+                let run_seq = run_seq.as_u64().filter(|seq| *seq > 0).ok_or_else(|| {
+                    format!(
+                        "event {} receipts/truncated runSeq must be a positive integer",
                         event.seq
-                    ));
-                }
-                if !prior
-                    .iter()
-                    .any(|item| item.kind == "run/start" && item.seq == run_seq)
-                {
-                    return Err(format!(
-                        "event {} references missing run {run_seq}",
-                        event.seq
-                    ));
-                }
+                    )
+                })?;
+                ensure_run_of_current_turn(prior, run_seq, event.seq)?;
             }
         }
         "turn/end" => {

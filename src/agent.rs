@@ -30,7 +30,9 @@ const ROLE_TEMPLATE: &str = include_str!("prompts/main.md");
 const RUN_TIMEOUT_DEFAULT_MS: u64 = 10_000;
 const DEFAULT_MAX_STEPS: u64 = 256;
 const FEEDBACK_CAP: usize = 24 * 1024;
-/// One run journals at most this many capability receipts; later ones are dropped.
+/// One run journals at most this many capability receipts; later ones are dropped. A
+/// handle-bearing receipt (a `spawn` anchor) is exempt: handles are bounded by the
+/// process table, and dropping one would strand its `proc/exit` on the validator.
 const RUN_RECEIPT_CAP: usize = 128;
 
 /// The invocation-local facts rendered at the head of every newly emitted user-role message.
@@ -576,14 +578,18 @@ async fn execute_run(
 /// runSeq; `proc/exit` records are run-independent. The journal never stores stream data
 /// beyond the bounded receipt tails. Truncation is never silent: a `receipts/truncated`
 /// event counts what was dropped, because the journal is the audit trail (and the only
-/// detection mechanism for `net/request` egress).
+/// detection mechanism for `net/request` egress). A handle-bearing receipt is never
+/// capped: it is the anchor a later `proc/exit` resolves its handle against, and handles
+/// are bounded by the process table, so dropping one would strand its exit receipt on the
+/// validator.
 fn journal_receipts(
     journal: &mut Journal,
     run_seq: Option<u64>,
     receipts: &[serde_json::Value],
 ) -> Result<(), String> {
-    let dropped = receipts.len().saturating_sub(RUN_RECEIPT_CAP);
-    for receipt in receipts.iter().take(RUN_RECEIPT_CAP) {
+    let mut journaled = 0;
+    let mut dropped = 0;
+    for receipt in receipts {
         let (kind, mut data) = match (
             receipt.get("handle"),
             receipt.get("status"),
@@ -609,6 +615,14 @@ fn journal_receipts(
                 }
                 data = serde_json::Value::Object(ordered);
             }
+        }
+        let anchored = data.get("handle").is_some();
+        if !anchored {
+            if journaled >= RUN_RECEIPT_CAP {
+                dropped += 1;
+                continue;
+            }
+            journaled += 1;
         }
         journal.append(kind, data)?;
     }
@@ -2762,6 +2776,83 @@ mod tests {
             .expect("truncation marker");
         assert_eq!(marker.data["dropped"], serde_json::json!(5));
         assert_eq!(marker.data["runSeq"], serde_json::json!(4));
+        drop(journal);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn the_cap_never_drops_a_spawn_anchor_receipt() {
+        // a journal is opened: serialize against other journal-holding tests
+        let _journal_guard = crate::session::tests::STATE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let state =
+            std::env::temp_dir().join(format!("terrarium-agent-anchors-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let root = state.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("XDG_STATE_HOME", &state);
+        let mut journal = crate::session::Journal::create(&root).unwrap();
+        journal
+            .append(
+                "turn/start",
+                crate::session::turn_data(
+                    "test",
+                    "system",
+                    &crate::llm::test_profile(
+                        "openai-chat-completions",
+                        "https://example.test",
+                        "test-model",
+                    ),
+                    2,
+                    100,
+                    300,
+                ),
+            )
+            .unwrap();
+        journal
+            .append("model/request", serde_json::json!({"step":1,"attempt":1}))
+            .unwrap();
+        journal
+            .append(
+                "model/result",
+                serde_json::json!({"requestSeq":2,"ok":true,"content":"```run\nreturn 1\n```","action":{"kind":"run","source":"return 1\n","timeoutMs":1,"access":{"writes":[],"reason":""}}}),
+            )
+            .unwrap();
+        journal
+            .append("run/start", serde_json::json!({"modelResultSeq":3}))
+            .unwrap();
+        // a busy run exhausts the cap with exec receipts, then spawns one process: the
+        // handle-bearing receipt must survive the cap, or the process's later exit
+        // receipt would fail validation and abort the session
+        let mut receipts: Vec<serde_json::Value> = Vec::new();
+        for _ in 0..RUN_RECEIPT_CAP + 1 {
+            receipts.push(serde_json::json!({"code": 0, "tail": "hi"}));
+        }
+        receipts.push(serde_json::json!({
+            "exe": "/bin/sh", "argv": ["-c", "sleep 0.1"], "cwd": "/tmp", "pid": 4242,
+            "handle": "p1", "log": "/state/terrarium/sessions/s/procs/p1.log",
+        }));
+        journal_receipts(&mut journal, Some(4), &receipts).unwrap();
+        assert!(journal
+            .events
+            .iter()
+            .any(|event| event.kind == "run/spawn" && event.data["handle"].as_str() == Some("p1")));
+        // the marker still counts exactly the capped receipts — here just the one exec
+        // exit beyond the cap, not the exempt spawn anchor
+        let marker = journal
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "receipts/truncated")
+            .expect("truncation marker");
+        assert_eq!(marker.data["dropped"], serde_json::json!(1));
+        // the anchored exit receipt journals cleanly instead of failing validation
+        journal_exit_receipts(
+            &mut journal,
+            &[serde_json::json!({"handle": "p1", "code": 0, "tail": ""})],
+        )
+        .unwrap();
         drop(journal);
         let _ = std::fs::remove_dir_all(&state);
     }

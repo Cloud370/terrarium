@@ -155,9 +155,11 @@ Process creation is a write-class effect — a child is not bound by write scope
 
 One honest warning belongs in the operator docs: an executable that loads project code — build tools (`cargo`, `npm`, `make`) as much as interpreters (`sh`, `node`, `python`) — turns the workspace into its program. Since the model can write into the workspace through authorized writes, allowing such an executable approaches full trust for it. There is no blacklist; the display and this rule are the defense.
 
+The environment is part of that trust: children inherit the full host process environment — every credential Terrarium keeps out of the cage by env-var name included — so any approved executable can read those values, and an approved `sh -c env` prints them into a spawn log the model can read back. The approval display shows exe, argv, and cwd; the inherited environment is invisible in it and must be assumed as part of what approving means.
+
 ### 8.4 Display quality
 
-The approval prompt renders each command as the exact argv with the executable resolved, the working directory, and the reason — the same "what you read is what runs" guarantee the filesystem proposal gives for writes. With no shell, no environment setting, and no stdin in v1, the approved record is a complete summary of what will start. This, not any downstream check, is the boundary; downstream errors like `command_not_authorized` only keep the declaration honest.
+The approval prompt renders each command as the exact argv with the executable resolved, the working directory, and the reason — the same "what you read is what runs" guarantee the filesystem proposal gives for writes. With no shell, no environment setting, and no stdin in v1, the approved record is a complete summary of what will start — apart from the inherited host environment (§8.3), which approving accepts wholesale. This, not any downstream check, is the boundary; downstream errors like `command_not_authorized` only keep the declaration honest.
 
 ## 9. Contract, runtime state, and migration
 

@@ -26,8 +26,11 @@ pub(crate) const MAX_WRITE_TARGETS: usize = 32;
 pub(crate) const MAX_COMMANDS: usize = proc::MAX_COMMANDS;
 pub(crate) const ACCESS_ENCODED_CAP: usize = 8 * 1024;
 pub(crate) const ACCESS_REASON_CHARS: usize = 200;
-/// Per-argument display truncation; the journal keeps the exact record.
-const ARG_DISPLAY_CHARS: usize = 120;
+/// Per-argument display truncation; the journal keeps the exact record. High enough that
+/// an ordinary `sh -c` one-liner shows whole — the approval prompt is the security
+/// boundary, so truncating it aggressively hides exactly what needs reading. The 8 KiB
+/// access-block cap bounds the total regardless.
+const ARG_DISPLAY_CHARS: usize = 512;
 
 /// One command exactly as the model declared it, after strict JSON-shape checks.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
