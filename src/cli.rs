@@ -21,7 +21,7 @@ impl Authorizer for TerminalAuthorizer {
             return Decision::Unavailable;
         }
         let mut out = std::io::stdout();
-        let _ = writeln!(out, "Terrarium requests write authorization for this run");
+        let _ = writeln!(out, "Terrarium requests authorization for this run");
         if !request.reason.trim().is_empty() {
             let _ = writeln!(out, "Reason: {}", request.reason);
         }
@@ -31,9 +31,19 @@ impl Authorizer for TerminalAuthorizer {
             } else {
                 ""
             };
-            let _ = writeln!(out, "  {}{}", target.display, note);
+            let _ = writeln!(out, "  write {}{}", target.display, note);
         }
-        let _ = write!(out, "Allow these writes? [y/N] ");
+        // "what you read is what runs": the exact argv with the executable already
+        // resolved and the working directory spelled out
+        for command in &request.commands {
+            let _ = writeln!(out, "  run   {}", command.display);
+        }
+        let asks = match (request.targets.is_empty(), request.commands.is_empty()) {
+            (false, true) => "Allow these writes?",
+            (true, false) => "Allow these commands?",
+            _ => "Allow these writes and commands?",
+        };
+        let _ = write!(out, "{asks} [y/N] ");
         let _ = out.flush();
         let mut line = String::new();
         match std::io::stdin().read_line(&mut line) {
@@ -47,10 +57,12 @@ impl Authorizer for TerminalAuthorizer {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct RunArgs {
     timeout_ms: Option<u64>,
     allow_write: Vec<String>,
+    allow_exec: Vec<String>,
+    offline: bool,
     contract: bool,
     expression: Option<String>,
     file: Option<PathBuf>,
@@ -103,6 +115,17 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             "--allow-write" => {
                 return Err("--allow-write expects an absolute DIR or FILE path".into())
             }
+            "--allow-exec" if i + 1 < args.len() => {
+                parsed.allow_exec.push(args[i + 1].clone());
+                i += 2;
+            }
+            "--allow-exec" => {
+                return Err("--allow-exec expects an executable NAME or absolute path".into())
+            }
+            "--offline" => {
+                parsed.offline = true;
+                i += 1;
+            }
             arg if arg.starts_with("--") => {
                 return Err(format!("unknown or incomplete flag: {arg}"))
             }
@@ -125,23 +148,52 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 .into(),
         );
     }
+    if (parsed.read_only || parsed.full_access) && !parsed.allow_exec.is_empty() {
+        return Err(
+            "--allow-exec is valid only in planned-write mode; it cannot be combined with \
+             --read-only or --full-access"
+                .into(),
+        );
+    }
     Ok(parsed)
 }
 
 /// Direct run is read-only by default; `--full-access` is the explicit trusted path and
-/// `--allow-write` scopes switch the invocation to planned-write without a model access block.
-fn direct_run_authority(parsed: &RunArgs) -> Result<RunFilesystemAuthority, String> {
+/// `--allow-write` scopes or `--allow-exec` grants switch the invocation to planned-write
+/// without a model access block.
+fn direct_run_authority(
+    parsed: &RunArgs,
+) -> Result<(RunFilesystemAuthority, crate::ProcAuthority), String> {
     if parsed.full_access {
-        return Ok(RunFilesystemAuthority::FullAccess);
+        return Ok((
+            RunFilesystemAuthority::FullAccess,
+            crate::ProcAuthority::Unrestricted,
+        ));
     }
-    if parsed.allow_write.is_empty() {
-        return Ok(RunFilesystemAuthority::ReadOnly);
+    if parsed.allow_write.is_empty() && parsed.allow_exec.is_empty() {
+        return Ok((
+            RunFilesystemAuthority::ReadOnly,
+            crate::ProcAuthority::Denied,
+        ));
     }
+    // `--allow-exec` alone implies planned-write: writes stay denied (no scopes, no
+    // model access block in direct mode) but the granted commands run — a grant
+    // must never be silently ignored.
     let mut scopes = Vec::with_capacity(parsed.allow_write.len());
     for spec in &parsed.allow_write {
         scopes.push(WriteScope::from_operator_spec(spec)?);
     }
-    Ok(RunFilesystemAuthority::Scoped(scopes))
+    let mut grants = Vec::with_capacity(parsed.allow_exec.len());
+    for name in &parsed.allow_exec {
+        grants.push(crate::auth::operator_exec_grant(name)?);
+    }
+    Ok((
+        RunFilesystemAuthority::Scoped(scopes),
+        crate::ProcAuthority::Allowed(crate::CommandSet {
+            grants,
+            records: Vec::new(),
+        }),
+    ))
 }
 
 async fn run_direct(args: &[String]) -> i32 {
@@ -149,18 +201,21 @@ async fn run_direct(args: &[String]) -> i32 {
         Ok(v) => v,
         Err(error) => {
             eprintln!("terrarium: {error}");
-            eprintln!("usage: terrarium run [-e SOURCE | FILE] [--read-only | --full-access | --allow-write PATH]... [--timeout-ms N]");
+            eprintln!("usage: terrarium run [-e SOURCE | FILE] [--read-only | --full-access | --allow-write PATH]... [--allow-exec NAME]... [--offline] [--timeout-ms N]");
             return 2;
         }
     };
-    let authority = match direct_run_authority(&parsed) {
+    let (authority, proc_authority) = match direct_run_authority(&parsed) {
         Ok(v) => v,
         Err(error) => {
             eprintln!("terrarium: {error}");
             return 2;
         }
     };
-    let kernel = Kernel::new(authority);
+    let mut kernel = Kernel::new(authority).with_proc(proc_authority);
+    if parsed.offline {
+        kernel = kernel.offline();
+    }
     if parsed.contract {
         print!("{}", kernel.contract());
         return 0;
@@ -282,20 +337,26 @@ mod tests {
         let root = std::env::temp_dir();
         let root_display = root.to_string_lossy().into_owned();
         assert_eq!(
-            direct_run_authority(&run_args(RunArgs::default(), false, false)).unwrap(),
+            direct_run_authority(&run_args(RunArgs::default(), false, false))
+                .unwrap()
+                .0,
             RunFilesystemAuthority::ReadOnly
         );
         assert_eq!(
-            direct_run_authority(&run_args(RunArgs::default(), true, false)).unwrap(),
+            direct_run_authority(&run_args(RunArgs::default(), true, false))
+                .unwrap()
+                .0,
             RunFilesystemAuthority::ReadOnly
         );
         assert_eq!(
-            direct_run_authority(&run_args(RunArgs::default(), false, true)).unwrap(),
+            direct_run_authority(&run_args(RunArgs::default(), false, true))
+                .unwrap()
+                .0,
             RunFilesystemAuthority::FullAccess
         );
         let mut scoped = RunArgs::default();
         scoped.allow_write.push(root_display.clone());
-        let authority = direct_run_authority(&scoped).unwrap();
+        let authority = direct_run_authority(&scoped).unwrap().0;
         assert_eq!(authority.mode(), crate::fs::FilesystemMode::PlannedWrite);
         // authorize_write takes the resolved identity: temp_dir() is symlinked on macOS
         // (/var -> /private/var) and canonicalize() returns \\?\ forms on Windows
@@ -315,5 +376,69 @@ mod tests {
             .allow_write
             .push("/definitely/not/a/real/path".into());
         assert!(direct_run_authority(&missing).is_err());
+    }
+
+    #[test]
+    fn exec_grants_follow_the_planned_write_rules() {
+        let root = std::env::temp_dir();
+        let exe_name = if cfg!(windows) { "cmd" } else { "sh" };
+        let mut scoped = RunArgs::default();
+        scoped.allow_write.push(root.to_string_lossy().into_owned());
+        scoped.allow_exec.push(exe_name.into());
+        let (authority, proc) = direct_run_authority(&scoped).unwrap();
+        assert_eq!(authority.mode(), crate::fs::FilesystemMode::PlannedWrite);
+        // a grant matches the resolved executable with any argv
+        assert!(proc
+            .authorize(
+                exe_name,
+                &["-c".into(), "echo anything".into()],
+                None,
+                &root.canonicalize().unwrap()
+            )
+            .is_ok());
+        // a grant is rejected outside planned-write combinations
+        assert!(parse_run_args(&[
+            "--read-only".into(),
+            "--allow-exec".into(),
+            exe_name.into(),
+            "-e".into(),
+            "return 1".into()
+        ])
+        .is_err());
+        assert!(parse_run_args(&[
+            "--allow-exec".into(),
+            "definitely-not-a-real-tool-xyz".into(),
+            "--allow-write".into(),
+            root.to_string_lossy().into_owned(),
+            "-e".into(),
+            "return 1".into()
+        ])
+        .is_ok());
+        assert!(direct_run_authority(&{
+            let mut args = scoped.clone();
+            args.allow_exec.clear();
+            args.allow_exec
+                .push("definitely-not-a-real-tool-xyz".into());
+            args
+        })
+        .is_err());
+        // a grant without --allow-write still switches direct run to planned-write:
+        // writes stay denied, the granted commands run — never a silent no-op
+        let mut exec_only = RunArgs::default();
+        exec_only.allow_exec.push(exe_name.into());
+        let (authority, proc) = direct_run_authority(&exec_only).unwrap();
+        assert_eq!(authority.mode(), crate::fs::FilesystemMode::PlannedWrite);
+        let denied = std::path::PathBuf::from("/definitely/not/writable.txt");
+        assert!(authority
+            .authorize_write(denied.to_str().unwrap_or_default(), &denied)
+            .is_err());
+        assert!(proc
+            .authorize(
+                exe_name,
+                &["-c".into(), "echo granted".into()],
+                None,
+                &root.canonicalize().unwrap()
+            )
+            .is_ok());
     }
 }

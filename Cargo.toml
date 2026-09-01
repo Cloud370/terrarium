@@ -15,9 +15,19 @@ rquickjs = { version = "0.12", default-features = false, features = ["std", "fut
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "sync", "process", "io-util"] }
 toml = "0.8"
 fs2 = "0.4"
+url = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Security (SECURITY_ATTRIBUTES in CreateJobObjectW) and Threading (IO_COUNTERS inside
+# JOBOBJECT_EXTENDED_LIMIT_INFORMATION) are required for those job-object items to be
+# emitted at all.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [profile.release]
 opt-level = "z"

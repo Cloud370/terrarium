@@ -120,19 +120,19 @@ Direct `terrarium run` execution creates no session. Its transient working root 
 
 ### 2.10 Keep invocation access coarse and honest
 
-Each process invocation selects one filesystem mode (the normative contract is `filesystem-authorization.md`):
+Each process invocation selects one filesystem mode (the normative contract is `filesystem-authorization.md`; process execution is `process-and-network.md`):
 
-| Mode | Reads | Writes |
-|---|---|---|
-| `read-only` | OS-readable absolute paths | every write denied |
-| `planned-write` (agent default) | OS-readable absolute paths | per-run preauthorized exact files plus operator `--allow-write` scopes |
-| `full-access` | OS-readable absolute paths | any valid path, subject to OS permissions |
+| Mode | Reads | Writes | Process launch |
+|---|---|---|---|
+| `read-only` | OS-readable absolute paths | every write denied | denied |
+| `planned-write` (agent default) | OS-readable absolute paths | per-run preauthorized exact files plus operator `--allow-write` scopes | per-run preauthorized command records plus operator `--allow-exec` grants |
+| `full-access` | OS-readable absolute paths | any valid path, subject to OS permissions | any command, journaled, no prompt |
 
 The mode belongs to the trusted host invocation, not to the session, turn, journal, prompt, or model. Resuming a session does not restore or imply a previous invocation's authority.
 
-The name `full-access` is intentionally broader than "scoped files." A future unrestricted shell or external-process capability can escape any scope through subprocesses, hooks, build scripts, environment access, or networking. Such an operation may succeed only in `full-access` unless Terrarium can enforce the narrower boundary with a real operating-system or container sandbox. A write-scope check alone is not a security boundary for hostile execution.
+The name `full-access` is intentionally broader than "scoped files." An approved command is itself an escape hatch from any write scope: a child process is not bound by Terrarium's scopes and can act through subprocesses, hooks, build scripts, environment access, or networking. That is why process creation is a write-class effect decided by the same one-decision preauthorization, and why the approval display — the exact argv with the executable resolved — is the real boundary. A write-scope check alone is not a security boundary for hostile execution.
 
-Full access remains bounded by the operating-system user, run deadlines, resource budgets, and the capabilities installed by the host. It is not root access and does not remove execution limits. Version 1 does not implement shell or external-process execution; this rule fixes the permission boundary before such a capability exists.
+Full access remains bounded by the operating-system user, run deadlines, resource budgets, and the capabilities installed by the host. It is not root access and does not remove execution limits. There is no shell in the spawn path: a command is a structured record (resolved executable, exact argv, cwd), and `read-only` denies process creation outright.
 
 The generated host contract exposes `host.fs.list(dir)` as sorted objects with `name`, `type`, and `size` fields. `type` is `file`, `directory`, `symlink`, or `other`; `size` is the byte count for regular files and `null` otherwise. Programs inspect these fields directly and do not parse display strings.
 
@@ -971,7 +971,7 @@ For the runtime:
 
 ```text
 Config -> one resolved turn profile
-Host invocation -> read-only | planned-write | full-access (+ write scopes, never journaled)
+Host invocation -> read-only | planned-write | full-access (+ write scopes, exec grants, offline; never journaled)
 Session header -> one stable working root
                -> step -> visible attempt 1 -> optional attempt 2 -> model result
                        -> optional run/access decision -> run under frozen authority -> run result

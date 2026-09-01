@@ -73,19 +73,21 @@ A run has two data channels. Program-provided data enters the next model context
 
 - A whole unit of work executes per step; context is spent on findings instead of tool-call bookkeeping.
 - JavaScript supplies control flow, retries, branching, and concurrency through ordinary language constructs.
-- The host surface stays small: bounded filesystem capabilities and explicit model/user dispositions. The main model is called by the trusted outer loop; JavaScript has no model-call primitive.
+- The host surface stays small: bounded filesystem capabilities, preauthorized process execution, journaled network fetch, and explicit model/user dispositions. The main model is called by the trusted outer loop; JavaScript has no model-call primitive.
 - Each run has a fresh cage, so a failed run does not corrupt the next run.
 
 ## The cage
 
 - Per run: 64 MB heap, 1 MB stack, and one hard deadline. Agent mode defaults to 10 seconds; single-run mode defaults to 2 seconds. A first-line `// timeout-ms: N` directive may raise an agent run up to 300 seconds.
 - Captured stdout is limited to 16 KB. Host file reads use bounded windows or a bounded whole-file channel.
-- Every path is one absolute path in the operating-system user's filesystem view; there is no virtual namespace. Reads see what the current OS user can read. Writes are governed by the invocation's frozen filesystem authority — `read-only` denies every write, `planned-write` requires a preauthorized exact file or operator-declared scope, `full-access` keeps only path validation and OS permissions. Existing symlinks are never written; scans never follow symlinks.
+- Every path is one absolute path in the operating-system user's filesystem view; there is no virtual namespace. Reads see what the current OS user can read. Writes are governed by the invocation's frozen filesystem authority and process creation by its frozen command authority — `read-only` denies every write and every process launch, `planned-write` requires a preauthorized exact file or operator-declared scope and each command to match one of the run's approved records, `full-access` keeps only path validation and OS permissions. Existing symlinks are never written; scans never follow symlinks.
 - API credentials remain in the host process environment and are never exposed to JavaScript.
 
-## Write preauthorization
+## Write and command preauthorization
 
-In the default `planned-write` mode, a run that writes declares its targets up front in the `access` block — at most 32 exact absolute file paths plus a reason. The host resolves and validates every path, subtracts anything already covered by an operator `--allow-write` scope, and presents the remainder as one allow/deny decision before any JavaScript starts. Partial approval does not exist; approval covers that one run only and is discarded when it ends. A denied, cancelled, invalid, or unavailable request (no interactive terminal) runs no code and returns one bounded observation instead. Every decision — including declarations accepted and ignored under `full-access` — is journaled as a `run/access` audit event that never restores authority.
+In the default `planned-write` mode, a run that writes or launches a process declares both up front in the `access` block — at most 32 exact absolute file paths plus at most 8 command records (`exe`, exact `argv`, optional `cwd`) plus a reason. The host resolves and validates every path and command, subtracts anything already covered by an operator `--allow-write` scope or `--allow-exec` executable grant, and presents the remainder as one allow/deny decision before any JavaScript starts. Partial approval does not exist; approval covers that one run only and is discarded when it ends. A denied, cancelled, invalid, or unavailable request (no interactive terminal) runs no code and returns one bounded observation instead. Every decision — including declarations accepted and ignored under `full-access` — is journaled as a `run/access` audit event that never restores authority.
+
+A command is a structured record, never a command-line string: there is no shell in the spawn path. Approving a command approves every effect of that process for its remaining lifetime — a child process is not bound by Terrarium's write scopes — so the approval prompt showing the exact argv with the executable resolved is the real boundary. Process receipts (`run/spawn`, `proc/exit`) and network receipts (`net/request`) are journaled as they happen; the journal never stores stream data. `host.net.fetch` needs no consent in every mode (a response enters cage memory only) and is disabled by `--offline`; egress is journaled and detectable, not prevented. See [Process and network](docs/process-and-network.md).
 
 ## Quick start
 
@@ -117,6 +119,13 @@ The default mode is `planned-write`: each run's writes are preauthorized through
 terrarium --allow-write "$HOME/proj/notes" "summarize the project into notes/summary.md"
 ```
 
+To pre-grant a command's executable (any argv) or to disable network fetch for the invocation:
+
+```sh
+terrarium --allow-write "$HOME/proj" --allow-exec cargo "add a failing test, then make it pass"
+terrarium --offline "audit this repository for anything that phones home"
+```
+
 For trusted debugging the explicit path removes the scope check:
 
 ```sh
@@ -137,12 +146,12 @@ The agent stores its session under the per-user state directory and prints the s
 ## Command line
 
 ```sh
-terrarium [--config PATH] [--profile NAME] [--read-only | --full-access | --allow-write DIR|FILE]... [--max-steps N] [--run-timeout-ms N] [message...]
-terrarium --resume SESSION_ID [--read-only | --full-access | --allow-write DIR|FILE]... [message...]
-terrarium run [-e SOURCE | FILE] [--read-only | --full-access | --allow-write DIR|FILE]... [--timeout-ms N]
+terrarium [--config PATH] [--profile NAME] [--read-only | --full-access | --allow-write DIR|FILE]... [--allow-exec NAME]... [--offline] [--max-steps N] [--run-timeout-ms N] [message...]
+terrarium --resume SESSION_ID [--read-only | --full-access | --allow-write DIR|FILE]... [--allow-exec NAME]... [--offline] [message...]
+terrarium run [-e SOURCE | FILE] [--read-only | --full-access | --allow-write DIR|FILE]... [--allow-exec NAME]... [--offline] [--timeout-ms N]
 ```
 
-The normal command always starts or resumes the model-driven agent. Message arguments are joined as text; non-terminal stdin supplies a message when no message argument is present. `--allow-write` may be repeated and takes one existing absolute directory (recursive prefix) or file (exact target); the three mode flags cannot be combined. Mode and write scopes are invocation-only and never stored in the session. The agent exits `0` after a program returns `to: "user"`, and `2` for usage or configuration errors. Direct-run exits `0` for a successful program and `1` for a failed program.
+The normal command always starts or resumes the model-driven agent. Message arguments are joined as text; non-terminal stdin supplies a message when no message argument is present. `--allow-write` may be repeated and takes one existing absolute directory (recursive prefix) or file (exact target); `--allow-exec` may be repeated and pre-grants one resolved executable (bare names resolve through `PATH`) for any argv, covering both `exec` and `spawn`; `--offline` disables `host.net.fetch`. The three mode flags cannot be combined, and `--allow-write`/`--allow-exec` require `planned-write`. Mode, write scopes, and exec grants are invocation-only and never stored in the session. The agent exits `0` after a program returns `to: "user"`, and `2` for usage or configuration errors. Direct-run exits `0` for a successful program and `1` for a failed program.
 
 ## Host API
 
@@ -155,10 +164,14 @@ The generated contract (`--contract`) documents the live surface:
 - `host.fs.scan(path, options)` streams text-file lines from a directory tree. Pass optional `contains: "literal"` to let Rust discard non-matching lines before they cross into JavaScript; JavaScript remains the final predicate for regexes, case rules, multiple conditions, cross-line state, and custom limits. Without it, every line is yielded as before. It respects `.gitignore`, skips hidden entries, binaries, and symlinks by default, and validates option types. Traversal and decoding errors reject the scan rather than becoming an empty result.
 - `host.fs.walk(path, options)` streams one `{file, size}` per regular file from a directory tree — the file-level twin of `scan`, with the same pruning and the same options; files are never opened. Counting files or summing sizes is a walk; counting `scan` yields counts lines.
 - `host.fs.write(path, content)` atomically writes text to a write-authorized target and returns the byte count. Approving a new file includes creating its missing parent directories. The run result also includes bounded host-derived write receipts (`path`, `created`, `changed`, `bytesBefore`, `bytesAfter`, `firstChangedLine`).
+- `host.proc.exec(exe, argv[, {cwd}])` runs one command to completion within the current run and returns `{code, stdout, stderr}` — each stream captured as a bounded 16 KiB head-plus-tail. If the run ends first, the child's process group is killed. This is the verb for build, test, and lint.
+- `host.proc.spawn(exe, argv[, {cwd}])` starts a session-scoped process and returns `{id, log, output}`: an opaque handle that crosses runs like a file path, a host-owned append-only 4 MiB log readable with `host.fs.read`, and a live async-iterable view for the spawning run. The table holds at most 8 live processes and 16 entries; the host never silently kills an old process to make room.
+- `host.proc.status(id)`, `await host.proc.wait(id)`, `host.proc.kill(id[, {force}])` query, await, and gracefully terminate the process group. `wait` is bounded by the run deadline (the deadline kills the observer, not the observed). A handle from before a restart reports `process_lost`; its log stays readable.
+- `host.net.fetch(url[, {method, headers, body}])` performs one journaled HTTP request — any method, http/https only — and returns `{status, finalUrl, body}` where `body` is an async-iterable of string chunks. Header values may be `{env: NAME}` references resolved host-side; credentials never enter the cage. Limits are host-owned: 60 s per request, an 8 MiB response cap, 4 concurrent requests; redirects are followed (at most 5) and the final URL is journaled.
 
 Agent programs use the tagged return protocol described above for model continuation or user handoff.
 
-Model requests belong to the trusted outer agent loop and are journaled in the session; the JavaScript host surface is the filesystem capability set above. Requests are text-only; image file reading, encoding, and artifact transport are not implemented.
+Model requests belong to the trusted outer agent loop and are journaled in the session; the JavaScript host surface is the capability set above. Requests are text-only; image file reading, encoding, and artifact transport are not implemented.
 
 ## Configuration
 
@@ -174,7 +187,7 @@ If no TOML file is selected, the legacy `TERRARIUM_LLM_API_KEY`, `TERRARIUM_LLM_
 - `src/main.rs`, `src/cli.rs` — process and terminal adapters
 - `src/agent.rs` — outer agent loop, access/run fence parser, and preauthorization lifecycle
 - `src/session.rs` — durable append-only session journal
-- `src/fs.rs`, `src/auth.rs`, `src/llm/`, `src/registry.rs` — filesystem capabilities and frozen write authority, access-block parsing and the `Authorizer` boundary, streaming three-protocol model transport, and the live API registry
+- `src/fs.rs`, `src/proc.rs`, `src/net.rs`, `src/auth.rs`, `src/llm/`, `src/registry.rs` — filesystem capabilities and frozen write authority, process table and command authority, journaled network fetch, access-block parsing and the `Authorizer` boundary, streaming three-protocol model transport, and the live API registry
 - `src/prompts/`, `src/runtime/` — embedded model prompt and JavaScript runtime assets
 - `docs/` — maintained design, protocol, configuration, security, and integration notes
 
@@ -185,6 +198,7 @@ The library exposes `Kernel` and the `RunFilesystemAuthority`/`WriteScope` trust
 - [Design direction](docs/design.md)
 - [Current protocol](docs/protocol.md)
 - [Filesystem authorization](docs/filesystem-authorization.md)
+- [Process execution and network fetch](docs/process-and-network.md)
 - [Configuration](docs/configuration.md)
 - [Security boundary](docs/security.md)
 - [Model profiles and durable sessions](docs/model-profiles-and-durable-sessions.md)

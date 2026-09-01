@@ -2,6 +2,7 @@
 //! structured outcome. Terminal I/O and process exit codes belong to `cli`, not this module.
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -9,7 +10,7 @@ use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, CaughtError, Function
 use serde::Serialize;
 use tokio::sync::watch;
 
-use crate::{fs, registry};
+use crate::{fs, net, proc, registry};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -92,6 +93,28 @@ pub struct Outcome {
     pub elapsed_ms: u64,
     pub writes: Vec<WriteSummary>,
     pub writes_truncated: bool,
+    /// Host-derived receipts (`run/spawn`, `proc/exit`, `net/request` records) collected
+    /// during the run. Bounded forensics for the journal — never stream data.
+    pub receipts: Vec<serde_json::Value>,
+}
+
+/// Everything one run needs beyond its code and deadline: the frozen filesystem and
+/// process authorities, the session process table, the network switch, the canonical
+/// working root for command cwd defaults, and the per-run receipt queue the capabilities
+/// fill and the caller journals.
+pub(crate) struct RunEnv {
+    pub fs: fs::RunFilesystemAuthority,
+    pub proc: proc::ProcAuthority,
+    pub net_offline: bool,
+    pub table: Rc<proc::ProcTable>,
+    pub working_root: PathBuf,
+    pub receipts: Rc<RefCell<Vec<serde_json::Value>>>,
+}
+
+impl RunEnv {
+    pub(crate) fn receipts() -> Rc<RefCell<Vec<serde_json::Value>>> {
+        Rc::new(RefCell::new(Vec::new()))
+    }
 }
 
 fn failure(kind: ErrorKind, msg: impl Into<String>) -> Outcome {
@@ -108,6 +131,7 @@ fn failure(kind: ErrorKind, msg: impl Into<String>) -> Outcome {
         elapsed_ms: 0,
         writes: Vec::new(),
         writes_truncated: false,
+        receipts: Vec::new(),
     }
 }
 
@@ -150,10 +174,20 @@ fn value_to_json<'js>(
 }
 
 /// One call = one fresh cage. Conversation state stays outside so a dead run never takes the session with it.
+/// Resolves once the run's cancellation flag is set. `watch::Receiver::changed` is
+/// cancel-safe, so host capabilities race it against their own completion instead of
+/// blocking the run's teardown past the grace window.
+pub(crate) async fn cancelled(cancel: &mut watch::Receiver<bool>) {
+    if *cancel.borrow() {
+        return;
+    }
+    let _ = cancel.changed().await;
+}
+
 pub(crate) async fn eval_js(
     code: &str,
     timeout_ms: u64,
-    authority: &fs::RunFilesystemAuthority,
+    env: &RunEnv,
     cancel_tx: watch::Sender<bool>,
 ) -> Outcome {
     if !(1..=MAX_TIMEOUT_MS).contains(&timeout_ms) {
@@ -166,6 +200,7 @@ pub(crate) async fn eval_js(
     let logs: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let overflowed: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
     let writes: Rc<RefCell<fs::WriteLog>> = Rc::new(RefCell::new(fs::WriteLog::default()));
+    let cancel_rx = cancel_tx.subscribe();
 
     let rt = match AsyncRuntime::new() {
         Ok(rt) => rt,
@@ -204,7 +239,17 @@ pub(crate) async fn eval_js(
         ctx.globals().set("__log", log_fn)?;
 
         let host = Object::new(ctx.clone())?;
-        fs::install(&ctx, &host, authority, writes.clone())?;
+        fs::install(&ctx, &host, &env.fs, writes.clone())?;
+        proc::install(
+            &ctx,
+            &host,
+            &env.proc,
+            &env.table,
+            &env.working_root,
+            &env.receipts,
+            &cancel_rx,
+        )?;
+        net::install(&ctx, &host, env.net_offline, &env.receipts, &cancel_rx)?;
         ctx.globals().set("host", host)?;
         ctx.eval::<Value, _>(PRELUDE)?;
 
@@ -218,6 +263,7 @@ pub(crate) async fn eval_js(
             elapsed_ms: 0,
             writes: Vec::new(),
             writes_truncated: false,
+            receipts: Vec::new(),
         };
         let source = format!("(async () => {{\n{code}\n}})()");
         let result = match ctx.eval::<Value, _>(source.as_str()).catch(&ctx) {
@@ -342,7 +388,24 @@ pub(crate) async fn eval_js(
         out.writes = std::mem::take(&mut write_log.items);
         out.writes_truncated = write_log.truncated;
     }
+    out.receipts = std::mem::take(&mut env.receipts.borrow_mut());
     out
+}
+
+/// A private log root for a direct-run invocation: each `Kernel::run` is its own session,
+/// so its spawn logs live under their own id and die with the process table.
+fn direct_run_proc_root() -> PathBuf {
+    let base = crate::config::state_dir()
+        .unwrap_or_else(|_| std::env::temp_dir().join("terrarium/sessions"));
+    let id = format!(
+        "run_{}_{:x}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    base.join(id).join("procs")
 }
 
 /// Reusable execution facade for non-CLI frontends. The kernel holds one invocation-level
@@ -351,11 +414,33 @@ pub(crate) async fn eval_js(
 #[derive(Debug, Clone)]
 pub struct Kernel {
     authority: fs::RunFilesystemAuthority,
+    proc: proc::ProcAuthority,
+    offline: bool,
 }
 
 impl Kernel {
     pub fn new(authority: fs::RunFilesystemAuthority) -> Self {
-        Self { authority }
+        let proc = match authority {
+            fs::RunFilesystemAuthority::FullAccess => proc::ProcAuthority::Unrestricted,
+            _ => proc::ProcAuthority::Denied,
+        };
+        Self {
+            authority,
+            proc,
+            offline: false,
+        }
+    }
+
+    /// Override the process authority (for example to install operator exec grants).
+    pub fn with_proc(mut self, proc: proc::ProcAuthority) -> Self {
+        self.proc = proc;
+        self
+    }
+
+    /// Disable `host.net.fetch` for every run of this kernel.
+    pub fn offline(mut self) -> Self {
+        self.offline = true;
+        self
     }
 
     pub fn authority(&self) -> &fs::RunFilesystemAuthority {
@@ -367,16 +452,46 @@ impl Kernel {
     }
 
     pub async fn run(&self, code: &str, timeout_ms: u64) -> Outcome {
+        let working_root = std::env::current_dir()
+            .and_then(|dir| dir.canonicalize())
+            .unwrap_or_else(|_| PathBuf::from("."));
+        let table = Rc::new(proc::ProcTable::new(direct_run_proc_root()));
+        let env = RunEnv {
+            fs: self.authority.clone(),
+            proc: self.proc.clone(),
+            net_offline: self.offline,
+            table: table.clone(),
+            working_root,
+            receipts: RunEnv::receipts(),
+        };
         let (cancel_tx, _cancel_rx) = watch::channel(false);
-        eval_js(code, timeout_ms, &self.authority, cancel_tx).await
+        let out = eval_js(code, timeout_ms, &env, cancel_tx).await;
+        // a direct run is its own session: its end kills its live processes; the logs stay
+        table.kill_all(true);
+        out
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{contract, eval_js, truncate_utf8, ErrorKind, Termination};
+    use super::{contract, eval_js, truncate_utf8, ErrorKind, RunEnv, Termination};
     use crate::fs::RunFilesystemAuthority;
+    use crate::proc::ProcTable;
     use tokio::sync::watch;
+
+    fn env(authority: RunFilesystemAuthority) -> RunEnv {
+        let root = std::env::temp_dir()
+            .join(format!("terrarium-kernel-env-{}", std::process::id()))
+            .join("procs");
+        RunEnv {
+            fs: authority,
+            proc: crate::proc::ProcAuthority::default(),
+            net_offline: false,
+            table: std::rc::Rc::new(ProcTable::new(root)),
+            working_root: std::env::temp_dir().canonicalize().unwrap(),
+            receipts: RunEnv::receipts(),
+        }
+    }
 
     #[test]
     fn truncate_utf8_lands_on_char_boundaries() {
@@ -407,7 +522,7 @@ mod tests {
         let out = eval_js(
             "function value() { return 41; }\nreturn {to: 'model', facts: {value: value() + 1}};",
             5_000,
-            &RunFilesystemAuthority::ReadOnly,
+            &env(RunFilesystemAuthority::ReadOnly),
             tx,
         )
         .await;
@@ -425,7 +540,7 @@ mod tests {
         let within_limit = eval_js(
             "return 'x'.repeat(23 * 1024)",
             5_000,
-            &RunFilesystemAuthority::ReadOnly,
+            &env(RunFilesystemAuthority::ReadOnly),
             tx,
         )
         .await;
@@ -435,7 +550,7 @@ mod tests {
         let oversized = eval_js(
             "return 'x'.repeat(24 * 1024 + 1)",
             5_000,
-            &RunFilesystemAuthority::ReadOnly,
+            &env(RunFilesystemAuthority::ReadOnly),
             tx,
         )
         .await;
@@ -447,7 +562,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_timeout_is_configuration_failure() {
         let (tx, _rx) = watch::channel(false);
-        let out = eval_js("return 1", 0, &RunFilesystemAuthority::ReadOnly, tx).await;
+        let out = eval_js("return 1", 0, &env(RunFilesystemAuthority::ReadOnly), tx).await;
         assert!(!out.ok);
         assert_eq!(out.termination, Termination::Fatal);
         assert_eq!(
@@ -462,7 +577,7 @@ mod tests {
         let out = eval_js(
             "print(\"x\".repeat(16383) + \"中文中文中文\");\nreturn 1",
             5_000,
-            &RunFilesystemAuthority::ReadOnly,
+            &env(RunFilesystemAuthority::ReadOnly),
             tx,
         )
         .await;
@@ -478,7 +593,7 @@ mod tests {
         let out = eval_js(
             "while (true) print('x'.repeat(4000))",
             500,
-            &RunFilesystemAuthority::ReadOnly,
+            &env(RunFilesystemAuthority::ReadOnly),
             tx,
         )
         .await;
