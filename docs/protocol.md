@@ -79,7 +79,7 @@ Each run uses a fresh QuickJS runtime with a 64 MiB heap, 1 MiB stack, bounded s
 - `run/spawn` — one per process creation through either `exec` or `spawn`: the resolved executable, argv, cwd, pid, and for `spawn` the handle and log path. It carries the creating run's `runSeq`.
 - `proc/exit` — one per process exit: handle (when the process had one), exit code, and a bounded output tail. Exits can arrive after their creating run ends.
 - `net/request` — one per fetch: method, final URL after redirects, response status, and response byte count, with the creating run's `runSeq`. A request that fails, times out, or is cancelled after dispatch is still journaled with status 0 — bytes may have left the machine. The request URL itself is capped at 8 KiB.
-- `receipts/truncated` — when a batch of receipts exceeds the per-batch journal cap (128), one marker counts the dropped receipts and names the run they belonged to. Truncation is never silent: the journal is the audit trail, and for fetch it is the only detection mechanism.
+- `receipts/truncated` — when a batch of receipts exceeds the per-batch journal cap (128), or when session shutdown's grace window closes before an exit could be observed, one marker counts the dropped receipts (naming the run when they belonged to one). Truncation is never silent: the journal is the audit trail, and for fetch it is the only detection mechanism.
 
 The session table behind `host.proc` handles lives in host memory and never survives a restart: a handle that predates the current session reports `process_lost`, while its log file remains an ordinary readable session file. Session validators accept pre-existing `run/access` events without a `commands` field (it reads as empty) so existing journals replay unchanged.
 
